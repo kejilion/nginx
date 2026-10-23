@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import configparser
 import datetime
 import hashlib
 import json
@@ -138,9 +139,9 @@ def fail2ban_update(root,legacy=False):
         jail=Path('/etc/fail2ban/jail.d/zz-waf-managed.local')
         if not jail.exists():return {'updated':False,'reason':'no-existing-shared-jails'}
         before=read_config(jail)
-        if not before.startswith('# Managed shared WAF;'):raise ValueError('Existing jail requires explicit migration')
+        migrated=migrate_existing_jail(root,before)
         files={Path('/etc/fail2ban/filter.d')/name:data.encode() for name,data in policy.render_filters().items()}
-        files[jail]=before.replace(str(root/'log/nginx/error.log'),str(root/'log/nginx/waf-audit.json')).encode()
+        files[jail]=migrated.encode()
         log=root/'log/nginx/waf-audit.json'
         safe_parent(log)
         if log.is_symlink():raise ValueError('Unsafe audit log')
@@ -153,6 +154,17 @@ def fail2ban_update(root,legacy=False):
     except Exception:
         if active:execute('fail2ban-client','reload')
         raise
+
+
+def migrate_existing_jail(root,text):
+    if not text.startswith('# Managed shared WAF;'):raise ValueError('Existing jail requires explicit migration')
+    parsed=configparser.ConfigParser(interpolation=None)
+    parsed.read_string(text)
+    old=str(root/'log/nginx/error.log');new=str(root/'log/nginx/waf-audit.json')
+    if parsed.get('waf-attack','logpath',fallback=None) not in {old,new}:
+        raise ValueError('Existing attack log path requires explicit migration')
+    # Only the known log source changes. Preserve actions, retries and other jails.
+    return text.replace(old,new)
 
 
 def rotation(root,config):

@@ -131,6 +131,14 @@ class ConfigurationLifecycleTests(unittest.TestCase):
         self.assertFalse(new.exists())
         self.assertEqual(len(list((self.root/'backups/waf-managed').glob('*/preimage.json'))),1)
 
+    def test_existing_fail2ban_log_migration_preserves_actions_and_thresholds(self):
+        text='# Managed shared WAF; existing integration\n[waf-attack]\nlogpath = '+str(self.root/'log/nginx/error.log')+'\naction = existing-ban[source=attack]\nmaxretry = 20\n[waf-rate]\nlogpath = '+str(self.root/'log/nginx/waf-rate.log')+'\naction = existing-ban[source=rate]\n'
+        changed=manage.migrate_existing_jail(self.root,text)
+        self.assertEqual(changed,text.replace('/error.log','/waf-audit.json'))
+        self.assertEqual(manage.migrate_existing_jail(self.root,changed),changed)
+        with self.assertRaisesRegex(ValueError,'explicit migration'):
+            manage.migrate_existing_jail(self.root,text.replace('/error.log','/custom.log'))
+
     def test_policy_concurrency_conflict_does_not_write_any_configuration(self):
         state=self.root/'config/waf/policy.json';self.atomic(state,b'newer policy')
         with patch.object(manage,'make_plan') as plan,self.assertRaisesRegex(ValueError,'concurrently'):
