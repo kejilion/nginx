@@ -227,7 +227,7 @@ def _rotation(root,config):
 def trust_cloudflare(root,config,expected):
     if (root/'config/waf/policy.json').exists():
         config['cdn']='mixed'
-        return apply(root,config,expected=expected)
+        return apply(root,config,expected=expected,respect_native=True)
     path=root/'conf.d/default.conf'
     cf=load_json(BUNDLE/'cloudflare-ips.json')
     networks=policy.networks(cf)
@@ -328,8 +328,8 @@ def make_plan(root, config, cfdata=None):
     cloudflare = policy.networks(cfdata)
     changes = {}
     main = root / 'nginx.conf'
-    header_scopes=nginx_edit.configuration_headers(execute('docker','exec',config['container'],'nginx','-T'))
     allowed_proxy_files={'/etc/nginx/conf.d/'+p.name for p in (root/'conf.d').glob('*.conf')}
+    header_scopes=nginx_edit.configuration_headers(execute('docker','exec',config['container'],'nginx','-T'),allowed_proxy_files)
     if any(name not in allowed_proxy_files and not name.startswith('/etc/nginx/conf.d/waf/') for name,_ in header_scopes):
         raise ValueError('Proxy directives outside managed site files need explicit integration')
     main_text=read_config(main)
@@ -535,6 +535,8 @@ def configured_status(root,config):
     names={name for path in files for name in nginx_edit.site_scopes(read_config(path)) if name!='_'}
     modes={config['sites'].get(name,{}).get('mode',config['mode']) for name in names} or {config['mode']}
     engine=native_engine_enabled(read_config(root/'nginx.conf'))
+    if not engine and any([t.value for t in s[:-1]]==['modsecurity','on'] for path in files for group in nginx_edit.statement_scopes(nginx_edit.tokens(read_config(path))).values() for s in group['statements']):
+        raise ValueError('Child WAF switch conflicts with the global Off state; apply migration first')
     mode='off' if not engine else ('on' if not policy.engine_enabled(config) else (next(iter(modes)) if len(modes)==1 else 'mixed'))
     return {'mode':mode,'engineEnabled':engine,'sites':config['sites'],'siteCount':len(names),
             'banBackend':config.get('banBackend','existing'),'source':'configuration'}

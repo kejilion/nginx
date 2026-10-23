@@ -236,6 +236,31 @@ class ConfigurationLifecycleTests(unittest.TestCase):
         self.assertEqual(config['banBackend'],'existing')
         self.assertEqual(config['sites']['one.example'],{'profile':'api','mode':'detect'})
         self.assertEqual(apply.call_args.kwargs['expected'],'exact-policy-hash')
+        self.assertTrue(apply.call_args.kwargs['respect_native'])
+
+    def test_cloudflare_trust_obeys_legacy_switch_in_both_directions(self):
+        state=self.root/'config/waf/policy.json';self.atomic(state,b'{}')
+        for native,mode,wanted in [('off','on','off'),('on','off','on')]:
+            config={'mode':mode,'container':'nginx','banBackend':'existing','trustedProxies':['10.20.0.0/16'],'sites':{'one.example':{'profile':'api','mode':'detect','cdn':'direct'}}}
+            if mode=='off':config['sites']['one.example'].pop('mode')
+            (self.root/'nginx.conf').write_text('events {} http { modsecurity '+native+'; }',encoding='utf-8')
+            def plan(root,changed,cfdata=None):
+                self.assertEqual(changed['mode'],wanted)
+                self.assertEqual(changed['banBackend'],'existing')
+                self.assertEqual(changed['trustedProxies'],['10.20.0.0/16'])
+                self.assertEqual(changed['sites']['one.example'],{'profile':'api','cdn':'direct'})
+                self.assertEqual(changed['cdn'],'mixed')
+                return {},['one.example']
+            with self.subTest(native=native),patch.object(manage,'make_plan',side_effect=plan),patch.object(manage,'execute',return_value='# configuration file /etc/nginx/nginx.conf:\nhttp {}'),patch.object(manage,'reload_nginx'):
+                result=manage.trust_cloudflare(self.root,config,hashlib.sha256(state.read_bytes()).hexdigest())
+            self.assertEqual(result['mode'],wanted)
+
+    def test_status_refuses_false_off_with_unmigrated_child_on(self):
+        (self.root/'conf.d').mkdir()
+        (self.root/'conf.d/site.conf').write_text('server { server_name one.example; modsecurity on; }',encoding='utf-8')
+        (self.root/'nginx.conf').write_text('events {} http { # modsecurity on;\n}',encoding='utf-8')
+        with self.assertRaisesRegex(ValueError,'conflicts'):
+            manage.configured_status(self.root,{'mode':'off','sites':{}})
 
 
 @unittest.skipUnless(os.name=='posix','POSIX ownership and symlink checks')

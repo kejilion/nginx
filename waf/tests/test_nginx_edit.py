@@ -7,6 +7,24 @@ import nginx_edit
 
 
 class ApplicationBoundaryTests(unittest.TestCase):
+    def test_child_on_inherits_global_switch_and_location_off_is_preserved(self):
+        text='server { server_name one.example; modsecurity on; auth_basic "Private"; location / { modsecurity on; proxy_pass http://app; } location /assets { modsecurity off; } }'
+        changed=nginx_edit.patch_site(text,{'sites':{}})
+        self.assertNotIn('modsecurity on;',changed)
+        self.assertIn('modsecurity off;',changed)
+        self.assertIn('auth_basic "Private";',changed)
+        self.assertEqual(nginx_edit.patch_site(changed,{'sites':{}}),changed)
+
+    def test_expanded_switch_graph_rejects_custom_off_on_and_external_on(self):
+        main='http { modsecurity on; include conf.d/site.conf; }'
+        for site,extra in [
+            ('server { server_name one.example; modsecurity off; location / { modsecurity on; } }',''),
+            ('server { server_name one.example; location / { modsecurity off; location /nested { modsecurity on; } } }',''),
+            ('server { server_name one.example; include /etc/nginx/custom.inc; }','# configuration file /etc/nginx/custom.inc:\nmodsecurity on;\n')]:
+            dump='# configuration file /etc/nginx/nginx.conf:\n'+main+'\n# configuration file /etc/nginx/conf.d/site.conf:\n'+site+'\n'+extra
+            with self.subTest(site=site),self.assertRaisesRegex(ValueError,'explicit integration'):
+                nginx_edit.configuration_headers(dump,{'/etc/nginx/conf.d/site.conf'})
+
     def test_disabled_main_uses_the_legacy_toggle_line_and_is_idempotent(self):
         text='events {} http {\nmodsecurity on;\nserver { server_name one.example; }\n}'
         disabled=nginx_edit.patch_main(text,enabled=False)

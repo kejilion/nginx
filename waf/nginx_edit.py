@@ -105,6 +105,8 @@ def patch_site(text: str, config: dict) -> str:
     removals=[]
     for group in statement_scopes(tokens(text)).values():
         for statement in group['statements']:
+            if group['kind'] in {'server','location'} and [t.value for t in statement[:-1]]==['modsecurity','on']:
+                removals.append((statement[0].start,statement[-1].end))
             if statement[0].value=='include' and len(statement)==3 and re.fullmatch(r'/etc/nginx/conf\.d/waf/server-(?:default\*|[a-f0-9]{16})\.inc',statement[1].value.strip('\"\'')):
                 removals.append((statement[0].start,statement[-1].end))
     text=remove_statements(text,removals)
@@ -222,7 +224,7 @@ def statement_scopes(stream):
     return groups
 
 
-def configuration_headers(dump):
+def configuration_headers(dump, managed_sites=None):
     """Evaluate actual include scopes from a bounded nginx -T snapshot.
 
     Keep source offsets so only directives in the administrator's site file are
@@ -258,6 +260,18 @@ def configuration_headers(dump):
     main='/etc/nginx/nginx.conf'
     if main not in files: raise ValueError('Missing main configuration snapshot')
     groups=statement_scopes(expand(main))
+    if managed_sites is not None:
+        for ident, group in groups.items():
+            if group['kind']=='http':continue
+            for statement in group['statements']:
+                if [t.value for t in statement[:-1]]!=['modsecurity','on']:continue
+                if group['kind'] not in {'server','location'} or statement[0].source not in managed_sites:
+                    raise ValueError('WAF switch outside managed site scopes needs explicit integration')
+                parent=group['parent']
+                while parent is not None and groups[parent]['kind']!='http':
+                    if any([t.value for t in s[:-1]]==['modsecurity','off'] for s in groups[parent]['statements']):
+                        raise ValueError('Nested WAF Off/On exception needs explicit integration')
+                    parent=groups[parent]['parent']
     result={}
     for ident, group in groups.items():
         ancestor=ident

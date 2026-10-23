@@ -150,6 +150,10 @@ proxy_pass http://fixture_backend;
     blocks.append(nginx_edit.patch_application(parent,nginx_edit.configuration_headers(dump),'/etc/nginx/conf.d/parent.conf'))
     duplicate='server { listen unix:/test/front.sock; server_name duplicate.example; set_real_ip_from unix:; real_ip_header CF-Connecting-IP; include /etc/nginx/conf.d/waf/server-default.inc; location / { proxy_set_header x-forwarded-for $http_x_forwarded_for; proxy_set_header X-Forwarded-For bad; proxy_pass http://fixture_backend; } }'
     blocks.append(nginx_edit.patch_application(duplicate))
+    child='server { listen unix:/test/front.sock; server_name child.example; modsecurity on; set_real_ip_from unix:; real_ip_header CF-Connecting-IP; location / { modsecurity on; '+proxy+' } location /custom-off { modsecurity off; '+proxy+' } }'
+    migrated=nginx_edit.patch_site(child,config)
+    assert 'modsecurity on;' not in migrated and 'modsecurity off;' in migrated
+    blocks.append(migrated)
     fixture = '''load_module /etc/nginx/modules/ngx_http_modsecurity_module.so;
 pid /run/nginx.pid;
 error_log /var/log/nginx/error.log error;
@@ -290,6 +294,8 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         assert 'auth_request' not in (generated/'http.conf').read_text()
         results.append({'test':'configuration-only-backend-boundary','passed':True})
         # Emulate the historical native sed toggle on a fully disabled policy.
+        check('migrated-child-on-blocks-before-global-off',host='child.example',path=sqli,expected=403)
+        check('custom-location-off-preserved',host='child.example',path='/custom-off'+sqli)
         # Its HTTP switch remains authoritative without hidden ctl=Off fallback.
         disabled=json.loads(json.dumps(config));disabled['mode']='off'
         for site in disabled['sites'].values():site.pop('mode',None)
@@ -305,9 +311,11 @@ upstream fixture_backend { server unix:/test/backend.sock; }
             raise RuntimeError('No new fixture worker after toggle')
         reload_fixture()
         check('legacy-global-off-with-disabled-policy',path=sqli)
+        check('global-off-also-disables-migrated-server-and-location-on',host='child.example',path=sqli)
         (work/'nginx.conf').write_text(fixture)
         reload_fixture()
         check('legacy-global-on-after-disabled-policy',path=sqli,expected=403)
+        check('global-on-restores-migrated-server-and-location',host='child.example',path=sqli,expected=403)
         # Keep raw evidence without request bodies or secrets.
         (work / 'results.json').write_text(json.dumps(results, indent=2))
         print(json.dumps({'passed': len(results), 'container': name, 'workspace': str(work)}), flush=True)
