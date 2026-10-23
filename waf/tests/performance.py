@@ -62,15 +62,19 @@ def main():
     p.add_argument('--work-dir', type=Path, required=True)
     p.add_argument('--baseline', type=Path, required=True, help='Immutable baseline waf directory')
     p.add_argument('--candidate', type=Path, help='Candidate waf directory; defaults to this tree')
-    p.add_argument('--suite', choices=['probe', 'matrix', 'soak'], default='probe')
+    p.add_argument('--suite', choices=['probe', 'matrix', 'soak', 'guard'], default='probe')
     p.add_argument('--seconds', type=int, default=8)
     p.add_argument('--cpus', type=int, choices=[1, 2], default=1)
     p.add_argument('--sites', type=int, choices=[20, 200], default=20)
     p.add_argument('--early-blocking', action='store_true', help='Experiment only, not a runtime policy field')
     p.add_argument('--variants', default='off,baseline,candidate', help='Explicit order/subset of off,baseline,candidate')
+    p.add_argument('--log-budget-mib', type=int, default=128, help='Live watchdog threshold (1..128 MiB)')
     args = p.parse_args()
     if not 4 <= args.seconds <= 120:
         p.error('Measurement window must be 4..120 seconds')
+    if not 1 <= args.log_budget_mib <= 128:
+        p.error('Log watchdog budget must be 1..128 MiB')
+    log_budget = args.log_budget_mib * 1024 * 1024
     variants = args.variants.split(',')
     if not variants or len(variants) != len(set(variants)) or set(variants) - {'off', 'baseline', 'candidate'}:
         p.error('Invalid variant set')
@@ -88,6 +92,7 @@ def main():
                 'go': run('go', 'version').stdout.decode().strip(),
                 'cpus': args.cpus, 'memoryLimitMiB': 512 if args.cpus == 1 else 1024,
                 'sites': args.sites, 'suite': args.suite, 'variants': variants, 'earlyBlockingExperiment': args.early_blocking,
+                'logWatchdogMiB': args.log_budget_mib,
                 'sources': {str(root): {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in root.glob('*.py')} for root in (baseline, candidate)},
                 'harnessSHA256': {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in (source/'performance.py', source/'performance_client.go')},
                 'startedAt': time.time(), 'limits': 'No external network or host configuration mounts; origin is a fixture; proxy identity is simulated; not a real CDN benchmark.'}
@@ -214,8 +219,8 @@ upstream fixture_origin {{ server unix:/test/backend.sock; keepalive 64; }}
             container(client, '2', '256m', '/bin/sleep', ['1800'], network='container:' + nginx)
             clientcg, origincg = cgroup(client), cgroup(origin)
             def cell(workload='static', rate=100, concurrency=32, target='unix', identity_mode='proxy', duration=None, record=True, host_count=None):
-                if sum(logs_size().values()) > 128 * 1024 * 1024:
-                    raise RuntimeError('Fixture logs exceeded 128 MiB; stopping without deleting evidence')
+                if sum(logs_size().values()) > log_budget:
+                    raise RuntimeError('Fixture logs exceeded watchdog budget; stopping without deleting evidence')
                 before = resources(rootcg)
                 aux = {'client': resources(clientcg), 'origin': resources(origincg)}
                 log_before = logs_size()
@@ -224,7 +229,7 @@ upstream fixture_origin {{ server unix:/test/backend.sock; keepalive 64; }}
                     while not stop.wait(.25):
                         samples.append(resources(rootcg))
                         size, free = sum(logs_size().values()), shutil.disk_usage(work).free
-                        if size > 128 * 1024 * 1024 or free < 512 * 1024 * 1024:
+                        if size > log_budget or free < 512 * 1024 * 1024:
                             (work / 'budget-failure.json').write_text(json.dumps(dict(logBytes=size, freeBytes=free, variant=variant, workload=workload)))
                             stop.set()
                             # Stop only this job's load container, then let finally retain logs/clean up.
@@ -243,7 +248,7 @@ upstream fixture_origin {{ server unix:/test/backend.sock; keepalive 64; }}
                     stop.set()
                     thread.join(2)
                 elapsed = time.monotonic() - at
-                if (work / 'budget-failure.json').exists() or sum(logs_size().values()) > 128 * 1024 * 1024:
+                if (work / 'budget-failure.json').exists() or sum(logs_size().values()) > log_budget:
                     raise RuntimeError('Resource watchdog budget exceeded; retained evidence')
                 after = resources(rootcg)
                 result = json.loads(response.stdout)
@@ -267,7 +272,9 @@ upstream fixture_origin {{ server unix:/test/backend.sock; keepalive 64; }}
                     raise RuntimeError('Unexpected response, incomplete offered load, network error or OOM; retained raw result')
                 return result
             cell(rate=50, duration=4, record=False)
-            if args.suite == 'probe':
+            if args.suite == 'guard':
+                cell('static', 0, concurrency=8)
+            elif args.suite == 'probe':
                 for kind, rate in [('static', 100), ('json', 50), ('json64', 2), ('upload', 5), ('attack-json', 3), ('attack', 10)]:
                     cell(kind, rate)
             elif args.suite == 'matrix':
