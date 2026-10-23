@@ -368,7 +368,8 @@ def make_plan(root, config, cfdata=None):
         # Historical whole-site switches are migration work, not permanent bypasses.
         # Preserve an explicit replacement; otherwise start that site in detection.
         text,legacy_off=nginx_edit.migrate_server_off(text)
-        for name in legacy_off:config['sites'].setdefault(name,{}).setdefault('mode','detect')
+        if config['mode']!='off':
+            for name in legacy_off:config['sites'].setdefault(name,{}).setdefault('mode','detect')
         changes[path] = nginx_edit.absolute_includes(nginx_edit.patch_site(text, config)).encode()
     if not discovered:
         raise ValueError('No application sites found')

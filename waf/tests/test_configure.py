@@ -31,6 +31,9 @@ class ManagedTrustTests(unittest.TestCase):
             self.assertEqual(config['sites']['wp.example'],{'profile':'wordpress','mode':'detect'})
             self.assertNotIn('api.example',config['sites'])
             self.assertIn(b'location /assets { modsecurity off; }',changes[root/'conf.d/sites.conf'])
+            off=json.loads((manage.BUNDLE/'example-policy.json').read_text());off['mode']='off'
+            with patch.object(manage,'execute',return_value=dump),patch.object(manage,'kpanel_endpoints',return_value=set()):manage.make_plan(root,off)
+            self.assertNotIn('mode',off['sites']['wp.example'])
             blocked=root/'conf.d/waf/blocked.map';blocked.parent.mkdir();blocked.write_text('# existing map\n')
             read_config=manage.read_config
             def untrusted(path):
