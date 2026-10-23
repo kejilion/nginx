@@ -340,7 +340,7 @@ def make_plan(root, config, cfdata=None):
             found=re.search(pattern,main_text)
             if found:config[field]=max(config.get(field,{'rate':50,'burst':200,'connections':256}[field]),int(found[1]))
         policy.validate(config)
-    changes[main] = nginx_edit.absolute_includes(nginx_edit.patch_main(main_text)).encode()
+    changes[main] = nginx_edit.absolute_includes(nginx_edit.patch_main(main_text,enabled=policy.engine_enabled(config))).encode()
     discovered = []
     panel=kpanel_endpoints()
     configs = list(sorted((root / 'conf.d').glob('*.conf')))
@@ -476,12 +476,28 @@ def restore(root, backup, verify=True):
 UNSET=object()
 
 
-def apply(root, config, cfdata=None, expected=UNSET):
+def native_engine_enabled(text):
+    groups=nginx_edit.statement_scopes(nginx_edit.tokens(text))
+    http=[group for group in groups.values() if group['kind']=='http']
+    if len(http)!=1:raise ValueError('Expected one authoritative HTTP switch')
+    return any([token.value for token in statement[:-1]]==['modsecurity','on'] for statement in http[0]['statements'])
+
+
+def reconcile_native_switch(root,config):
+    enabled=native_engine_enabled(read_config(root/'nginx.conf'))
+    if not enabled or not policy.engine_enabled(config):
+        mode='on' if enabled else 'off'
+        config=dict(config,mode=mode,sites={name:{key:value for key,value in site.items() if key!='mode'} for name,site in config['sites'].items()})
+    return config
+
+
+def apply(root, config, cfdata=None, expected=UNSET, respect_native=False):
     with locked(root / 'config/waf/install.lock'):
         current=root/'config/waf/policy.json'
         actual=hashlib.sha256(current.read_bytes()).hexdigest() if current.exists() else None
         if expected is not UNSET and actual!=expected:
             raise ValueError('Policy changed concurrently; retry against current configuration')
+        if respect_native:config=reconcile_native_switch(root,config)
         changes, sites = make_plan(root, config,cfdata)
         changes={path:data for path,data in changes.items() if not path.exists() or path.read_bytes()!=data}
         if not changes:
@@ -518,8 +534,8 @@ def configured_status(root,config):
     if len(files)>250:raise ValueError('Site file count exceeds supported budget')
     names={name for path in files for name in nginx_edit.site_scopes(read_config(path)) if name!='_'}
     modes={config['sites'].get(name,{}).get('mode',config['mode']) for name in names} or {config['mode']}
-    engine=bool(re.search(r'(?m)^\s*modsecurity on;',read_config(root/'nginx.conf')))
-    mode='off' if not engine or modes=={'off'} else (next(iter(modes)) if len(modes)==1 else 'mixed')
+    engine=native_engine_enabled(read_config(root/'nginx.conf'))
+    mode='off' if not engine else ('on' if not policy.engine_enabled(config) else (next(iter(modes)) if len(modes)==1 else 'mixed'))
     return {'mode':mode,'engineEnabled':engine,'sites':config['sites'],'siteCount':len(names),
             'banBackend':config.get('banBackend','existing'),'source':'configuration'}
 
@@ -572,7 +588,7 @@ def main():
         elif args.action=='plan':
             changes,sites=make_plan(root,config)
             result={'sites':sites,'files':[str(p) for p,c in changes.items() if not p.exists() or p.read_bytes()!=c],'policy':config}
-        elif args.action in {'apply','configure'}:result=apply(root,config,expected=expected)
+        elif args.action in {'apply','configure'}:result=apply(root,config,expected=expected,respect_native=args.action=='apply')
         elif args.action=='refresh-ips':
             with urllib.request.urlopen('https://api.cloudflare.com/client/v4/ips',timeout=20) as response:raw=response.read(65537)
             if len(raw)>65536:raise ValueError('Cloudflare address response exceeds budget')
@@ -580,7 +596,7 @@ def main():
             if data.get('success') is not True:raise ValueError('Cloudflare address update failed')
             addresses=data['result']
             policy.networks(addresses)
-            result=apply(root,config,{'ipv4_cidrs':addresses['ipv4_cidrs'],'ipv6_cidrs':addresses['ipv6_cidrs']},expected=expected)
+            result=apply(root,config,{'ipv4_cidrs':addresses['ipv4_cidrs'],'ipv6_cidrs':addresses['ipv6_cidrs']},expected=expected,respect_native=True)
         else:
             if args.action=='doctor':execute('docker','exec',config['container'],'nginx','-t')
             result=configured_status(root,config)

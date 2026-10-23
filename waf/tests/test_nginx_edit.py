@@ -7,6 +7,15 @@ import nginx_edit
 
 
 class ApplicationBoundaryTests(unittest.TestCase):
+    def test_disabled_main_uses_the_legacy_toggle_line_and_is_idempotent(self):
+        text='events {} http {\nmodsecurity on;\nserver { server_name one.example; }\n}'
+        disabled=nginx_edit.patch_main(text,enabled=False)
+        self.assertIn('# modsecurity on;',disabled)
+        self.assertEqual(nginx_edit.patch_main(disabled,enabled=False),disabled)
+        enabled=nginx_edit.patch_main(disabled)
+        self.assertNotIn('# modsecurity on;',enabled)
+        self.assertIn('\n    modsecurity on;',enabled)
+
     def test_identity_and_event_logging_survive_child_overrides(self):
         original = 'server { server_name one.example;\nlocation / { access_log off; proxy_set_header Host $host; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_pass http://app; }\n}'
         changed = nginx_edit.patch_application(original)

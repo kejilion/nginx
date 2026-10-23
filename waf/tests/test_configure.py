@@ -15,6 +15,18 @@ import nginx_edit
 
 
 class ManagedTrustTests(unittest.TestCase):
+    def test_native_switch_reconciliation_preserves_profiles_and_trust(self):
+        config={'mode':'on','sites':{'api.example':{'profile':'api','mode':'detect','cdn':'cloudflare'}}}
+        with patch.object(manage,'read_config',return_value='events {} http { # modsecurity on;\nserver { modsecurity on; } }'):
+            changed=manage.reconcile_native_switch(pathlib.Path('/fixture'),config)
+        self.assertEqual(changed['mode'],'off')
+        self.assertEqual(changed['sites']['api.example'],{'profile':'api','cdn':'cloudflare'})
+        self.assertEqual(config['mode'],'on')
+        with patch.object(manage,'read_config',return_value='events {} http { modsecurity on; }'):
+            restored=manage.reconcile_native_switch(pathlib.Path('/fixture'),changed)
+        self.assertEqual(restored['mode'],'on')
+        self.assertEqual(restored['sites'],changed['sites'])
+
     def test_profiles_and_legacy_modes_are_scoped_to_each_server(self):
         with tempfile.TemporaryDirectory() as directory:
             root=pathlib.Path(directory)

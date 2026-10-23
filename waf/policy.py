@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 MAX_SITES = 200
 MAX_BANS = 10000
 MAX_STATE_BYTES = 4 * 1024 * 1024
@@ -181,6 +181,10 @@ def render_server(realip: str = "realip.conf", existing_bans=True) -> str:
             "include " + BASE + "/" + realip + ";\n")
 
 
+def engine_enabled(config: dict) -> bool:
+    return config['mode']!='off' or any(site.get('mode','off')!='off' for site in config.get('sites',{}).values())
+
+
 def render_profile_rules(config: dict) -> str:
     lines = [
         '# Settings run after vendor setup, before CRS and application exclusions.',
@@ -210,7 +214,7 @@ def render_profile_rules(config: dict) -> str:
                 f'    SecRule REQUEST_FILENAME "@streq {item["path"]}" "t:none,ctl:ruleRemoveTargetById={item["ruleId"]};{item["target"]}"',
             ]
             rid += 1
-    if global_mode != "on":
+    if global_mode != "on" and engine_enabled(config):
         lines.append('SecRule &TX:waf_mode_override "@eq 0" "id:1190,phase:1,pass,nolog,ctl:ruleEngine=' + {"off":"Off", "detect":"DetectionOnly"}[global_mode] + '"')
     for name,site in sorted(config['sites'].items()):
         if site.get('profile')=='kpanel':

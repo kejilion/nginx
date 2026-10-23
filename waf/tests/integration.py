@@ -289,6 +289,25 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         check('long-URI-attack',path=xss+'&padding='+'a'*3000,expected=403)
         assert 'auth_request' not in (generated/'http.conf').read_text()
         results.append({'test':'configuration-only-backend-boundary','passed':True})
+        # Emulate the historical native sed toggle on a fully disabled policy.
+        # Its HTTP switch remains authoritative without hidden ctl=Off fallback.
+        disabled=json.loads(json.dumps(config));disabled['mode']='off'
+        for site in disabled['sites'].values():site.pop('mode',None)
+        (generated/'profile-rules.conf').write_text(policy.render_profile_rules(disabled))
+        (work/'nginx.conf').write_text(fixture.replace('modsecurity on;','# modsecurity on;'))
+        def reload_fixture():
+            before=set(run('docker','top',name,'-eo','pid,args').stdout.decode().splitlines())
+            run('docker','exec',name,'nginx','-s','reload')
+            for _ in range(100):
+                after=set(run('docker','top',name,'-eo','pid,args').stdout.decode().splitlines())
+                if any('nginx: worker process' in line and 'shutting down' not in line and line not in before for line in after):return
+                time.sleep(0.1)
+            raise RuntimeError('No new fixture worker after toggle')
+        reload_fixture()
+        check('legacy-global-off-with-disabled-policy',path=sqli)
+        (work/'nginx.conf').write_text(fixture)
+        reload_fixture()
+        check('legacy-global-on-after-disabled-policy',path=sqli,expected=403)
         # Keep raw evidence without request bodies or secrets.
         (work / 'results.json').write_text(json.dumps(results, indent=2))
         print(json.dumps({'passed': len(results), 'container': name, 'workspace': str(work)}), flush=True)

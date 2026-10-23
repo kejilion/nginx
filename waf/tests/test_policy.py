@@ -9,6 +9,14 @@ import policy
 
 
 class PolicyTests(unittest.TestCase):
+    def test_full_off_keeps_the_native_global_switch_authoritative(self):
+        config={'mode':'off','sites':{'wp.example':{'profile':'wordpress'}}}
+        self.assertFalse(policy.engine_enabled(config))
+        self.assertNotIn('ctl:ruleEngine=Off',policy.render_profile_rules(config))
+        config['sites']['api.example']={'mode':'on'}
+        self.assertTrue(policy.engine_enabled(config))
+        self.assertIn('ctl:ruleEngine=Off',policy.render_profile_rules(config))
+
     def setUp(self):
         self.root = pathlib.Path(__file__).resolve().parents[1]
         self.config = json.loads((self.root / 'example-policy.json').read_text())

@@ -127,7 +127,7 @@ def patch_site(text: str, config: dict) -> str:
     return text
 
 
-def patch_main(text: str) -> str:
+def patch_main(text: str, enabled: bool = True) -> str:
     # Only the shipped legacy module/config/rate directives are migrated.
     removals=[]
     for group in statement_scopes(tokens(text)).values():
@@ -143,6 +143,7 @@ def patch_main(text: str) -> str:
                 remove=remove or values in [['limit_req_status','429'],['limit_conn_status','429']]
             if remove:removals.append((statement[0].start,statement[-1].end))
     text=remove_statements(text,removals)
+    text=re.sub(r'(?m)^[ \t]*# modsecurity on;[ \t]*(?:\r?\n|$)','',text)
     groups=statement_scopes(tokens(text))
     module='/etc/nginx/conf.d/waf/load-module*.conf'
     http_include='/etc/nginx/conf.d/waf/http*.conf'
@@ -155,7 +156,7 @@ def patch_main(text: str) -> str:
     # Keep the native script's existing engine switch and status readback working.
     # Rules and maps are still provided by the one shared managed bundle.
     pos=http[0]['open']
-    addition='\n    modsecurity on;'
+    addition='\n    '+('modsecurity on;' if enabled else '# modsecurity on;')
     if not includes(http[0],http_include):addition+='\n    include /etc/nginx/conf.d/waf/http*.conf;'
     if not text[pos:].startswith('\n'):addition+='\n'
     text=text[:pos]+addition+text[pos:]
