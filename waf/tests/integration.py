@@ -218,9 +218,13 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         assert (value['host'],value['proto'],value['authorization'])==('preserved.example','https','fixture-token'),value
         _,data=check('migrated-duplicate-case-identity-headers',host='duplicate.example',headers={'X-Forwarded-For':'6.6.6.6'})
         assert json.loads(data)['forwardedAll']==['8.8.8.8'],data
-        for path in ['/https://github.com/kejilion/sh/raw/main/kejilion.sh','/https://github.com/kejilion/sh.git/info/refs?service=git-upload-pack','/v2/library/alpine/manifests/latest','/https://huggingface.co/org/model/resolve/main/config.json']:
+        for path in ['/https://github.com/kejilion/sh/raw/main/kejilion.sh','/https://github.com/kejilion/sh.git/info/refs?service=git-upload-pack','/v2/library/alpine/manifests/latest','/https://huggingface.co/org/model/resolve/main/config.json','/raw.githubusercontent.com/kejilion/sh/main/cn/kejilion.sh','/github.com/kejilion/apps.git/info/refs?service=git-upload-pack']:
             check('artifact-proxy-legitimate-route-'+path,host='artifact.example',path=path)
         check('artifact-Git-clone-packet',host='artifact.example',path='/https://github.com/kejilion/sh.git/git-upload-pack',method='POST',body=b'0032want 0123456789012345678901234567890123456789\n0000',headers={'Content-Type':'application/x-git-upload-pack-request'})
+        check('artifact-schemeless-Git-packet',host='artifact.example',path='/github.com/kejilion/apps.git/git-upload-pack',method='POST',body=b'0032want 0123456789012345678901234567890123456789\n0000',headers={'Content-Type':'application/x-git-upload-pack-request'})
+        check('artifact-schemeless-query-SQLi-still-denied',host='artifact.example',path='/raw.githubusercontent.com/org/repo/main/test.sh?q=1%27%20UNION%20SELECT%20password%20FROM%20users--',expected=403)
+        check('artifact-local-file-path-still-denied',host='artifact.example',path='/etc/passwd',expected=403)
+        check('schemeless-exclusion-never-applies-to-other-sites',path='/raw.githubusercontent.com/org/repo/main/test.sh',expected=403)
         check('JSON', host='api.example', method='POST', body=b'{"name":"hello","count":2}', headers={'Content-Type': 'application/json'})
         check('vendor-JSON', host='api.example', method='PATCH', body=b'{"name":"hello"}', headers={'Content-Type': 'application/vnd.api+json'})
         check('XML',host='api.example',method='POST',body=b'<root>hello</root>',headers={'Content-Type':'application/xml'})

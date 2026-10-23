@@ -236,15 +236,15 @@ def render_profile_rules(config: dict) -> str:
         if site.get('profile')=='artifact-proxy':
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                       '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
-                      '    SecRule REQUEST_FILENAME "@rx ^/https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/" "t:none,ctl:ruleRemoveById=920440,ctl:ruleRemoveTargetById=930130;REQUEST_FILENAME"']
+                      '    SecRule REQUEST_FILENAME "@rx ^/(?:https?://)?[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+(?::[0-9]{1,5})?/" "t:none,ctl:ruleRemoveById=920440,ctl:ruleRemoveTargetById=930130;REQUEST_FILENAME"']
             rid+=1
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                       '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD|POST)$" "t:none,chain"',
-                      '    SecRule REQUEST_FILENAME "@rx ^/https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git/(?:info/refs|git-upload-pack)$" "t:none,ctl:ruleRemoveTargetById=930130;REQUEST_FILENAME"']
+                      '    SecRule REQUEST_FILENAME "@rx ^/(?:https?://)?[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+(?::[0-9]{1,5})?/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git/(?:info/refs|git-upload-pack)$" "t:none,ctl:ruleRemoveTargetById=930130;REQUEST_FILENAME"']
             rid+=1
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                       '    SecRule REQUEST_METHOD "@streq POST" "t:none,chain"',
-                      '    SecRule REQUEST_FILENAME "@rx ^/https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git/git-upload-pack$" "t:none,chain"',
+                      '    SecRule REQUEST_FILENAME "@rx ^/(?:https?://)?[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+(?::[0-9]{1,5})?/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git/git-upload-pack$" "t:none,chain"',
                       '    SecRule REQUEST_HEADERS:Content-Type "@streq application/x-git-upload-pack-request" "t:none,t:lowercase,ctl:ruleRemoveById=920420"']
             rid+=1
     return "\n".join(lines + exceptions) + "\n"
