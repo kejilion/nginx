@@ -262,7 +262,8 @@ upstream fixture_origin {{ server unix:/test/backend.sock; keepalive 64; }}
                               cpuThrottledUsec=after['cpu'].get('throttled_usec', 0) - before['cpu'].get('throttled_usec', 0),
                               logBytesDelta={k: n - log_before.get(k, 0) for k, n in logs_size().items()},
                               auxiliaryCpuPercent={k: (resources(cg)['cpu']['usage_usec'] - aux[k]['cpu']['usage_usec']) / elapsed / 10000 for k, cg in [('client', clientcg), ('origin', origincg)]},
-                              memorySamples=[s['memory'] for s in samples], ioBefore=before['io'], ioAfter=after['io'])
+                              memorySamples=[s['memory'] for s in samples], anonymousSamples=[s['memoryStat']['anon'] for s in samples],
+                              sampleIntervalSeconds=.25, ioBefore=before['io'], ioAfter=after['io'])
                 if record:
                     results.append(result)
                     with (work / 'results.jsonl').open('a') as f:
