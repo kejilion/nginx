@@ -31,6 +31,13 @@ class ManagedTrustTests(unittest.TestCase):
             self.assertEqual(config['sites']['wp.example'],{'profile':'wordpress','mode':'detect'})
             self.assertNotIn('api.example',config['sites'])
             self.assertIn(b'location /assets { modsecurity off; }',changes[root/'conf.d/sites.conf'])
+            blocked=root/'conf.d/waf/blocked.map';blocked.parent.mkdir();blocked.write_text('# existing map\n')
+            read_config=manage.read_config
+            def untrusted(path):
+                if path==blocked:raise ValueError('untrusted-existing-map')
+                return read_config(path)
+            with patch.object(manage,'execute',return_value=dump),patch.object(manage,'kpanel_endpoints',return_value=set()),patch.object(manage,'read_config',side_effect=untrusted),self.assertRaisesRegex(ValueError,'untrusted-existing-map'):
+                manage.make_plan(root,config)
 
     def test_location_off_never_promotes_to_site_off(self):
         text='server { server_name one.example; location /assets { modsecurity off; } }'
@@ -132,9 +139,9 @@ class ConfigurationLifecycleTests(unittest.TestCase):
         self.assertEqual(len(list((self.root/'backups/waf-managed').glob('*/preimage.json'))),1)
 
     def test_existing_fail2ban_log_migration_preserves_actions_and_thresholds(self):
-        text='# Managed shared WAF; existing integration\n[waf-attack]\nlogpath = '+str(self.root/'log/nginx/error.log')+'\naction = existing-ban[source=attack]\nmaxretry = 20\n[waf-rate]\nlogpath = '+str(self.root/'log/nginx/waf-rate.log')+'\naction = existing-ban[source=rate]\n'
+        text='# Managed shared WAF; existing integration\n[waf-attack]\nlogpath = '+str(self.root/'log/nginx/error.log')+'\naction = existing-ban[source=attack,notify='+str(self.root/'log/nginx/error.log')+']\nmaxretry = 20\n[waf-rate]\nlogpath = '+str(self.root/'log/nginx/waf-rate.log')+'\naction = existing-ban[source=rate]\n'
         changed=manage.migrate_existing_jail(self.root,text)
-        self.assertEqual(changed,text.replace('error.log','waf-audit.json'))
+        self.assertEqual(changed,text.replace('error.log','waf-audit.json',1))
         self.assertEqual(manage.migrate_existing_jail(self.root,changed),changed)
         with self.assertRaisesRegex(ValueError,'explicit migration'):
             manage.migrate_existing_jail(self.root,text.replace('error.log','custom.log'))
@@ -146,13 +153,32 @@ class ConfigurationLifecycleTests(unittest.TestCase):
         plan.assert_not_called()
         self.assertEqual(state.read_bytes(),b'newer policy')
 
+    def test_status_counts_unlisted_sites_using_the_global_mode(self):
+        (self.root/'conf.d').mkdir()
+        (self.root/'conf.d/sites.conf').write_text('server { server_name one.example; } server { server_name two.example; }')
+        (self.root/'nginx.conf').write_text('http {\n modsecurity on;\n}')
+        config={'mode':'detect','sites':{'one.example':{'mode':'on'}}}
+        status=manage.configured_status(self.root,config)
+        self.assertEqual(status['mode'],'mixed')
+        self.assertEqual(status['siteCount'],2)
+        config['sites']['two.example']={'mode':'on'}
+        self.assertEqual(manage.configured_status(self.root,config)['mode'],'on')
+
     def test_identical_apply_reloads_without_growing_backups(self):
         path=self.root/'site.conf';path.write_bytes(b'unchanged')
-        with patch.object(manage,'make_plan',return_value=({path:b'unchanged'},['one.example'])),patch.object(manage,'execute'),patch.object(manage,'reload_nginx') as reload:
+        with patch.object(manage,'make_plan',return_value=({path:b'unchanged'},['one.example'])),patch.object(manage,'execute',return_value='# configuration file /etc/nginx/nginx.conf:\nhttp {}'),patch.object(manage,'reload_nginx') as reload:
             result=manage.apply(self.root,{'mode':'on','container':'nginx'})
         self.assertFalse(result['applied'])
         reload.assert_called_once_with('nginx')
         self.assertFalse((self.root/'backups').exists())
+
+    def test_identical_apply_rejects_unmanaged_trust_before_reload(self):
+        path=self.root/'site.conf';path.write_bytes(b'unchanged')
+        dump='# configuration file /etc/nginx/nginx.conf:\nhttp { set_real_ip_from 0.0.0.0/0; }'
+        with patch.object(manage,'make_plan',return_value=({path:b'unchanged'},['one.example'])),patch.object(manage,'execute',return_value=dump),patch.object(manage,'reload_nginx') as reload:
+            with self.assertRaisesRegex(ValueError,'Unmanaged proxy trust'):
+                manage.apply(self.root,{'mode':'on','container':'nginx'})
+        reload.assert_not_called()
 
     def test_backup_limit_preserves_existing_recovery_points(self):
         directory=self.root/'backups/waf-managed';directory.mkdir(parents=True)

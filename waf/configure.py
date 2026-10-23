@@ -161,10 +161,24 @@ def migrate_existing_jail(root,text):
     parsed=configparser.ConfigParser(interpolation=None)
     parsed.read_string(text)
     old=str(root/'log/nginx/error.log');new=str(root/'log/nginx/waf-audit.json')
+    if 'logpath' not in parsed._sections.get('waf-attack',{}):
+        raise ValueError('Existing attack log path must be explicit in its jail')
     if parsed.get('waf-attack','logpath',fallback=None) not in {old,new}:
         raise ValueError('Existing attack log path requires explicit migration')
-    # Only the known log source changes. Preserve actions, retries and other jails.
-    return text.replace(old,new)
+    # Only the explicit attack logpath changes, including when another action
+    # independently references the old error log. Preserve formatting and actions.
+    section=None;changed=0;lines=text.splitlines(keepends=True)
+    for index,line in enumerate(lines):
+        header=re.match(r'^\s*\[([^\]]+)\]',line)
+        if header:section=header[1]
+        if section!='waf-attack':continue
+        value=re.match(r'(?i)^([ \t]*logpath[ \t]*[=:][ \t]*)(.*?)([ \t]*)(\r?\n)?$',line)
+        if not value:continue
+        if value[2] not in {old,new}:raise ValueError('Existing attack log path requires explicit migration')
+        lines[index]=value[1]+new+value[3]+(value[4] or '')
+        changed+=1
+    if changed!=1:raise ValueError('Existing attack log path must be explicit in its jail')
+    return ''.join(lines)
 
 
 def rotation(root,config):
@@ -216,7 +230,8 @@ def trust_cloudflare(root,config,expected):
         return apply(root,config,expected=expected)
     path=root/'conf.d/default.conf'
     cf=load_json(BUNDLE/'cloudflare-ips.json')
-    replacement=nginx_edit.strip_legacy_default_realip(read_config(path))+policy.render_realip({'cdn':'cloudflare'},policy.networks(cf))
+    networks=policy.networks(cf)
+    replacement=nginx_edit.strip_legacy_default_realip(read_config(path),networks)+policy.render_realip({'cdn':'cloudflare'},networks)
     changes={path:replacement.encode()}
     with locked(root/'config/waf/install.lock'):
         backup=snapshot(root,changes,'cloudflare')
@@ -349,7 +364,7 @@ def make_plan(root, config, cfdata=None):
                 config['sites'].setdefault(name,{}).setdefault('profile','wordpress')
         text=nginx_edit.patch_application(text,header_scopes,'/etc/nginx/conf.d/'+path.name)
         if path.name == 'default.conf':
-            text = nginx_edit.strip_legacy_default_realip(text)
+            text = nginx_edit.strip_legacy_default_realip(text,cloudflare)
         # Historical whole-site switches are migration work, not permanent bypasses.
         # Preserve an explicit replacement; otherwise start that site in detection.
         text,legacy_off=nginx_edit.migrate_server_off(text)
@@ -369,12 +384,16 @@ def make_plan(root, config, cfdata=None):
     for name in ['policy.py', 'nginx_edit.py', 'configure.py', 'example-policy.json', 'legacy-jails.local']:
         changes[directory / name] = (BUNDLE / name).read_bytes()
     changes[root / 'config/waf/policy.json'] = (json.dumps(config, indent=2, sort_keys=True)+'\n').encode()
-    if not (directory / 'blocked.map').exists():
+    blocked=directory/'blocked.map'
+    if blocked.exists() or blocked.is_symlink():read_config(blocked)
+    else:
         changes[directory / 'blocked.map'] = policy.render_bans({}, int(time.time())).encode()
     for path in changes:
         safe_parent(path)
         if path.is_symlink():
             raise ValueError('Symlink target refused: ' + str(path))
+        if len(changes[path])>2*1024*1024:raise ValueError('Generated configuration exceeds per-file budget: '+str(path))
+        if path.exists():read_config(path)
     return changes, sorted(set(discovered))
 
 
@@ -465,7 +484,7 @@ def apply(root, config, cfdata=None, expected=UNSET):
         changes, sites = make_plan(root, config,cfdata)
         changes={path:data for path,data in changes.items() if not path.exists() or path.read_bytes()!=data}
         if not changes:
-            execute('docker','exec',config['container'],'nginx','-t')
+            check_trust_dump(execute('docker','exec',config['container'],'nginx','-T'))
             reload_nginx(config['container'])
             return {'applied':False,'mode':config['mode'],'sites':sites,'version':policy.VERSION}
         backup = snapshot(root, changes, 'policy')
@@ -491,6 +510,17 @@ def apply(root, config, cfdata=None, expected=UNSET):
                 candidate.unlink()
         atomic(root/'config/waf/last-backup.json',(json.dumps({'path':str(backup)})+'\n').encode())
         return {'applied':True,'mode':config['mode'],'sites':sites,'backup':str(backup),'version':policy.VERSION}
+
+
+def configured_status(root,config):
+    files=list((root/'conf.d').glob('*.conf'))
+    if len(files)>250:raise ValueError('Site file count exceeds supported budget')
+    names={name for path in files for name in nginx_edit.site_scopes(read_config(path)) if name!='_'}
+    modes={config['sites'].get(name,{}).get('mode',config['mode']) for name in names} or {config['mode']}
+    engine=bool(re.search(r'(?m)^\s*modsecurity on;',read_config(root/'nginx.conf')))
+    mode='off' if not engine or modes=={'off'} else (next(iter(modes)) if len(modes)==1 else 'mixed')
+    return {'mode':mode,'engineEnabled':engine,'sites':config['sites'],'siteCount':len(names),
+            'banBackend':config.get('banBackend','existing'),'source':'configuration'}
 
 
 def main():
@@ -552,11 +582,8 @@ def main():
             result=apply(root,config,{'ipv4_cidrs':addresses['ipv4_cidrs'],'ipv6_cidrs':addresses['ipv6_cidrs']},expected=expected)
         else:
             if args.action=='doctor':execute('docker','exec',config['container'],'nginx','-t')
-            modes=[site.get('mode',config['mode']) for site in config['sites'].values()] or [config['mode']]
-            engine=bool(re.search(r'(?m)^\s*modsecurity on;',read_config(root/'nginx.conf')))
-            mode='off' if not engine or set(modes)=={'off'} else (modes[0] if len(set(modes))==1 else 'mixed')
-            result={'syntax':'passed' if args.action=='doctor' else 'not-checked','mode':mode,'engineEnabled':engine,
-                    'sites':config['sites'],'banBackend':config.get('banBackend','existing')}
+            result=configured_status(root,config)
+            result['syntax']='passed' if args.action=='doctor' else 'not-checked'
     print(json.dumps(result,sort_keys=True))
 
 if __name__=='__main__':

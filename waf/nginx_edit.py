@@ -102,8 +102,12 @@ def site_scopes(text: str) -> list[str]:
 
 def patch_site(text: str, config: dict) -> str:
     # On updates, only our managed hook is replaced. Existing application directives stay.
-    pattern = r'\n[ \t]*include /etc/nginx/conf\.d/waf/server-(?:default\*|[a-f0-9]{16})\.inc;[^\n]*\n'
-    text = re.sub(pattern, '', text)
+    removals=[]
+    for group in statement_scopes(tokens(text)).values():
+        for statement in group['statements']:
+            if statement[0].value=='include' and len(statement)==3 and re.fullmatch(r'/etc/nginx/conf\.d/waf/server-(?:default\*|[a-f0-9]{16})\.inc',statement[1].value.strip('\"\'')):
+                removals.append((statement[0].start,statement[-1].end))
+    text=remove_statements(text,removals)
     insertions = []
     for block in server_blocks(text):
         if not block['names']:
@@ -116,7 +120,8 @@ def patch_site(text: str, config: dict) -> str:
         filename = 'server-default*.inc'
         if 'cdn' in config.get('sites', {}).get(name, {}):
             filename = 'server-' + hashlib.sha256(name.encode()).hexdigest()[:16] + '.inc'
-        insertions.append((block['open'], '\n    include /etc/nginx/conf.d/waf/' + filename + ';\n'))
+        suffix='' if text[block['open']:].startswith('\n') else '\n'
+        insertions.append((block['open'], '\n    include /etc/nginx/conf.d/waf/' + filename + ';'+suffix))
     for offset, addition in reversed(insertions):
         text = text[:offset] + addition + text[offset:]
     return text
@@ -124,44 +129,72 @@ def patch_site(text: str, config: dict) -> str:
 
 def patch_main(text: str) -> str:
     # Only the shipped legacy module/config/rate directives are migrated.
-    text = re.sub(r'(?m)^\s*(?:#\s*)?load_module /etc/nginx/modules/ngx_http_modsecurity_module\.so;[^\n]*\n', '', text)
-    text = re.sub(r'(?m)^\s*(?:#\s*)?modsecurity(?:_rules_file)? (?:on|off|/etc/nginx/modsec/modsecurity\.conf);[^\n]*\n', '', text)
-    key=r'(?:\$binary_remote_addr|"\$server_name\|\$binary_remote_addr")'
-    text = re.sub(r'(?m)^\s*limit_req_zone '+key+r' zone=example_zone:[^;]+;[^\n]*\n', '', text)
-    text = re.sub(r'(?m)^\s*limit_req zone=example_zone[^;]*;[^\n]*\n', '', text)
-    text = re.sub(r'(?m)^\s*limit_conn_zone '+key+r' zone=addr:[^;]+;[^\n]*\n', '', text)
-    text = re.sub(r'(?m)^\s*limit_conn addr [0-9]+;[^\n]*\n', '', text)
-    text = re.sub(r'(?m)^\s*limit_(?:req|conn)_status 429;[^\n]*\n', '', text)
-    if 'include /etc/nginx/conf.d/waf/load-module*.conf;' not in text:
+    removals=[]
+    for group in statement_scopes(tokens(text)).values():
+        for statement in group['statements']:
+            values=[token.value.strip('\"\'') for token in statement[:-1]]
+            remove=group['kind']=='root' and values==['load_module','/etc/nginx/modules/ngx_http_modsecurity_module.so']
+            if group['kind']=='http':
+                remove=remove or values in [['modsecurity','on'],['modsecurity','off'],['modsecurity_rules_file','/etc/nginx/modsec/modsecurity.conf']]
+                remove=remove or (len(values)>=3 and values[0]=='limit_req_zone' and values[1] in {'$binary_remote_addr','$server_name|$binary_remote_addr'} and values[2].startswith('zone=example_zone:'))
+                remove=remove or (len(values)>=2 and values[:2]==['limit_req','zone=example_zone'])
+                remove=remove or (len(values)>=3 and values[0]=='limit_conn_zone' and values[1] in {'$binary_remote_addr','$server_name|$binary_remote_addr'} and values[2].startswith('zone=addr:'))
+                remove=remove or (len(values)==3 and values[:2]==['limit_conn','addr'] and values[2].isdigit())
+                remove=remove or values in [['limit_req_status','429'],['limit_conn_status','429']]
+            if remove:removals.append((statement[0].start,statement[-1].end))
+    text=remove_statements(text,removals)
+    groups=statement_scopes(tokens(text))
+    module='/etc/nginx/conf.d/waf/load-module*.conf'
+    http_include='/etc/nginx/conf.d/waf/http*.conf'
+    def includes(group,target):return any(len(s)==3 and s[0].value=='include' and s[1].value.strip('\"\'')==target for s in group['statements'])
+    if not includes(groups[0],module):
         text = 'include /etc/nginx/conf.d/waf/load-module*.conf;\n' + text
-    if 'include /etc/nginx/conf.d/waf/http*.conf;' not in text:
-        matches = list(re.finditer(r'(?m)^\s*http\s*\{', text))
-        if len(matches) != 1:
-            raise ValueError("Expected one HTTP block")
-        pos = matches[0].end()
-        text = text[:pos] + '\n    include /etc/nginx/conf.d/waf/http*.conf;\n' + text[pos:]
+    groups=statement_scopes(tokens(text))
+    http=[group for group in groups.values() if group['kind']=='http']
+    if len(http)!=1:raise ValueError('Expected one HTTP block')
     # Keep the native script's existing engine switch and status readback working.
     # Rules and maps are still provided by the one shared managed bundle.
-    text=text.replace('    include /etc/nginx/conf.d/waf/http*.conf;',
-                      '    modsecurity on;\n    include /etc/nginx/conf.d/waf/http*.conf;')
+    pos=http[0]['open']
+    addition='\n    modsecurity on;'
+    if not includes(http[0],http_include):addition+='\n    include /etc/nginx/conf.d/waf/http*.conf;'
+    if not text[pos:].startswith('\n'):addition+='\n'
+    text=text[:pos]+addition+text[pos:]
     return text
 
 
-def strip_legacy_default_realip(text: str) -> str:
+def remove_statements(text,spans):
+    edits=[]
+    for start,end in spans:
+        left=text.rfind('\n',0,start)+1
+        right=text.find('\n',end)
+        if right<0:right=len(text)
+        # Remove a whole line only when it contains no other active directive.
+        if not text[left:start].strip() and (not text[end:right].strip() or text[end:right].lstrip().startswith('#')):
+            start,end=left,min(right+1,len(text))
+        edits.append((start,end))
+    for start,end in sorted(edits,reverse=True):text=text[:start]+text[end:]
+    return text
+
+
+def strip_legacy_default_realip(text: str,known_cidrs=()) -> str:
     # Legacy default10/default11 placed trust at HTTP scope after the catch-all.
     # Fail closed for unfamiliar mixed content instead of rewriting unknown policies.
     blocks = server_blocks(text)
     end = max((b['end'] for b in blocks), default=0)
     prefix, suffix = text[:end], text[end:]
-    rest = []
-    for line in suffix.splitlines():
-        if re.match(r'\s*(?:set_real_ip_from|real_ip_header|real_ip_recursive)\s+', line):
-            continue
-        if line.strip() and not line.lstrip().startswith('#'):
-            raise ValueError("Default file contains additional unmanaged directives")
-        rest.append(line)
-    if any(re.search(r'\b(?:set_real_ip_from|real_ip_header|real_ip_recursive)\s+', line)
-           for line in prefix.splitlines() if not line.lstrip().startswith('#')):
+    trusted={'172.0.0.0/8','fd00::/8',*known_cidrs}
+    spans=[]
+    for group in statement_scopes(tokens(suffix)).values():
+        for statement in group['statements']:
+            values=[t.value.strip('\"\'') for t in statement[:-1]]
+            if len(values)!=2:continue
+            if ((values[0]=='set_real_ip_from' and values[1] in trusted) or
+                values in [['real_ip_header','X-Forwarded-For'],['real_ip_header','CF-Connecting-IP'],
+                           ['real_ip_recursive','on'],['real_ip_recursive','off']]):
+                spans.append((statement[0].start,statement[-1].end))
+    if tokens(remove_statements(suffix,spans)):
+        raise ValueError('Default file contains additional unmanaged directives')
+    if any(s[0].value in {'set_real_ip_from','real_ip_header','real_ip_recursive'} for group in statement_scopes(tokens(prefix)).values() for s in group['statements']):
         raise ValueError("Default file has a custom server-level proxy policy")
     return prefix.rstrip() + '\n'
 
@@ -173,7 +206,7 @@ def statement_scopes(stream):
         if token.value == '{':
             serial += 1
             groups[serial] = {'parent': stack[-1], 'kind': stream[start].value,
-                              'head':[t.value for t in stream[start:i]], 'statements': []}
+                              'head':[t.value for t in stream[start:i]], 'open':token.end, 'statements': []}
             stack.append(serial)
             start = i + 1
         elif token.value == '}':

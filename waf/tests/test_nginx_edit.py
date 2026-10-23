@@ -74,11 +74,36 @@ http {
         self.assertIn('zone=custom_login', updated)
         self.assertEqual(nginx_edit.patch_main(updated), updated)
 
+    def test_inline_security_migration_preserves_authentication_and_limits(self):
+        text='load_module /etc/nginx/modules/ngx_http_modsecurity_module.so; events {} http {\nmodsecurity on; auth_request /auth;\nlimit_req zone=example_zone burst=100; auth_basic "Private";\nserver { modsecurity off; }\n}\n'
+        updated=nginx_edit.patch_main(text)
+        self.assertIn('auth_request /auth;',updated)
+        self.assertIn('auth_basic "Private";',updated)
+        self.assertIn('server { modsecurity off; }',updated)
+        self.assertNotIn('zone=example_zone',updated)
+        self.assertEqual(nginx_edit.patch_main(updated),updated)
+        inline='events {} http { include /etc/nginx/conf.d/waf/http*.conf; modsecurity on; auth_request /auth; }'
+        changed=nginx_edit.patch_main(inline)
+        self.assertIn('\n    modsecurity on;',changed)
+        self.assertIn('auth_request /auth;',changed)
+        self.assertEqual(nginx_edit.patch_main(changed),changed)
+
+    def test_inline_managed_include_migration_preserves_authentication(self):
+        text='server { server_name one.example;\n include /etc/nginx/conf.d/waf/server-default*.inc; auth_request /auth;\n}\n'
+        updated=nginx_edit.patch_site(text,{'sites':{}})
+        self.assertIn('auth_request /auth;',updated)
+        self.assertEqual(updated.count('server-default*.inc;'),1)
+        self.assertEqual(nginx_edit.patch_site(updated,{'sites':{}}),updated)
+
     def test_legacy_default_migration(self):
         text = 'server { server_name _; return 444; }\n# Old trust\nset_real_ip_from 172.0.0.0/8;\nreal_ip_header CF-Connecting-IP;\n'
         self.assertNotIn('set_real_ip_from', nginx_edit.strip_legacy_default_realip(text))
         with self.assertRaises(ValueError):
             nginx_edit.strip_legacy_default_realip(text + 'map $x $y { default 1; }\n')
+        with self.assertRaisesRegex(ValueError,'unmanaged directives'):
+            nginx_edit.strip_legacy_default_realip('server { server_name _; return 444; }\nset_real_ip_from 172.0.0.0/8; auth_request /auth;\n')
+        with self.assertRaisesRegex(ValueError,'unmanaged directives'):
+            nginx_edit.strip_legacy_default_realip('server { server_name _; return 444; }\nset_real_ip_from 10.2.3.4/32;\n')
 
 
 if __name__ == '__main__':
