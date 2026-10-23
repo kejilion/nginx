@@ -1,0 +1,20 @@
+# Managed compatibility override: business HTTP statuses are not attack evidence.
+# Retire only website jails shipped by the old native script. SSH is unchanged.
+[fail2ban-nginx-cc]
+enabled = false
+[nginx-418]
+enabled = false
+[nginx-bad-request]
+enabled = false
+[nginx-badbots]
+enabled = false
+[nginx-botsearch]
+enabled = false
+[nginx-deny]
+enabled = false
+[nginx-http-auth]
+enabled = false
+[nginx-unauthorized]
+enabled = false
+[php-url-fopen]
+enabled = false

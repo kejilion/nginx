@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "mode": "detect",
+  "banBackend": "none",
+  "cdn": "mixed",
+  "container": "nginx",
+  "sites": {},
+  "trustedProxies": [],
+  "proxyHeader": "X-Forwarded-For",
+  "rate": 50,
+  "burst": 200,
+  "connections": 256,
+  "attackRetries": 20,
+  "rateRetries": 120,
+  "banSeconds": 600
+}

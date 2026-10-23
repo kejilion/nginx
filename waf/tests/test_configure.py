@@ -1,0 +1,198 @@
+import pathlib
+import sys
+import unittest
+from unittest.mock import patch
+import tempfile
+import json
+import contextlib
+import hashlib
+import os
+import subprocess
+
+sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
+import configure as manage
+import nginx_edit
+
+
+class ManagedTrustTests(unittest.TestCase):
+    def test_profiles_and_legacy_modes_are_scoped_to_each_server(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory)
+            (root/'conf.d').mkdir()
+            (root/'html/wp.example/wp-includes').mkdir(parents=True)
+            main='events {}\nhttp { include conf.d/*.conf; }\n'
+            site='server { server_name wp.example; root /var/www/html/wp.example; modsecurity off; }\nserver { server_name api.example; root /var/www/html/api.example; location /assets { modsecurity off; } }\n'
+            (root/'nginx.conf').write_text(main)
+            (root/'conf.d/sites.conf').write_text(site)
+            config=json.loads((manage.BUNDLE/'example-policy.json').read_text())
+            config['mode']='on'
+            dump='# configuration file /etc/nginx/nginx.conf:\n'+main+'# configuration file /etc/nginx/conf.d/sites.conf:\n'+site
+            with patch.object(manage,'execute',return_value=dump),patch.object(manage,'kpanel_endpoints',return_value=set()):changes,sites=manage.make_plan(root,config)
+            self.assertEqual(config['sites']['wp.example'],{'profile':'wordpress','mode':'detect'})
+            self.assertNotIn('api.example',config['sites'])
+            self.assertIn(b'location /assets { modsecurity off; }',changes[root/'conf.d/sites.conf'])
+
+    def test_location_off_never_promotes_to_site_off(self):
+        text='server { server_name one.example; location /assets { modsecurity off; } }'
+        changed,sites=nginx_edit.migrate_server_off(text)
+        self.assertEqual(sites,[])
+        self.assertEqual(changed,text)
+        changed,sites=nginx_edit.migrate_server_off('server { server_name one.example; modsecurity off; location / { return 200; } }')
+        self.assertEqual(sites,['one.example'])
+        self.assertNotIn('modsecurity off;',changed)
+
+    def test_effective_header_scope_includes_http_and_includes(self):
+        main='http { proxy_set_header Host $host; proxy_set_header Upgrade $http_upgrade; include conf.d/site.conf; }'
+        site='server { server_name one.example; location / { proxy_pass http://backend; } }'
+        dump='# configuration file /etc/nginx/nginx.conf:\n'+main+'\n# configuration file /etc/nginx/conf.d/site.conf:\n'+site+'\n'
+        effective=nginx_edit.configuration_headers(dump)
+        changed=nginx_edit.patch_application(site,effective,'/etc/nginx/conf.d/site.conf')
+        self.assertIn('proxy_set_header Host $host;',changed)
+        self.assertIn('proxy_set_header Upgrade $http_upgrade;',changed)
+        self.assertEqual(nginx_edit.patch_application(changed),changed)
+
+    def test_identity_headers_are_case_insensitive_and_unique(self):
+        text='server { location / { proxy_set_header x-forwarded-for $http_x_forwarded_for; proxy_set_header X-Forwarded-For bad; proxy_set_header Host $host; proxy_pass http://backend; } }'
+        changed=nginx_edit.patch_application(text)
+        self.assertNotIn('$http_x_forwarded_for',changed)
+        self.assertNotIn(' bad;',changed)
+        self.assertEqual(changed.lower().count('proxy_set_header x-forwarded-for '),1)
+        self.assertIn('proxy_set_header Host $host;',changed)
+
+    def test_nearest_header_scope_replaces_whole_ancestor_set(self):
+        text='server { proxy_set_header Host old; proxy_set_header Upgrade old; location / { proxy_set_header Authorization token; location /sub { proxy_pass http://backend; } } }'
+        changed=nginx_edit.patch_application(text)
+        leaf=changed[changed.index('location /sub'):]
+        self.assertIn('proxy_set_header Authorization token;',leaf)
+        self.assertNotIn('proxy_set_header Host old;',leaf)
+        self.assertNotIn('proxy_set_header Upgrade old;',leaf)
+
+    def test_same_scope_external_identity_include_refused(self):
+        site='server { location / { include headers.conf; proxy_pass http://backend; } }'
+        dump='# configuration file /etc/nginx/nginx.conf:\nhttp { include conf.d/site.conf; }\n# configuration file /etc/nginx/conf.d/site.conf:\n'+site+'\n# configuration file /etc/nginx/headers.conf:\nproxy_set_header x-forwarded-for $http_x_forwarded_for;\n'
+        with self.assertRaises(ValueError):
+            nginx_edit.patch_application(site,nginx_edit.configuration_headers(dump),'/etc/nginx/conf.d/site.conf')
+
+    def test_managed_trust_dump(self):
+        manage.check_trust_dump('# configuration file /etc/nginx/conf.d/waf/realip.conf:\nset_real_ip_from 104.16.0.0/13;\nreal_ip_header CF-Connecting-IP;\n')
+
+    def test_custom_scoped_trust_dump(self):
+        manage.check_trust_dump('# configuration file /etc/nginx/conf.d/waf/realip-1234567890abcdef.conf:\nset_real_ip_from 10.2.3.4/32;\n')
+
+    def test_unmanaged_inherited_or_location_trust_rejected(self):
+        for filename in ['nginx.conf','conf.d/default.conf','conf.d/site.conf','conf.d/waf/not-realip.conf']:
+            with self.subTest(filename=filename),self.assertRaises(ValueError):
+                manage.check_trust_dump('# configuration file /etc/nginx/'+filename+':\nset_real_ip_from 0.0.0.0/0;\n')
+
+    def test_inline_proxy_trust_is_not_missed(self):
+        with self.assertRaises(ValueError):
+            manage.check_trust_dump('# configuration file /etc/nginx/conf.d/a.conf:\nserver { set_real_ip_from 0.0.0.0/0; }\n')
+
+    def test_existing_authentication_is_preserved(self):
+        for directive in ['auth_request /auth;','auth_request off;','satisfy any;']:
+            text='server { server_name one.example; '+directive+' }'
+            changed=nginx_edit.patch_site(text,{'sites':{}})
+            self.assertIn(directive,changed)
+
+    def test_relative_include_normalization_is_idempotent(self):
+        before='server { include fastcgi_params; include /root/custom.conf; }'
+        after=nginx_edit.absolute_includes(before)
+        self.assertIn('include "/etc/nginx/fastcgi_params";',after)
+        self.assertIn('include /root/custom.conf;',after)
+        self.assertEqual(after,nginx_edit.absolute_includes(after))
+
+    def test_relative_traversal_refused(self):
+        with self.assertRaises(ValueError):nginx_edit.absolute_includes('include ../secret;')
+
+
+class ConfigurationLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary=tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root=pathlib.Path(self.temporary.name).resolve()
+        # OS directory trust is tested separately; these tests isolate transactions.
+        self.addCleanup(patch.stopall)
+        patch.object(manage,'safe_parent').start()
+        patch.object(manage,'locked',side_effect=lambda path:contextlib.nullcontext()).start()
+        patch.object(manage,'atomic',side_effect=self.atomic).start()
+
+    def atomic(self,path,data,mode=0o600):
+        path.parent.mkdir(parents=True,exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(mode)
+
+    def test_external_failure_restores_old_files_and_removes_created_files(self):
+        old=self.root/'old.conf';old.write_bytes(b'user custom config\n')
+        new=self.root/'new.conf'
+        def rejected():raise RuntimeError('validation failed')
+        with self.assertRaisesRegex(RuntimeError,'validation failed'):
+            manage.external_update(self.root,{old:b'candidate',new:b'candidate'},'fixture',rejected)
+        self.assertEqual(old.read_bytes(),b'user custom config\n')
+        self.assertFalse(new.exists())
+        self.assertEqual(len(list((self.root/'backups/waf-managed').glob('*/preimage.json'))),1)
+
+    def test_policy_concurrency_conflict_does_not_write_any_configuration(self):
+        state=self.root/'config/waf/policy.json';self.atomic(state,b'newer policy')
+        with patch.object(manage,'make_plan') as plan,self.assertRaisesRegex(ValueError,'concurrently'):
+            manage.apply(self.root,{},expected=hashlib.sha256(b'old policy').hexdigest())
+        plan.assert_not_called()
+        self.assertEqual(state.read_bytes(),b'newer policy')
+
+    def test_identical_apply_reloads_without_growing_backups(self):
+        path=self.root/'site.conf';path.write_bytes(b'unchanged')
+        with patch.object(manage,'make_plan',return_value=({path:b'unchanged'},['one.example'])),patch.object(manage,'execute'),patch.object(manage,'reload_nginx') as reload:
+            result=manage.apply(self.root,{'mode':'on','container':'nginx'})
+        self.assertFalse(result['applied'])
+        reload.assert_called_once_with('nginx')
+        self.assertFalse((self.root/'backups').exists())
+
+    def test_backup_limit_preserves_existing_recovery_points(self):
+        directory=self.root/'backups/waf-managed';directory.mkdir(parents=True)
+        for index in range(3):
+            item=directory/str(index);item.mkdir();(item/'manifest.json').write_text('{}')
+        with patch.object(manage,'MAX_BACKUPS',3),self.assertRaisesRegex(ValueError,'count limit'):
+            manage.snapshot(self.root,{},'fixture')
+        self.assertEqual(len(list(directory.iterdir())),3)
+
+    def test_rollback_refuses_changed_or_missing_owned_files(self):
+        path=self.root/'site.conf';path.write_bytes(b'before')
+        backup=manage.snapshot(self.root,{path:b'after'},'fixture')
+        for value in [b'user later edit',None]:
+            if value is None:path.unlink()
+            else:path.write_bytes(value)
+            with self.subTest(value=value),self.assertRaisesRegex(ValueError,'changed since'):
+                manage.restore(self.root,backup)
+
+    @unittest.skipUnless(os.name=='posix','Linux cron paths')
+    def test_cron_install_failure_restores_preexisting_cron_and_configuration(self):
+        path=self.root/'config/waf/logrotate.conf';self.atomic(path,b'old rotation')
+        before='17 3 * * * /usr/local/bin/user-backup\n'
+        calls=[]
+        def run(args,**kwargs):
+            calls.append((args,kwargs.get('input')))
+            if args==['crontab','-l']:return subprocess.CompletedProcess(args,0,before,'')
+            if len(calls)==2:raise subprocess.CalledProcessError(1,args)
+            return subprocess.CompletedProcess(args,0,'','')
+        with patch.object(manage.shutil,'which',side_effect=lambda name:'/usr/sbin/'+name),patch.object(manage,'execute'),patch.object(manage.subprocess,'run',side_effect=run):
+            with self.assertRaises(subprocess.CalledProcessError):manage.rotation(self.root,{})
+        self.assertEqual(calls[-1],(['crontab','-'],before))
+        self.assertEqual(path.read_bytes(),b'old rotation')
+
+    def test_cloudflare_trust_preserves_existing_inspection_profiles_and_backend(self):
+        self.atomic(self.root/'config/waf/policy.json',b'{}')
+        config={'mode':'on','banBackend':'existing','sites':{'one.example':{'profile':'api','mode':'detect'}}}
+        with patch.object(manage,'apply',return_value={'applied':True}) as apply:
+            manage.trust_cloudflare(self.root,config,'exact-policy-hash')
+        self.assertEqual(config['mode'],'on')
+        self.assertEqual(config['banBackend'],'existing')
+        self.assertEqual(config['sites']['one.example'],{'profile':'api','mode':'detect'})
+        self.assertEqual(apply.call_args.kwargs['expected'],'exact-policy-hash')
+
+
+@unittest.skipUnless(os.name=='posix','POSIX ownership and symlink checks')
+class DirectoryTrustTests(unittest.TestCase):
+    def test_dangling_parent_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent=pathlib.Path(directory)/'parent'
+            parent.symlink_to(pathlib.Path(directory)/'absent',target_is_directory=True)
+            with self.assertRaisesRegex(ValueError,'Unsafe parent'):manage.safe_parent(parent/'file')

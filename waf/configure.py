@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""Configure the existing Nginx/ModSecurity chain without installing a service."""
+from __future__ import annotations
+import argparse
+import base64
+import contextlib
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import tempfile
+import time
+import shutil
+import urllib.request
+import nginx_edit
+import policy
+BUNDLE=Path(__file__).resolve().parent
+MAX_BACKUPS=128
+MAX_BACKUP_BYTES=64*1024*1024
+
+def safe_parent(path: Path):
+    """Root actions must not follow replaceable directories supplied by a web user."""
+    for parent in [path.parent, *path.parent.parents]:
+        if not parent.exists() and not parent.is_symlink():
+            continue
+        info = parent.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError('Unsafe parent directory: ' + str(parent))
+        if hasattr(os, 'geteuid') and (info.st_uid != os.geteuid() or info.st_mode & 0o022):
+            raise ValueError('Untrusted parent ownership/permissions: ' + str(parent))
+
+
+def atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
+    safe_parent(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise ValueError("Refusing symlink: " + str(path))
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', dir=str(path.parent))
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def load_json(path: Path, default=None):
+    safe_parent(path)
+    if path.is_symlink():
+        raise ValueError("Refusing symlink: " + str(path))
+    if not path.exists():
+        if default is not None:
+            return default
+        raise FileNotFoundError(path)
+    info = path.stat()
+    if info.st_size > policy.MAX_STATE_BYTES or (os.name=='posix' and info.st_mode & 0o022):
+        raise ValueError("Unsafe state size or permissions: " + str(path))
+    if hasattr(os, 'geteuid') and info.st_uid != os.geteuid():
+        raise ValueError("State owner mismatch")
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+@contextlib.contextmanager
+def locked(path: Path):
+    import fcntl
+    safe_parent(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError('Unsafe lock file')
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def reload_nginx(container):
+    def workers():
+        output=execute('docker','top',container,'-eo','pid,args')
+        return {line.split()[0] for line in output.splitlines() if 'nginx: worker process' in line and 'shutting down' not in line}
+    before=workers()
+    if not before:raise RuntimeError('No serving Nginx workers')
+    execute('docker','exec',container,'nginx','-s','reload')
+    deadline=time.monotonic()+20
+    while time.monotonic()<deadline:
+        after=workers()
+        if after and not (after & before):return
+        time.sleep(0.2)
+    raise RuntimeError('New Nginx worker generation was not observed')
+
+def external_update(root,files,label,apply_command):
+    """Fixed integration files; preserve preimage on validation failure."""
+    with locked(root/'config/waf/install.lock'):
+        return _external_update(root,files,label,apply_command)
+
+
+def _external_update(root,files,label,apply_command):
+    backup_budget(root)
+    directory=root/'backups/waf-managed'/(
+        datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')+'-'+label)
+    safe_parent(directory/'preimage.json')
+    directory.mkdir(parents=True,mode=0o700)
+    previous={}
+    for path in files:
+        safe_parent(path)
+        if path.exists():read_config(path)
+        previous[str(path)]={'before':base64.b64encode(path.read_bytes()).decode() if path.exists() else None,
+                             'mode':path.stat().st_mode & 0o777 if path.exists() else 0o644}
+    atomic(directory/'preimage.json',(json.dumps(previous)+'\n').encode())
+    try:
+        for path,data in files.items():atomic(path,data,0o644)
+        apply_command()
+    except Exception:
+        for raw,item in previous.items():
+            path=Path(raw)
+            if item['before'] is None:
+                if path.exists():path.unlink()
+            else:atomic(path,base64.b64decode(item['before']),item['mode'])
+        raise
+    return {'updated':True,'backup':str(directory)}
+
+
+def fail2ban_update(root,legacy=False):
+    if not shutil.which('fail2ban-client'):return {'updated':False,'reason':'fail2ban-not-installed'}
+    if legacy:files={Path('/etc/fail2ban/jail.d/zz-kejilion-web-baseline.local'):(BUNDLE/'legacy-jails.local').read_bytes()}
+    else:
+        jail=Path('/etc/fail2ban/jail.d/zz-waf-managed.local')
+        if not jail.exists():return {'updated':False,'reason':'no-existing-shared-jails'}
+        before=read_config(jail)
+        if not before.startswith('# Managed shared WAF;'):raise ValueError('Existing jail requires explicit migration')
+        files={Path('/etc/fail2ban/filter.d')/name:data.encode() for name,data in policy.render_filters().items()}
+        files[jail]=before.replace(str(root/'log/nginx/error.log'),str(root/'log/nginx/waf-audit.json')).encode()
+        log=root/'log/nginx/waf-audit.json'
+        safe_parent(log)
+        if log.is_symlink():raise ValueError('Unsafe audit log')
+        log.touch(exist_ok=True);log.chmod(0o640)
+    active=subprocess.run(['fail2ban-client','ping'],capture_output=True,timeout=10).returncode==0
+    def validate():
+        execute('fail2ban-client','-t')
+        if active:execute('fail2ban-client','reload')
+    try:return external_update(root,files,'legacy-jails' if legacy else 'filters',validate)
+    except Exception:
+        if active:execute('fail2ban-client','reload')
+        raise
+
+
+def rotation(root,config):
+    with locked(root/'config/waf/install.lock'):
+        return _rotation(root,config)
+
+
+def _rotation(root,config):
+    binary=shutil.which('logrotate')
+    if not binary or not shutil.which('crontab'):raise ValueError('Install logrotate and enable the existing cron service first')
+    if not all(re.fullmatch(r'/[A-Za-z0-9_./-]+',x) for x in [str(root),binary]):raise ValueError('Unsupported rotation paths')
+    directory=root/'config/waf';path=directory/'logrotate.conf'
+    content=(str(root/'log/nginx/waf-rate.log')+' '+str(root/'log/nginx/waf-audit.json')+''' {
+    daily
+    maxsize 10M
+    rotate 4
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 root root
+}
+''').encode()
+    crontab=subprocess.run(['crontab','-l'],capture_output=True,text=True,timeout=10)
+    if crontab.returncode and 'no crontab' not in crontab.stderr.lower():raise ValueError('Unable to preserve existing crontab')
+    before=crontab.stdout if crontab.returncode==0 else ''
+    marker='# kejilion-waf-logrotate'
+    job='* * * * * '+binary+' --state '+str(directory/'logrotate.status')+' '+str(path)+' >/dev/null 2>&1 '+marker
+    lines=[line for line in before.splitlines() if not line.endswith(marker)]
+    updated='\n'.join([*lines,job])+'\n'
+    backup=directory/'logrotate-cron-preimage.txt'
+    if not backup.exists():atomic(backup,before.encode())
+    def validate():
+        execute(binary,'--debug','--state',str(directory/'logrotate.status'),str(path))
+        try:
+            subprocess.run(['crontab','-'],input=updated,text=True,capture_output=True,timeout=10,check=True)
+        except Exception:
+            # A failed or interrupted installer may already have changed cron.
+            # Restore exactly the preimage instead of dropping unrelated jobs.
+            subprocess.run(['crontab','-'],input=before,text=True,capture_output=True,timeout=10,check=True)
+            raise
+    return _external_update(root,{path:content},'rotation',validate)
+
+
+def trust_cloudflare(root,config,expected):
+    if (root/'config/waf/policy.json').exists():
+        config['cdn']='mixed'
+        return apply(root,config,expected=expected)
+    path=root/'conf.d/default.conf'
+    cf=load_json(BUNDLE/'cloudflare-ips.json')
+    replacement=nginx_edit.strip_legacy_default_realip(read_config(path))+policy.render_realip({'cdn':'cloudflare'},policy.networks(cf))
+    changes={path:replacement.encode()}
+    with locked(root/'config/waf/install.lock'):
+        backup=snapshot(root,changes,'cloudflare')
+        try:
+            atomic(path,changes[path],0o644)
+            execute('docker','exec',config['container'],'nginx','-t')
+            reload_nginx(config['container'])
+        except Exception:
+            restore(root,backup,verify=False)
+            execute('docker','exec',config['container'],'nginx','-t')
+            reload_nginx(config['container'])
+            raise
+    return {'cdn':'cloudflare','inspectionChanged':False,'backup':str(backup)}
+
+
+def execute(*args):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        raise RuntimeError('Command failed: ' + ' '.join(args[:4]) + ': ' + (result.stderr or result.stdout)[-1600:])
+    return result.stdout
+
+
+def kpanel_endpoints():
+    """Identify the native KPanel container without reading credentials/env."""
+    result=subprocess.run(['docker','inspect','kejilion-panel','--format','{{json .NetworkSettings}}'],
+                          capture_output=True,text=True,timeout=10)
+    if result.returncode:return set()
+    if len(result.stdout)>65536:raise ValueError('Container endpoint metadata exceeds budget')
+    data=json.loads(result.stdout)
+    addresses=set()
+    for name,bindings in (data.get('Ports') or {}).items():
+        if not name.endswith('/tcp'):continue
+        port=name.split('/')[0]
+        for binding in bindings or []:
+            addresses.update((host,binding['HostPort']) for host in ['127.0.0.1','0.0.0.0','localhost'])
+        for network in (data.get('Networks') or {}).values():
+            for field in ['IPAddress','GlobalIPv6Address']:
+                if network.get(field):addresses.add((network[field],port))
+    return addresses
+
+
+def app_is_kpanel(text,block,endpoints):
+    if not endpoints:return False
+    import urllib.parse
+    groups=nginx_edit.statement_scopes(nginx_edit.tokens(text))
+    upstreams={}
+    for group in groups.values():
+        if group['kind']=='upstream':
+            head=group['head']
+            if len(head)>1:
+                upstreams[head[1]]=[s[1].value for s in group['statements'] if s[0].value=='server']
+    body=text[block['open']:block['close']]
+    for group in nginx_edit.statement_scopes(nginx_edit.tokens(body)).values():
+        for statement in group['statements']:
+            if statement[0].value!='proxy_pass':continue
+            value=urllib.parse.urlsplit(statement[1].value)
+            targets=upstreams.get(value.hostname,[statement[1].value])
+            for target in targets:
+                address=urllib.parse.urlsplit(target if '://' in target else 'http://'+target)
+                try:port=str(address.port or (443 if address.scheme=='https' else 80))
+                except ValueError:continue
+                if (address.hostname,port) in endpoints:return True
+    return False
+
+
+def read_config(path):
+    safe_parent(path)
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError('Unsafe or excessive configuration: ' + str(path))
+    info=path.stat()
+    if hasattr(os,'geteuid') and (info.st_uid!=os.geteuid() or info.st_mode & 0o022):
+        raise ValueError('Untrusted configuration ownership/permissions: '+str(path))
+    return path.read_text(encoding='utf-8')
+
+
+def write(path, data, mode=0o644, inplace=False):
+    if not inplace:
+        atomic(path, data, mode)
+        return
+    # Docker single-file bind mounts retain their inode. The candidate was already
+    # syntax checked; preserve that inode and fsync, with an exact preimage rollback.
+    safe_parent(path)
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0))
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def make_plan(root, config, cfdata=None):
+    policy.validate(config)
+    current=root/'config/waf/cloudflare-ips.json'
+    cfdata=cfdata or load_json(current if current.exists() else BUNDLE/'cloudflare-ips.json')
+    cloudflare = policy.networks(cfdata)
+    changes = {}
+    main = root / 'nginx.conf'
+    header_scopes=nginx_edit.configuration_headers(execute('docker','exec',config['container'],'nginx','-T'))
+    allowed_proxy_files={'/etc/nginx/conf.d/'+p.name for p in (root/'conf.d').glob('*.conf')}
+    if any(name not in allowed_proxy_files and not name.startswith('/etc/nginx/conf.d/waf/') for name,_ in header_scopes):
+        raise ValueError('Proxy directives outside managed site files need explicit integration')
+    main_text=read_config(main)
+    if not (root/'config/waf/policy.json').exists():
+        for field,pattern in [('rate',r'zone=example_zone:[^;]+rate=(\d+)r/s'),
+                              ('burst',r'limit_req zone=example_zone burst=(\d+)'),
+                              ('connections',r'limit_conn addr (\d+);')]:
+            found=re.search(pattern,main_text)
+            if found:config[field]=max(config.get(field,{'rate':50,'burst':200,'connections':256}[field]),int(found[1]))
+        policy.validate(config)
+    changes[main] = nginx_edit.absolute_includes(nginx_edit.patch_main(main_text)).encode()
+    discovered = []
+    panel=kpanel_endpoints()
+    configs = list(sorted((root / 'conf.d').glob('*.conf')))
+    if len(configs) > 250:
+        raise ValueError('Site file count exceeds supported budget')
+    for path in configs:
+        text = read_config(path)
+        scopes = nginx_edit.site_scopes(text)
+        discovered += [s for s in scopes if s != '_']
+        if not scopes:
+            continue
+        for block in nginx_edit.server_blocks(text):
+            if not block['names'] or block['names'][0]=='_':continue
+            name=block['names'][0]
+            if app_is_kpanel(text,block,panel):config['sites'].setdefault(name,{}).setdefault('profile','kpanel')
+            # Only the server's own document root identifies its application.
+            groups=nginx_edit.statement_scopes(nginx_edit.tokens(text[block['open']:block['close']]))
+            roots=[s[1].value.strip('\"\'') for s in groups[0]['statements'] if s[0].value=='root']
+            roots=[r for r in roots if re.fullmatch(r'/var/www/html/[A-Za-z0-9_./-]+',r)]
+            if any((root/'html'/value.removeprefix('/var/www/html/')/'wp-includes').is_dir() for value in roots):
+                config['sites'].setdefault(name,{}).setdefault('profile','wordpress')
+        text=nginx_edit.patch_application(text,header_scopes,'/etc/nginx/conf.d/'+path.name)
+        if path.name == 'default.conf':
+            text = nginx_edit.strip_legacy_default_realip(text)
+        # Historical whole-site switches are migration work, not permanent bypasses.
+        # Preserve an explicit replacement; otherwise start that site in detection.
+        text,legacy_off=nginx_edit.migrate_server_off(text)
+        for name in legacy_off:config['sites'].setdefault(name,{}).setdefault('mode','detect')
+        changes[path] = nginx_edit.absolute_includes(nginx_edit.patch_site(text, config)).encode()
+    if not discovered:
+        raise ValueError('No application sites found')
+    if len(set(discovered)) > policy.MAX_SITES:
+        raise ValueError('Site count exceeds supported budget')
+    policy.validate(config)
+    directory = root / 'conf.d/waf'
+    for name, content in policy.bundle_files(config, cloudflare).items():
+        changes[directory / name] = content.encode()
+    changes[directory / 'cloudflare-ips.json'] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()
+    changes[current] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()
+    # The package is managed as a unit; no code or credentials are downloaded at run time.
+    for name in ['policy.py', 'nginx_edit.py', 'configure.py', 'example-policy.json', 'legacy-jails.local']:
+        changes[directory / name] = (BUNDLE / name).read_bytes()
+    changes[root / 'config/waf/policy.json'] = (json.dumps(config, indent=2, sort_keys=True)+'\n').encode()
+    if not (directory / 'blocked.map').exists():
+        changes[directory / 'blocked.map'] = policy.render_bans({}, int(time.time())).encode()
+    for path in changes:
+        safe_parent(path)
+        if path.is_symlink():
+            raise ValueError('Symlink target refused: ' + str(path))
+    return changes, sorted(set(discovered))
+
+
+def snapshot(root, changes, label):
+    backup_budget(root)
+    directory = root / 'backups/waf-managed' / (datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')+'-'+label)
+    safe_parent(directory/'manifest.json')
+    directory.mkdir(parents=True, mode=0o700)
+    records = {}
+    total = 0
+    for path in changes:
+        before = path.read_bytes() if path.exists() else None
+        total += len(before or b'')
+        if total > 2*1024*1024:
+            raise ValueError('Backup budget exceeded')
+        records[str(path.relative_to(root))] = {
+            'before': base64.b64encode(before).decode() if before is not None else None,
+            'mode': (path.stat().st_mode & 0o777) if before is not None else 0o644,
+            'afterSha256': hashlib.sha256(changes[path]).hexdigest(),
+        }
+    atomic(directory / 'manifest.json', (json.dumps({'schemaVersion':1, 'files':records},sort_keys=True)+'\n').encode())
+    return directory
+
+
+def backup_budget(root):
+    """Refuse unbounded backup growth; never silently prune user recovery points."""
+    directory=root/'backups/waf-managed'
+    safe_parent(directory/'manifest.json')
+    if not directory.exists():return
+    count=total=0
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            count+=1
+            if count>=MAX_BACKUPS:raise ValueError('Managed backup count limit reached; archive older recovery points first')
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):raise ValueError('Unrecognized managed backup entry')
+            for name in ['manifest.json','preimage.json']:
+                path=Path(entry.path)/name
+                if path.is_symlink():raise ValueError('Unsafe backup manifest')
+                if path.exists():total+=path.stat().st_size
+            if total>MAX_BACKUP_BYTES-4*1024*1024:raise ValueError('Managed backup byte limit reached; archive older recovery points first')
+
+
+def check_trust_dump(text):
+    files=re.split(r'(?m)^# configuration file ([^\r\n]+):\n',text)
+    for index in range(1,len(files),2):
+        current,body=files[index:index+2]
+        stream=nginx_edit.tokens(body)
+        for i,token in enumerate(stream):
+            if i and stream[i-1].value not in {';','{','}'}:continue
+            if token.value in {'set_real_ip_from','real_ip_header','real_ip_recursive'}:
+                if not re.fullmatch(r'/etc/nginx/conf\.d/waf/realip(?:-[a-f0-9]{16})?\.conf',current):
+                    raise ValueError('Unmanaged proxy trust requires explicit policy migration: '+current)
+
+
+def restore(root, backup, verify=True):
+    directory = (root / 'backups/waf-managed').resolve()
+    backup = backup.absolute()
+    if backup.resolve() != backup or directory not in backup.parents:
+        raise ValueError('Rollback must use a managed backup inside the installation')
+    manifest = load_json(backup / 'manifest.json')
+    paths = []
+    for relative, item in manifest['files'].items():
+        path = root / relative
+        if path.resolve() != path or root not in path.parents:
+            raise ValueError('Invalid backup target')
+        safe_parent(path)
+        if verify and (not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != item['afterSha256']):
+            raise ValueError('Configuration changed since install; explicit conflict resolution required: '+relative)
+        paths.append((path,item))
+    # Restore the main configuration first so no new includes remain on next reload.
+    for path,item in paths:
+        if item['before'] is None:
+            if path.exists():
+                path.unlink()
+        else:
+            write(path,base64.b64decode(item['before']),item['mode'],inplace=path==root/'nginx.conf')
+
+
+UNSET=object()
+
+
+def apply(root, config, cfdata=None, expected=UNSET):
+    with locked(root / 'config/waf/install.lock'):
+        current=root/'config/waf/policy.json'
+        actual=hashlib.sha256(current.read_bytes()).hexdigest() if current.exists() else None
+        if expected is not UNSET and actual!=expected:
+            raise ValueError('Policy changed concurrently; retry against current configuration')
+        changes, sites = make_plan(root, config,cfdata)
+        changes={path:data for path,data in changes.items() if not path.exists() or path.read_bytes()!=data}
+        if not changes:
+            execute('docker','exec',config['container'],'nginx','-t')
+            reload_nginx(config['container'])
+            return {'applied':False,'mode':config['mode'],'sites':sites,'version':policy.VERSION}
+        backup = snapshot(root, changes, 'policy')
+        container = config['container']
+        candidate = root / 'conf.d/waf/pending-nginx.conf'
+        try:
+            for path,content in changes.items():
+                if path != root / 'nginx.conf':
+                    atomic(path,content,0o600 if path.name=='policy.json' else 0o644)
+            atomic(candidate,changes.get(root/'nginx.conf',(root/'nginx.conf').read_bytes()))
+            dump=execute('docker','exec',container,'nginx','-T','-c','/etc/nginx/conf.d/waf/pending-nginx.conf')
+            check_trust_dump(dump)
+            if root/'nginx.conf' in changes:write(root/'nginx.conf',changes[root/'nginx.conf'],inplace=True)
+            execute('docker','exec',container,'nginx','-t')
+            reload_nginx(config['container'])
+        except Exception:
+            restore(root,backup,verify=False)
+            execute('docker','exec',container,'nginx','-t')
+            execute('docker','exec',container,'nginx','-s','reload')
+            raise
+        finally:
+            if candidate.exists():
+                candidate.unlink()
+        atomic(root/'config/waf/last-backup.json',(json.dumps({'path':str(backup)})+'\n').encode())
+        return {'applied':True,'mode':config['mode'],'sites':sites,'backup':str(backup),'version':policy.VERSION}
+
+
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--root',type=Path,default=Path('/home/web'))
+    parser.add_argument('action',choices=['plan','apply','configure','doctor','status','rollback','refresh-ips','retire-jails','existing-filters','rotation','trust-cloudflare'])
+    parser.add_argument('--policy',type=Path)
+    parser.add_argument('--backup',type=Path)
+    parser.add_argument('--mode',choices=sorted(policy.MODES))
+    parser.add_argument('--cdn',choices=['direct','cloudflare','mixed','proxy'])
+    parser.add_argument('--site')
+    parser.add_argument('--profile',choices=sorted(policy.PROFILES))
+    args=parser.parse_args()
+    if args.profile and not args.site:parser.error('--profile requires --site')
+    if args.action!='configure' and any([args.mode,args.site,args.profile,args.cdn]):parser.error('Policy options require configure')
+    if os.geteuid()!=0:parser.error('Root privileges required')
+    root=args.root.absolute()
+    safe_parent(root/'config/waf/policy.json')
+    if root.resolve()!=root or str(root)=='/':raise ValueError('Unsafe root')
+    default=root/'config/waf/policy.json'
+    expected=hashlib.sha256(default.read_bytes()).hexdigest() if default.exists() else None
+    if args.action in {'configure','retire-jails','trust-cloudflare'} and not default.exists():default=BUNDLE/'example-policy.json'
+    config=policy.validate(load_json(args.policy or default))
+    if args.action=='rollback':
+        if not args.backup:parser.error('--backup required')
+        with locked(root/'config/waf/install.lock'):
+            restore(root,args.backup)
+            execute('docker','exec',config['container'],'nginx','-t')
+            reload_nginx(config['container'])
+        result={'rolledBack':True}
+    else:
+        if args.action=='configure':
+            if args.site:
+                site=config['sites'].setdefault(policy.scope(args.site),{})
+                if args.mode:site['mode']=args.mode
+                if args.profile:site['profile']=args.profile
+                if args.cdn:site['cdn']=args.cdn
+            else:
+                if args.mode:
+                    config['mode']=args.mode
+                    for item in config['sites'].values():item.pop('mode',None)
+                if args.cdn:config['cdn']=args.cdn
+            config['logTimezone']='UTC'+execute('docker','exec',config['container'],'date','+%z').strip()
+        if args.action=='trust-cloudflare':result=trust_cloudflare(root,config,expected)
+        elif args.action=='retire-jails':result=fail2ban_update(root,legacy=True)
+        elif args.action=='existing-filters':result=fail2ban_update(root)
+        elif args.action=='rotation':result=rotation(root,config)
+        elif args.action=='plan':
+            changes,sites=make_plan(root,config)
+            result={'sites':sites,'files':[str(p) for p,c in changes.items() if not p.exists() or p.read_bytes()!=c],'policy':config}
+        elif args.action in {'apply','configure'}:result=apply(root,config,expected=expected)
+        elif args.action=='refresh-ips':
+            with urllib.request.urlopen('https://api.cloudflare.com/client/v4/ips',timeout=20) as response:raw=response.read(65537)
+            if len(raw)>65536:raise ValueError('Cloudflare address response exceeds budget')
+            data=json.loads(raw)
+            if data.get('success') is not True:raise ValueError('Cloudflare address update failed')
+            addresses=data['result']
+            policy.networks(addresses)
+            result=apply(root,config,{'ipv4_cidrs':addresses['ipv4_cidrs'],'ipv6_cidrs':addresses['ipv6_cidrs']},expected=expected)
+        else:
+            if args.action=='doctor':execute('docker','exec',config['container'],'nginx','-t')
+            modes=[site.get('mode',config['mode']) for site in config['sites'].values()] or [config['mode']]
+            engine=bool(re.search(r'(?m)^\s*modsecurity on;',read_config(root/'nginx.conf')))
+            mode='off' if not engine or set(modes)=={'off'} else (modes[0] if len(set(modes))==1 else 'mixed')
+            result={'syntax':'passed' if args.action=='doctor' else 'not-checked','mode':mode,'engineEnabled':engine,
+                    'sites':config['sites'],'banBackend':config.get('banBackend','existing')}
+    print(json.dumps(result,sort_keys=True))
+
+if __name__=='__main__':
+    try:main()
+    except Exception as error:
+        print(json.dumps({'error':str(error)[:2000]}),file=__import__('sys').stderr)
+        raise SystemExit(1)
