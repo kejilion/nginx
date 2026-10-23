@@ -115,6 +115,13 @@ class PolicyTests(unittest.TestCase):
         self.assertIn('inbound_anomaly_score_threshold=5', policy.render_profile_rules(self.config))
         self.assertIn('burst=400', policy.render_http(self.config))
 
+    def test_early_blocking_keeps_scoring_and_auditable_rule_ids(self):
+        rendered = policy.render_profile_rules(self.config)
+        self.assertIn('setvar:tx.early_blocking=1', rendered)
+        self.assertIn('inbound_anomaly_score_threshold=5', rendered)
+        self.assertIn('outbound_anomaly_score_threshold=4', rendered)
+        self.assertIn('949111', policy.render_filters()['waf-attack.conf'])
+
     def test_events_use_engine_signals_not_response_status(self):
         rendered = policy.render_http(self.config)
         self.assertIn('$limit_req_status:$limit_conn_status', rendered)

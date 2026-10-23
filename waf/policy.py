@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 MAX_SITES = 200
 MAX_BANS = 10000
 MAX_STATE_BYTES = 4 * 1024 * 1024
@@ -190,6 +190,9 @@ def render_profile_rules(config: dict) -> str:
         '# Settings run after vendor setup, before CRS and application exclusions.',
         'SecAction "id:1100,phase:1,pass,nolog,t:none,setvar:tx.inbound_anomaly_score_threshold=5,setvar:tx.outbound_anomaly_score_threshold=4,setvar:tx.blocking_paranoia_level=1,setvar:tx.detection_paranoia_level=1,setvar:tx.wordpress-rule-exclusions-plugin_enabled=0"',
         'SecAction "id:1101,phase:1,pass,nolog,t:none,setvar:\'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE\'"',
+        # CRS may reject a phase-1 score before buffering/inspecting the body.
+        # DetectionOnly still runs every phase, preserving false-positive tuning.
+        'SecAction "id:1102,phase:1,pass,nolog,t:none,setvar:tx.early_blocking=1"',
     ]
     global_mode = config["mode"]
     # Explicit site settings precede the fallback. Every transaction starts fresh.

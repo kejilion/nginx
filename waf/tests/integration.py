@@ -251,6 +251,19 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         check('artifact-exclusion-never-applies-to-other-sites',path='/https://github.com/org/repo/raw/main/test.sh',expected=403)
         check('ACME-does-not-bypass-CRS', path='/.well-known/acme-challenge/token' + sqli[1:], expected=403)
         check('detection-mode', host='detect.example', path=sqli)
+        check('early-header-denial', host='api.example', path='/early-header', method='POST',
+              body=json.dumps({'text':'normal body '*4096}).encode(),
+              headers={'Content-Type':'application/json','User-Agent':'sqlmap/1.8'}, expected=403)
+        check('early-blocking-detection-mode-keeps-body-processing', host='detect.example', path='/detect-early-header', method='POST',
+              body=json.dumps({'text':"1' UNION SELECT password FROM users--"}).encode(),
+              headers={'Content-Type':'application/json','User-Agent':'sqlmap/1.8'})
+        transactions = [json.loads(line)['transaction'] for line in (work / 'logs/waf-audit.json').read_text().splitlines()]
+        early = next(item for item in transactions if item['request']['uri'] == '/early-header')
+        detect = next(item for item in transactions if item['request']['uri'] == '/detect-early-header')
+        early_ids = {message['details']['ruleId'] for message in early['messages']}
+        detect_ids = {message['details']['ruleId'] for message in detect['messages']}
+        assert '949111' in early_ids and not any(rule.startswith('942') for rule in early_ids), early_ids
+        assert '913100' in detect_ids and '942100' in detect_ids, detect_ids
         check('off-mode', host='off.example', path=sqli)
         check('absolute-form-cannot-select-off-policy', host='off.example', path='http://one.example' + sqli, expected=403)
         check('WordPress-password', host='wordpress.example', path='/wp-login.php', method='POST',
