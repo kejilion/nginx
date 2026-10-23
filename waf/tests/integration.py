@@ -296,11 +296,11 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         (generated/'profile-rules.conf').write_text(policy.render_profile_rules(disabled))
         (work/'nginx.conf').write_text(fixture.replace('modsecurity on;','# modsecurity on;'))
         def reload_fixture():
-            before=set(run('docker','top',name,'-eo','pid,args').stdout.decode().splitlines())
+            before={line.split()[0] for line in run('docker','top',name,'-eo','pid,args').stdout.decode().splitlines() if 'nginx: worker process' in line}
             run('docker','exec',name,'nginx','-s','reload')
             for _ in range(100):
-                after=set(run('docker','top',name,'-eo','pid,args').stdout.decode().splitlines())
-                if any('nginx: worker process' in line and 'shutting down' not in line and line not in before for line in after):return
+                after={line.split()[0] for line in run('docker','top',name,'-eo','pid,args').stdout.decode().splitlines() if 'nginx: worker process' in line}
+                if after and not (after & before):return
                 time.sleep(0.1)
             raise RuntimeError('No new fixture worker after toggle')
         reload_fixture()
