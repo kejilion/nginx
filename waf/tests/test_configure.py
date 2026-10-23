@@ -173,11 +173,22 @@ class ConfigurationLifecycleTests(unittest.TestCase):
         (self.root/'conf.d/sites.conf').write_text('server { server_name one.example; } server { server_name two.example; }')
         (self.root/'nginx.conf').write_text('http {\n modsecurity on;\n}')
         config={'mode':'detect','sites':{'one.example':{'mode':'on'}}}
-        status=manage.configured_status(self.root,config)
+        dump='# configuration file /etc/nginx/nginx.conf:\nhttp {modsecurity on;}'
+        with patch.object(manage,'execute',return_value=dump):status=manage.configured_status(self.root,config)
         self.assertEqual(status['mode'],'mixed')
         self.assertEqual(status['siteCount'],2)
         config['sites']['two.example']={'mode':'on'}
-        self.assertEqual(manage.configured_status(self.root,config)['mode'],'on')
+        with patch.object(manage,'execute',return_value=dump):self.assertEqual(manage.configured_status(self.root,config)['mode'],'on')
+
+    def test_status_rejects_external_http_switch_instead_of_false_off(self):
+        (self.root/'conf.d').mkdir()
+        (self.root/'conf.d/site.conf').write_text('server { server_name one.example; }',encoding='utf-8')
+        main='http { # modsecurity on;\n include /etc/nginx/custom.inc; }'
+        (self.root/'nginx.conf').write_text(main,encoding='utf-8')
+        for mode in ['on','off']:
+            dump='# configuration file /etc/nginx/nginx.conf:\n'+main+'\n# configuration file /etc/nginx/custom.inc:\nmodsecurity '+mode+';\n'
+            with self.subTest(mode=mode),patch.object(manage,'execute',return_value=dump),self.assertRaisesRegex(ValueError,'HTTP WAF switch'):
+                manage.configured_status(self.root,{'mode':'off','sites':{}})
 
     def test_identical_apply_reloads_without_growing_backups(self):
         path=self.root/'site.conf';path.write_bytes(b'unchanged')

@@ -262,9 +262,18 @@ def configuration_headers(dump, managed_sites=None):
     groups=statement_scopes(expand(main))
     if managed_sites is not None:
         for ident, group in groups.items():
-            if group['kind']=='http':continue
             for statement in group['statements']:
-                if [t.value for t in statement[:-1]]!=['modsecurity','on']:continue
+                values=[t.value for t in statement[:-1]]
+                if not values or values[0]!='modsecurity':continue
+                if group['kind']=='http':
+                    if statement[0].source!=main:
+                        raise ValueError('HTTP WAF switch in an external include needs explicit integration')
+                    continue
+                if values==['modsecurity','off']:
+                    if group['kind']=='server' and statement[0].source not in managed_sites:
+                        raise ValueError('Server WAF switch in an external include needs explicit integration')
+                    continue
+                if values!=['modsecurity','on']:continue
                 if group['kind'] not in {'server','location'} or statement[0].source not in managed_sites:
                     raise ValueError('WAF switch outside managed site scopes needs explicit integration')
                 parent=group['parent']

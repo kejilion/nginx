@@ -25,6 +25,14 @@ class ApplicationBoundaryTests(unittest.TestCase):
             with self.subTest(site=site),self.assertRaisesRegex(ValueError,'explicit integration'):
                 nginx_edit.configuration_headers(dump,{'/etc/nginx/conf.d/site.conf'})
 
+    def test_http_switch_only_has_one_authoritative_source(self):
+        for filename in ['custom.inc','fragment.conf']:
+            for mode in ['on','off']:
+                path='/etc/nginx/conf.d/'+filename
+                dump='# configuration file /etc/nginx/nginx.conf:\nhttp { include '+path+'; }\n# configuration file '+path+':\nmodsecurity '+mode+';\n'
+                with self.subTest(filename=filename,mode=mode),self.assertRaisesRegex(ValueError,'HTTP WAF switch'):
+                    nginx_edit.configuration_headers(dump,{'/etc/nginx/conf.d/site.conf',path})
+
     def test_disabled_main_uses_the_legacy_toggle_line_and_is_idempotent(self):
         text='events {} http {\nmodsecurity on;\nserver { server_name one.example; }\n}'
         disabled=nginx_edit.patch_main(text,enabled=False)

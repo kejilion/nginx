@@ -537,6 +537,9 @@ def configured_status(root,config):
     engine=native_engine_enabled(read_config(root/'nginx.conf'))
     if not engine and any([t.value for t in s[:-1]]==['modsecurity','on'] for path in files for group in nginx_edit.statement_scopes(nginx_edit.tokens(read_config(path))).values() for s in group['statements']):
         raise ValueError('Child WAF switch conflicts with the global Off state; apply migration first')
+    # Verify the expanded source graph before claiming a global mode. External
+    # HTTP fragments can otherwise override the main file's apparent Off state.
+    nginx_edit.configuration_headers(execute('docker','exec',config.get('container','nginx'),'nginx','-T'),{'/etc/nginx/conf.d/'+path.name for path in files})
     mode='off' if not engine else ('on' if not policy.engine_enabled(config) else (next(iter(modes)) if len(modes)==1 else 'mixed'))
     return {'mode':mode,'engineEnabled':engine,'sites':config['sites'],'siteCount':len(names),
             'banBackend':config.get('banBackend','existing'),'source':'configuration'}
