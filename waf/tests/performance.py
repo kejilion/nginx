@@ -248,7 +248,7 @@ upstream fixture_origin {{ server unix:/test/backend.sock; keepalive 64; }}
                     stop.set()
                     thread.join(2)
                 elapsed = time.monotonic() - at
-                if (work / 'budget-failure.json').exists() or sum(logs_size().values()) > log_budget:
+                if (work / 'budget-failure.json').exists() or sum(logs_size().values()) > log_budget or shutil.disk_usage(work).free < 512 * 1024 * 1024:
                     raise RuntimeError('Resource watchdog budget exceeded; retained evidence')
                 after = resources(rootcg)
                 result = json.loads(response.stdout)
