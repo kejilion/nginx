@@ -257,7 +257,20 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         check('early-blocking-detection-mode-keeps-body-processing', host='detect.example', path='/detect-early-header', method='POST',
               body=json.dumps({'text':"1' UNION SELECT password FROM users--"}).encode(),
               headers={'Content-Type':'application/json','User-Agent':'sqlmap/1.8'})
-        transactions = [json.loads(line)['transaction'] for line in (work / 'logs/waf-audit.json').read_text().splitlines()]
+        # The response may finish before phase-5 serial audit logging. Wait for
+        # these exact complete transactions, rather than racing the worker.
+        wanted = {'/early-header', '/detect-early-header'}
+        deadline = time.monotonic() + 2
+        while True:
+            transactions = []
+            for line in (work / 'logs/waf-audit.json').read_text().splitlines(keepends=True):
+                if line.endswith('\n'):
+                    transactions.append(json.loads(line)['transaction'])
+            if wanted <= {item['request']['uri'] for item in transactions}:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError('Early-blocking audit transactions did not finish within two seconds')
+            time.sleep(.025)
         early = next(item for item in transactions if item['request']['uri'] == '/early-header')
         detect = next(item for item in transactions if item['request']['uri'] == '/detect-early-header')
         early_ids = {message['details']['ruleId'] for message in early['messages']}
