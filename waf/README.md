@@ -1,18 +1,18 @@
-# 共享 WAF 配置候选
+# 共享 WAF 配置
 
-本目录管理现有 Docker Nginx + ModSecurity v3 + OWASP CRS 的配置。当前为待验收候选，不表示已完成 kejilion.sh / KPanel 发布。
+本目录管理现有 Docker Nginx + ModSecurity v3 + OWASP CRS 的配置。共享配置 1.0.4、原生脚本和兼容镜像已发布；KPanel 同源适配分支已通过完整 L2，面板版本发行另行进行。
 
 ## 架构边界
 
 沿用已有 CDN、Nginx、ModSecurity/CRS 和 Fail2Ban 链路。配置工具使用 Python 3.11+ 标准库，不安装 WAF 常驻服务，不新增 HTTP/Unix Socket 检查服务，不自动替换封禁后端。新增后端须另行评估。
 
-`banBackend: existing` 仅保留试点既有的按站点 IP map 接口；它要求安装环境已具备受信事件消费、到期及解封机制，不会凭空安装这些组件。新部署示例为 `none`：仍执行请求拦截及限流，但不宣称具备累计自动封禁能力。既有未声明此字段的试点策略保持原有 map 语义。公共生态的封禁适配与双端接入尚须验收，不能以本目录替代该验收。
+`banBackend: existing` 仅保留试点既有的按站点 IP map 接口；它要求安装环境已具备受信事件消费、到期及解封机制，不会凭空安装这些组件。新部署示例为 `none`：仍执行请求拦截及限流，但不宣称具备累计自动封禁能力。既有未声明此字段的试点策略保持原有 map 语义。公共默认提供请求拦截和限流；累计封禁继续使用管理员已有的受信机制，不自动新增封禁后台服务。
 
-## 试用前提与入口
+## 使用前提与入口
 
-需要 root、Docker 中名为 `nginx` 的现有容器、`/home/web` 原生布局，以及兼容的 ModSecurity/CRS 镜像。当前实测版本为 Nginx 1.31.7、ModSecurity 3.0.17、连接器 1.0.4、CRS 4.30.0；其他组合不能直接视为已验证。先备份并在隔离环境验证。
+需要 root、Docker 中名为 `nginx` 的现有容器、`/home/web` 原生布局，以及兼容的 ModSecurity/CRS 镜像。当前实测版本为 Nginx 1.31.7 / 1.31.8、ModSecurity 3.0.17、连接器 1.0.4、CRS 4.30.0；其他组合不能直接视为已验证。先备份并在隔离环境验证。
 
-从固定 Git 提交取得整个 `waf` 目录并核验摘要后，在该目录执行：
+日常仍使用原生环境防护菜单中的 WAF 开关。接入后可使用 `k web waf status`、`k web waf doctor` 诊断。原生脚本固定共享提交及六文件摘要；下列 Python 入口用于已经取得并核验完整配置包后的高级设置：
 
 ```sh
 python3 configure.py configure --mode detect
@@ -47,7 +47,7 @@ python3 configure.py refresh-ips
 
 ## 日志、Fail2Ban 与恢复
 
-`existing-filters` 仅更新带有共享方案管理标记的既有 Fail2Ban 过滤器，不创建 jail 或动作。`retire-jails` 是显式迁移动作：只停用旧脚本按普通业务状态计数的九个网站 jail，保留 SSH 和自定义 jail；执行前应确认替代的受信事件链路已可用。不要把该动作当作新用户完整安装流程。
+`existing-filters` 仅更新带有共享方案管理标记的既有 Fail2Ban 过滤器，不创建 jail 或动作。`retire-jails` 是显式迁移动作：只停用旧脚本按普通业务状态计数的九个网站 jail，保留 SSH 和自定义 jail；执行前应确认替代的受信事件链路已可用。不要把该动作当作新用户完整安装流程。公共旧网站 jail 模板默认关闭，不自动改变已安装的 jail；原生重装或重新配置 CF/Fail2Ban 会重新下载模板，须回读传统 jail 的启用状态，不能把配置成功等同于累计封禁已经生效。
 
 审计使用 ModSecurity JSON 的 AHZ 部分，省略原始请求头、请求体和响应体；URI 与规则匹配信息仍可能敏感，日志权限为 0640。不要公开原始审计日志。
 
@@ -59,13 +59,17 @@ python3 configure.py refresh-ips
 python3 configure.py rollback --backup /home/web/backups/waf-managed/具体备份目录
 ```
 
-后续人工改动发生冲突时回滚会拒绝覆盖，须先核对差异。停用请使用 `configure --mode off`；当前没有宣称已验证的自动卸载或封禁后端迁移功能。
+后续人工改动发生冲突时回滚会拒绝覆盖，须先核对差异。停用请使用 `configure --mode off`；原生整个环境卸载会清理本包带标记的轮转任务，保留其他 Cron；备份、停容器或清理失败会中止。该入口不自动拆除管理员原有 Fail2Ban 动作或迁移封禁后端，本包也没有独立的自动卸载命令。
 
 ## 验证与依据
 
 ```sh
 python3 -m unittest discover -s waf/tests -p 'test_*.py'
 ```
+
+2026-10-23 的正式 Nginx 1.31.8 镜像完成 amd64 / arm64 各 36 项镜像检查；完整配置完成 71 项通用场景、15 项真实 KPanel、18 项原生升级回滚和 56 项模板组合检查，核心 Linux 单测 62 项通过。正式服镜像与配置试点为 20 站点拦截模式，40 项正常访问检查无差异。KPanel 适配候选的完整 L2 通过，包含 314 个前端测试文件、3115 项通过和 6 项跳过，以及固定脚本来源的实际镜像构建。
+
+[正式构建](https://github.com/kejilion/docker/actions/runs/39971721735)与[已验证产物发布](https://github.com/kejilion/docker/actions/runs/39974763991)使用同一批产物。发布标签为 `kjlion/nginx:alpine`、`kjlion/nginx:1.31.8-alpine`；本次不可变镜像为 `kjlion/nginx@sha256:7827d4c2e19bfce579f6fb4ce94884a126b5ab8ea74943e5448fa4c2b3d7f894`。源码固定、CI 产物和公开镜像摘要均已核验。
 
 生产副本迁移及真实 KPanel 用例位于 `tests/pilot_config.py`、`tests/kpanel_profile.py`。它们使用无外网、无公开端口的隔离容器；KPanel 用例不挂载 Agent，因此文件内容测试只验证请求通过 WAF 到达 Agent 边界，不代表实际写文件功能通过。
 
