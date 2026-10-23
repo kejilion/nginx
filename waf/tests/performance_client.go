@@ -99,12 +99,13 @@ func main() {
 	rate := flag.Int("rate", 0, "scheduled requests per second; 0 = closed loop")
 	hosts := flag.Int("hosts", 20, "virtual hosts")
 	identity := flag.String("identity", "proxy", "proxy or direct")
+	expectedStatus := flag.Int("expected-status", 200, "business response or deliberate WAF denial")
 	flag.Parse()
 	if *mode == "backend" {
 		backend(*sock)
 		return
 	}
-	if *mode != "load" || *concurrency < 1 || *concurrency > 512 || *rate < 0 || *rate > 10000 || *hosts < 1 || *hosts > 200 || *duration < time.Second || *duration > 5*time.Minute {
+	if *mode != "load" || *concurrency < 1 || *concurrency > 512 || *rate < 0 || *rate > 10000 || *hosts < 1 || *hosts > 200 || *duration < time.Second || *duration > 5*time.Minute || *expectedStatus < 100 || *expectedStatus > 599 {
 		panic("invalid load budget")
 	}
 	var body []byte
@@ -261,10 +262,7 @@ func main() {
 		}
 	}
 	elapsed := time.Since(start).Seconds()
-	expected := 200
-	if strings.HasPrefix(*workload, "attack") {
-		expected = 403
-	}
+	expected := *expectedStatus
 	result := map[string]any{"workload": *workload, "target": *target, "identity": *identity, "hosts": *hosts, "concurrency": *concurrency, "targetRps": *rate, "durationSeconds": duration.Seconds(), "elapsedSeconds": elapsed, "requests": stats.Count, "completedRps": float64(stats.Count) / elapsed, "expectedStatus": expected, "expectedResponses": stats.Codes[expected], "networkErrors": stats.Errors, "skipped": stats.Skipped, "codes": stats.Codes, "protocols": stats.Protocols, "p50Ms": percentile(&stats.Histogram, stats.Count, .50), "p95Ms": percentile(&stats.Histogram, stats.Count, .95), "p99Ms": percentile(&stats.Histogram, stats.Count, .99), "serviceP99Ms": percentile(&stats.ServiceHistogram, stats.Count, .99), "responseBytes": stats.Bytes, "requestBodyBytes": len(body)}
 	if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
 		panic(err)

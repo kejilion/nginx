@@ -42,6 +42,20 @@ def resources(root):
                 events=pairs('memory.events'), io=(root / 'io.stat').read_text())
 
 
+def assess(result, variant, workload, limit_boundary=False):
+    """Validate responses separately from the count of completed HTTP transactions."""
+    expected = 403 if workload.startswith('attack') and variant != 'off' else 200
+    codes = {int(k): n for k, n in result['codes'].items()}
+    allowed = {200, 429} if limit_boundary else {expected}
+    unexpected = sum(n for code, n in codes.items() if code not in allowed)
+    rate_evidence = not limit_boundary or (codes.get(200, 0) > 0 and codes.get(429, 0) > 0)
+    return dict(expectedStatus=expected, allowedStatuses=sorted(allowed), expectedResponses=codes.get(expected, 0),
+                expectedRps=codes.get(expected, 0) / result['elapsedSeconds'], unexpectedResponses=unexpected,
+                limitBoundary=limit_boundary,
+                responseValidationPassed=(result['requests'] > 0 and not unexpected and not result['networkErrors']
+                                          and not result['skipped'] and rate_evidence))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--image', required=True)
@@ -209,6 +223,13 @@ upstream fixture_origin {{ server unix:/test/backend.sock; keepalive 64; }}
                 def sample():
                     while not stop.wait(.25):
                         samples.append(resources(rootcg))
+                        size, free = sum(logs_size().values()), shutil.disk_usage(work).free
+                        if size > 128 * 1024 * 1024 or free < 512 * 1024 * 1024:
+                            (work / 'budget-failure.json').write_text(json.dumps(dict(logBytes=size, freeBytes=free, variant=variant, workload=workload)))
+                            stop.set()
+                            # Stop only this job's load container, then let finally retain logs/clean up.
+                            subprocess.run(['docker', 'kill', client], capture_output=True, timeout=10)
+                            return
                 thread = threading.Thread(target=sample, daemon=True)
                 thread.start()
                 at = time.monotonic()
@@ -216,13 +237,17 @@ upstream fixture_origin {{ server unix:/test/backend.sock; keepalive 64; }}
                     response = run('docker', 'exec', '-e', 'GOMAXPROCS=1', client, '/test/runner', '-workload', workload,
                                    '-duration', f'{duration or args.seconds}s', '-rate', str(rate), '-concurrency', str(concurrency),
                                    '-hosts', str(host_count or args.sites // 2), '-identity', identity_mode, '-target', target,
+                                   '-expected-status', str(403 if workload.startswith('attack') and variant != 'off' else 200),
                                    timeout=(duration or args.seconds) + 15)
                 finally:
                     stop.set()
                     thread.join(2)
                 elapsed = time.monotonic() - at
+                if (work / 'budget-failure.json').exists() or sum(logs_size().values()) > 128 * 1024 * 1024:
+                    raise RuntimeError('Resource watchdog budget exceeded; retained evidence')
                 after = resources(rootcg)
                 result = json.loads(response.stdout)
+                result.update(assess(result, variant, workload, host_count == 1 and identity_mode == 'direct'))
                 result.update(variant=variant, cpuCores=args.cpus, sites=args.sites, startup=startup,
                               serverCpuPercent=(after['cpu']['usage_usec'] - before['cpu']['usage_usec']) / elapsed / 10000,
                               memoryPeakBytes=max(s['memory'] for s in [before, after, *samples]),
@@ -237,9 +262,9 @@ upstream fixture_origin {{ server unix:/test/backend.sock; keepalive 64; }}
                     results.append(result)
                     with (work / 'results.jsonl').open('a') as f:
                         f.write(json.dumps(result) + '\n')
-                    print(json.dumps({k: result[k] for k in ['variant', 'workload', 'target', 'identity', 'targetRps', 'completedRps', 'codes', 'skipped', 'p99Ms', 'serverCpuPercent', 'memoryPeakBytes']}), flush=True)
-                if result['networkErrors'] or result['memoryEventsDelta'].get('oom_kill'):
-                    raise RuntimeError('Network error/OOM; retained raw result, stopping test')
+                    print(json.dumps({k: result[k] for k in ['variant', 'workload', 'target', 'identity', 'targetRps', 'expectedRps', 'codes', 'skipped', 'responseValidationPassed', 'p99Ms', 'serverCpuPercent', 'memoryPeakBytes']}), flush=True)
+                if not result['responseValidationPassed'] or result['memoryEventsDelta'].get('oom_kill'):
+                    raise RuntimeError('Unexpected response, incomplete offered load, network error or OOM; retained raw result')
                 return result
             cell(rate=50, duration=4, record=False)
             if args.suite == 'probe':
