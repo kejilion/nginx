@@ -61,6 +61,29 @@ python3 configure.py rollback --backup /home/web/backups/waf-managed/具体备�
 
 后续人工改动发生冲突时回滚会拒绝覆盖，须先核对差异。停用请使用 `configure --mode off`；原生整个环境卸载会清理本包带标记的轮转任务，保留其他 Cron；备份、停容器或清理失败会中止。该入口不自动拆除管理员原有 Fail2Ban 动作或迁移封禁后端，本包也没有独立的自动卸载命令。
 
+## 通用 Nginx 响应缓冲调优
+
+原生安装实际下载根目录的 `nginx10.conf`，普通模式使用官方 `nginx:alpine`，WAF 模式使用在官方镜像上构建的兼容镜像；两者挂载同一份宿主配置。本次共同基线只调整响应缓冲，不提高攻击阈值、关闭正文检查或改变 CF 信任及站点开关。
+
+| 参数 | 原公共模板 | 候选值 | 官方依据与余量 |
+| --- | --- | --- | --- |
+| `gzip_buffers` | `8 256k`，池上限 2 MiB | `16 32k`，512 KiB | [官方默认](https://nginx.org/en/docs/http/ngx_http_gzip_module.html#gzip_buffers)总量约 128 KiB；保留四倍总量，压缩等级仍为 3 |
+| `output_buffers` | `8 1024k`，池上限 8 MiB | `2 128k`，256 KiB | [官方默认](https://nginx.org/en/docs/http/ngx_http_core_module.html#output_buffers)为 `2 32k`；保留四倍总量，兼容线程读取及 TLS/压缩输出 |
+
+这些数值是按需使用的缓冲池上限，不是每个连接必定分配的内存，也不是上传或响应大小限制。`ssl_buffer_size` 保留原有 32 KiB；[官方默认](https://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_buffer_size)为 16 KiB，本轮较小值在大响应中没有体现足够收益，因此未采用。代理/FastCGI 响应头缓冲、上传容量、HTTP/2/3 连接参数、缓存和超时保持原值。
+
+通用比较入口如下；测试使用实际完整模板、20 个独立虚拟主机（10 个轮流发压）、PHP-FPM、反向代理、Range、gzip、SSE 及慢读大响应，分别运行官方镜像、WAF Off 和 WAF On。`--cpus 1` 用于控制单 worker 比较，`--cpus 2` 可验证多 worker；少量持久连接在 worker 间的分布会影响双核吞吐，不能直接当作参数收益。
+
+```sh
+python3 tests/nginx_performance.py --official-image <已核验的官方镜像> \
+  --waf-image <同版本已核验WAF镜像> --baseline <原nginx10.conf> \
+  --work-dir /root/nginx-perf-run --cpus 1 --seconds 8
+```
+
+所有流量仅在隔离容器间产生；前端限制 512 MiB，客户端和轻量源站各限制 256 MiB，禁止额外 swap。门禁检查正常状态、协议、完整响应字节数、前后正文摘要、gzip 解压内容、OOM、日志预算及剩余磁盘。100 ms 内存采样是观测峰值；延迟包含整个响应下载，不是 TTFB。该工具不衡量 HTTP/3、新 TLS 握手、大客户应用或真实 CDN 的容量。
+
+新安装通过公共模板取得参数；已有自定义配置不会被镜像更新覆盖，需备份后只迁移相应指令，再检查语法、重载和验证业务。不要用完整模板覆盖用户已有的站点、认证、代理头或安全策略。试点生产保持现有压缩配置，仅对齐输出缓冲；公共模板的收益须以通用矩阵为依据，不能用试点现状替代旧公共模板对比。
+
 ## 1.0.5 性能候选
 
 沿用现有组件及开关，启用 CRS 的 `tx.early_blocking=1`。仅当请求头阶段已经达到原有拦截分数时，才提前拒绝，避免继续读取、解析和检查正文；正常请求仍执行原有规则。完整配置维持 PL1、入站 5 / 出站 4，检测模式仍检查正文。镜像兼容层候选增加同一开关，保留旧配置的阈值及审计设置，供仍使用旧共享包的环境在升级镜像后获得此项改进。
