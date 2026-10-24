@@ -224,13 +224,8 @@ def statement_scopes(stream):
     return groups
 
 
-def configuration_headers(dump, managed_sites=None):
-    """Evaluate actual include scopes from a bounded nginx -T snapshot.
-
-    Keep source offsets so only directives in the administrator's site file are
-    rewritten. An identity header in a same-scope external include needs explicit
-    migration; we must not leave a duplicate or mutate a shared external file.
-    """
+def configuration_scopes(dump):
+    """Expand a bounded nginx -T snapshot without losing its source scopes."""
     parts = re.split(r'(?m)^# configuration file ([^\r\n]+):\n', dump)
     files = dict(zip(parts[1::2], parts[2::2]))
     if not files or len(files)>1024 or sum(len(x.encode()) for x in files.values())>2*1024*1024:
@@ -259,7 +254,76 @@ def configuration_headers(dump, managed_sites=None):
         return out
     main='/etc/nginx/nginx.conf'
     if main not in files: raise ValueError('Missing main configuration snapshot')
-    groups=statement_scopes(expand(main))
+    return statement_scopes(expand(main))
+
+
+def method_override_controls(dump):
+    """Keep method-dependent gateway authorization stricter than compatibility.
+
+    Follow variables derived from the method, including maps in external files.
+    Cache keys and ordinary FastCGI REQUEST_METHOD forwarding are not ACLs.
+    Unknown access-code/auth subrequests cannot prove method-independent access.
+    """
+    groups=configuration_scopes(dump)
+    variables={'$request_method','$request'}
+    variable=lambda text:{'$'+name.lower() for name in re.findall(r'\$\{?([A-Za-z0-9_]+)',text)}
+    for _ in range(len(groups)):
+        before=set(variables)
+        for group in groups.values():
+            if group['kind']=='map' and len(group['head'])>=3:
+                inputs=' '.join(group['head'][1:-1]+[t.value for s in group['statements'] for t in s])
+                if variable(inputs) & variables: variables.update(variable(group['head'][-1]))
+            for statement in group['statements']:
+                if statement[0].value=='set' and len(statement)>=4:
+                    conditional=group['kind']=='if' and bool(variable(' '.join(group['head'])) & variables)
+                    if conditional or variable(' '.join(t.value for t in statement[2:-1])) & variables:
+                        variables.update(variable(statement[1].value))
+        if variables==before:break
+    sites=set(); all_sites=False
+    for ident,group in groups.items():
+        opaque=('access_by_lua','rewrite_by_lua','set_by_lua','js_','perl')
+        sensitive=group['kind']=='limit_except' or group['kind'].startswith(opaque)
+        # Whitelist only consumers that cannot authorize another method. Unknown
+        # modules, auth_basic realms/files, custom headers and dynamic routing
+        # remain strict when they consume a method-derived variable.
+        benign={'set','log_format','access_log','fastcgi_cache_key','proxy_cache_key',
+                'fastcgi_no_cache','fastcgi_cache_bypass','proxy_no_cache','proxy_cache_bypass'}
+        if variable(' '.join(group.get('head',[]))) & variables and group['kind'] not in {'map','if'}:
+            sensitive=True
+        if group['kind']=='if' and variable(' '.join(group['head'])) & variables:
+            if any(s[0].value not in {'set'} for s in group['statements']):sensitive=True
+        for statement in group['statements']:
+            key=statement[0].value
+            if key=='proxy_method' or key.startswith(opaque):
+                sensitive=True
+            if key=='auth_request' and statement[1].value!='off':sensitive=True
+            if key=='underscores_in_headers' and statement[1].value=='on':sensitive=True
+            if key in {'proxy_set_header','fastcgi_param','uwsgi_param','scgi_param'} and len(statement)>2:
+                target=statement[1].value.strip('\"\'').lower().replace('_','-')
+                if target.removeprefix('http-') in {'x-http-method-override','x-http-method','x-method-override'}:sensitive=True
+            if key=='modsecurity_rules':sensitive=True
+            if key=='modsecurity_rules_file' and statement[1].value.strip('\"\'') not in {'/etc/nginx/modsec/modsecurity.conf','/etc/nginx/conf.d/waf/modsecurity.conf'}:sensitive=True
+            dependent=variable(' '.join(t.value for t in statement[1:-1])) & variables
+            standard_method=(key in {'fastcgi_param','uwsgi_param','scgi_param'} and
+                             [t.value.strip('\"\'') for t in statement[1:-1]]==['REQUEST_METHOD','$request_method'])
+            if dependent and key not in benign and not standard_method and group['kind']!='map':sensitive=True
+        if not sensitive:continue
+        owner=ident
+        while owner is not None and groups[owner]['kind'] not in {'server','http'}:owner=groups[owner]['parent']
+        if owner is None:continue
+        if groups[owner]['kind']=='http':all_sites=True;continue
+        names=[s for s in groups[owner]['statements'] if s[0].value=='server_name']
+        if not names:all_sites=True;continue
+        name=names[0][1].value.strip('\"\'').lower()
+        if not re.fullmatch(r'(?:\*\.)?[A-Za-z0-9_][A-Za-z0-9_.-]{0,252}',name):all_sites=True
+        else:sites.add(name)
+    return all_sites,sites
+
+
+def configuration_headers(dump, managed_sites=None):
+    """Evaluate effective proxy headers, retaining offsets for minimal edits."""
+    groups=configuration_scopes(dump)
+    main='/etc/nginx/nginx.conf'
     if managed_sites is not None:
         for ident, group in groups.items():
             for statement in group['statements']:

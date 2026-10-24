@@ -45,13 +45,15 @@ def networks(data: dict) -> list[str]:
 
 def validate(config: dict) -> dict:
     allowed = {"schemaVersion", "mode", "cdn", "container", "sites", "trustedProxies", "proxyHeader",
-               "rate", "burst", "connections", "attackRetries", "rateRetries", "banSeconds", "logTimezone", "banBackend"}
+               "rate", "burst", "connections", "attackRetries", "rateRetries", "banSeconds", "logTimezone", "banBackend", "methodOverride"}
     if set(config) - allowed:
         raise ValueError("Unknown policy fields: " + ", ".join(sorted(set(config) - allowed)))
     if config.get("schemaVersion") != 1:
         raise ValueError("Unsupported WAF policy schema")
     if config.get('banBackend','existing') not in {'none','existing'}:
         raise ValueError('Unsupported existing ban integration')
+    if config.get('methodOverride','guarded') not in {'guarded','strict'}:
+        raise ValueError('Invalid method override policy')
     if not re.fullmatch(r'UTC(?:[+-](?:0[0-9]|1[0-4])[0-5][0-9])?', config.get('logTimezone','UTC')):
         raise ValueError('Invalid Nginx log timezone')
     if config.get("mode") not in MODES:
@@ -64,7 +66,7 @@ def validate(config: dict) -> dict:
     if not isinstance(sites, dict) or len(sites) > MAX_SITES:
         raise ValueError("Invalid or excessive sites")
     for name, site in sites.items():
-        if set(site) - {"profile", "mode", "exclusions", "cdn", "trustedProxies", "proxyHeader"}:
+        if set(site) - {"profile", "mode", "exclusions", "cdn", "trustedProxies", "proxyHeader", "methodOverride"}:
             raise ValueError("Unknown site policy fields")
         if scope(name) != name:
             raise ValueError("Site scopes must be normalized")
@@ -72,6 +74,8 @@ def validate(config: dict) -> dict:
             raise ValueError("Invalid profile")
         if site.get("mode", config["mode"]) not in MODES:
             raise ValueError("Invalid site mode")
+        if site.get('methodOverride',config.get('methodOverride','guarded')) not in {'guarded','strict'}:
+            raise ValueError('Invalid site method override policy')
         for rule in site.get("exclusions", []):
             if not isinstance(rule.get("ruleId"), int) or not 900000 <= rule["ruleId"] <= 999999:
                 raise ValueError("Exclusions must identify a CRS rule")
@@ -185,7 +189,11 @@ def engine_enabled(config: dict) -> bool:
     return config['mode']!='off' or any(site.get('mode','off')!='off' for site in config.get('sites',{}).values())
 
 
-def render_profile_rules(config: dict) -> str:
+def render_profile_rules(config: dict, method_controls=None) -> str:
+    # No capability proof means strict. Only the manager's complete Nginx graph
+    # can establish absence of method-dependent gateway access controls.
+    strict_all,strict_sites=method_controls if method_controls is not None else (True,set())
+    guarded=config.get('methodOverride','guarded')=='guarded' and not strict_all
     lines = [
         '# Settings run after vendor setup, before CRS and application exclusions.',
         'SecAction "id:1100,phase:1,pass,nolog,t:none,setvar:tx.inbound_anomaly_score_threshold=5,setvar:tx.outbound_anomaly_score_threshold=4,setvar:tx.blocking_paranoia_level=1,setvar:tx.detection_paranoia_level=1,setvar:tx.wordpress-rule-exclusions-plugin_enabled=0"',
@@ -193,18 +201,25 @@ def render_profile_rules(config: dict) -> str:
         # CRS may reject a phase-1 score before buffering/inspecting the body.
         # DetectionOnly still runs every phase, preserving false-positive tuning.
         'SecAction "id:1102,phase:1,pass,nolog,t:none,setvar:tx.early_blocking=1"',
+        'SecAction "id:1103,phase:1,pass,nolog,t:none,setvar:tx.waf_method_override_guarded='+str(int(guarded))+'"',
     ]
     global_mode = config["mode"]
     # Explicit site settings precede the fallback. Every transaction starts fresh.
     rid = 1200
     exceptions = []
-    for name, site in sorted(config["sites"].items()):
+    for name in sorted(config['sites'].keys() | strict_sites):
+        site=config['sites'].get(name,{})
         mode = site.get("mode", global_mode)
         # UNIQUE_ID is supplied by the connector from $server_name, not the Host header.
         # Absolute-form requests and aliases must not select a different site's policy.
         actions = []
+        site_guarded=site.get('methodOverride',config.get('methodOverride','guarded'))=='guarded' and not strict_all and name not in strict_sites
+        if site_guarded!=guarded:
+            actions.append('setvar:tx.waf_method_override_guarded='+str(int(site_guarded)))
         if site.get("profile") == "wordpress":
-            actions.append("setvar:tx.wordpress-rule-exclusions-plugin_enabled=1")
+            lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,setvar:tx.wordpress-rule-exclusions-plugin_enabled=1"']
+            rid += 1
         if mode != global_mode:
             actions.append("setvar:tx.waf_mode_override=1")
             actions.append("ctl:ruleEngine=" + {"on":"On", "off":"Off", "detect":"DetectionOnly"}[mode])
@@ -214,6 +229,7 @@ def render_profile_rules(config: dict) -> str:
         for item in site.get("exclusions", []):
             exceptions += [
                 f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
                 f'    SecRule REQUEST_FILENAME "@streq {item["path"]}" "t:none,ctl:ruleRemoveTargetById={item["ruleId"]};{item["target"]}"',
             ]
             rid += 1
@@ -233,23 +249,28 @@ def render_profile_rules(config: dict) -> str:
                 controls=','.join('ctl:ruleRemoveTargetByTag='+tag+';ARGS:json.'+target
                                   for target in targets for tag in ['attack-sqli','attack-xss','attack-rce','attack-lfi','attack-rfi'])
                 lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                          '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
                           f'    SecRule REQUEST_METHOD "@streq {method}" "t:none,chain"',
                           '    SecRule REQUEST_FILENAME "@rx ^(?:/[A-Za-z0-9_-]+)?'+path+'$" "t:none,'+controls+'"']
                 rid+=1
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
                       '    SecRule REQUEST_METHOD "@rx ^(?:GET|PUT)$" "t:none,chain"',
                       '    SecRule REQUEST_FILENAME "@rx ^(?:/[A-Za-z0-9_-]+)?/api/v1/files(?:/(?:entry|content|archive))?$" "t:none,ctl:ruleRemoveTargetById=930120;ARGS:path,ctl:ruleRemoveTargetById=930130;ARGS:path"']
             rid+=1
         if site.get('profile')=='artifact-proxy':
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
                       '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
                       '    SecRule REQUEST_FILENAME "@rx ^/(?:https?://)?[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+(?::[0-9]{1,5})?/" "t:none,ctl:ruleRemoveById=920440,ctl:ruleRemoveTargetById=930130;REQUEST_FILENAME"']
             rid+=1
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
                       '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD|POST)$" "t:none,chain"',
                       '    SecRule REQUEST_FILENAME "@rx ^/(?:https?://)?[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+(?::[0-9]{1,5})?/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git/(?:info/refs|git-upload-pack)$" "t:none,ctl:ruleRemoveTargetById=930130;REQUEST_FILENAME"']
             rid+=1
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
                       '    SecRule REQUEST_METHOD "@streq POST" "t:none,chain"',
                       '    SecRule REQUEST_FILENAME "@rx ^/(?:https?://)?[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+(?::[0-9]{1,5})?/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git/git-upload-pack$" "t:none,chain"',
                       '    SecRule REQUEST_HEADERS:Content-Type "@streq application/x-git-upload-pack-request" "t:none,t:lowercase,ctl:ruleRemoveById=920420"']
@@ -291,7 +312,9 @@ Include {BASE}/profile-rules.conf
 Include /etc/nginx/modsec/plugins/*-config.conf
 Include {BASE}/request-guard.conf
 Include /etc/nginx/modsec/plugins/wordpress-rule-exclusions-before.conf
+Include {BASE}/method-override.conf
 Include /etc/nginx/modsec/rules/*.conf
+SecRuleUpdateTargetById 920450 "!REQUEST_HEADERS_NAMES:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/"
 SecRule TX:BLOCKING_INBOUND_ANOMALY_SCORE "@ge 5" "id:1112,phase:5,pass,nolog,ctl:auditEngine=On"
 '''
 
@@ -302,6 +325,33 @@ def render_guard() -> str:
 SecRule REQUEST_FILENAME "@rx (?i)(?:^|/)\\.(?!well-known(?:/|$))" "id:1110,phase:1,deny,status:403,log,t:none,t:urlDecodeUni,t:normalizePath,msg:'WAF secret dot path'"
 SecRule REQUEST_FILENAME "@rx (?i)(?:^|/)wp-config\\.php(?:[.~].*)?$" "id:1111,phase:1,deny,status:403,log,t:none,t:urlDecodeUni,t:normalizePath,msg:'WAF secret application configuration'"
 '''
+
+
+def render_method_override() -> str:
+    lines=['''# Framework method tunnelling is compatible only with a proven gateway policy.
+# Only canonical override names are removed from the vendor name restriction.
+# These phase-2 guards take over their protocol checks after CRS initialization;
+# all other restricted names and the complete vendor wildcard stay untouched.
+SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@gt 1" "id:1120,phase:2,pass,log,t:none,msg:'WAF ambiguous method override headers',setvar:tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}"
+SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@gt 0" "id:1121,phase:2,pass,log,t:none,msg:'WAF method override requires POST',chain"
+    SecRule REQUEST_METHOD "!@streq POST" "t:none,setvar:tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}"
+SecRule REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "!@rx ^(?:PUT|PATCH|DELETE)$" "id:1122,phase:2,pass,log,t:none,msg:'WAF invalid method override value',setvar:tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}"
+SecRule REQUEST_HEADERS_NAMES "@rx (?i)^(?!x-http-method-override$|x-http-method$|x-method-override$)(?:x[-_.]http[-_.]method[-_.]override|x[-_.]http[-_.]method|x[-_.]method[-_.]override)$" "id:1124,phase:2,pass,log,t:none,msg:'WAF ambiguous method override header spelling',setvar:tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}"
+# Body arguments are unavailable in phase 1. Check all override sources again
+# after normal parsing, before CRS phase-2 checks or the upstream application.
+SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@gt 0" "id:1123,phase:2,pass,log,t:none,msg:'WAF mixed header and parameter method override',chain"
+    SecRule &ARGS:/^(?i:(?:json[.])?_method(?:[.\\[].*)?)$/ "@gt 0" "t:none,setvar:tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}"
+SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@gt 0" "id:1125,phase:2,pass,log,t:none,msg:'WAF method override requires a compatible gateway policy',chain"
+    SecRule TX:waf_method_override_guarded "!@eq 1" "t:none,setvar:tx.inbound_anomaly_score_pl1=+%{tx.critical_anomaly_score}"
+''']
+    number=1130
+    for header in ['x-http-method-override','x-http-method','x-method-override']:
+      for method in ['PUT','PATCH','DELETE']:
+        lines.append(f'''SecRule REQUEST_HEADERS:{header} "@streq {method}" "id:{number},phase:2,pass,log,t:none,msg:'WAF method override is not allowed by policy',chain"
+    SecRule TX:allowed_methods "!@rx (?:^|[ \\t]){method}(?:[ \\t]|$)" "t:none,setvar:tx.inbound_anomaly_score_pl1=+%{{tx.critical_anomaly_score}}"
+''')
+        number+=1
+    return ''.join(lines)
 
 
 def render_bans(records: dict, now: int) -> str:
@@ -317,11 +367,12 @@ def render_bans(records: dict, now: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def bundle_files(config: dict, cloudflare: list[str]) -> dict[str, str]:
+def bundle_files(config: dict, cloudflare: list[str], method_controls=None) -> dict[str, str]:
     validate(config)
     result = {
         "http.conf": render_http(config), "realip.conf": render_realip(config, cloudflare),
-        "server-default.inc": render_server(existing_bans=config.get('banBackend','existing')=='existing'), "profile-rules.conf": render_profile_rules(config),
+        "server-default.inc": render_server(existing_bans=config.get('banBackend','existing')=='existing'), "profile-rules.conf": render_profile_rules(config,method_controls),
+        "method-override.conf": render_method_override(),
         "modsecurity.conf": render_modsecurity(config), "request-guard.conf": render_guard(),
         "access-log.inc": 'access_log /var/log/nginx/waf-rate.log waf_rate if=$waf_rate_event;\n',
         "load-module.conf": 'load_module /etc/nginx/modules/ngx_http_modsecurity_module.so;\n',

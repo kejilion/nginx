@@ -128,6 +128,29 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn('$status', rendered)
         self.assertNotIn('$http_', rendered)
 
+    def test_method_compatibility_needs_proof_and_preserves_all_other_restrictions(self):
+        self.assertIn('waf_method_override_guarded=0',policy.render_profile_rules(self.config))
+        self.assertIn('waf_method_override_guarded=1',policy.render_profile_rules(self.config,(False,set())))
+        self.config['sites']={'locked.example':{'methodOverride':'strict'}}
+        rules=policy.render_profile_rules(self.config,(False,{'acl.example'}))
+        self.assertIn('@beginsWith acl.example|',rules)
+        self.assertIn('@beginsWith locked.example|',rules)
+        guard=policy.render_method_override()
+        self.assertNotIn('ruleRemoveById=920450',guard)
+        self.assertNotIn('ruleEngine=Off',guard)
+        self.assertIn('requires a compatible gateway policy',guard)
+        self.assertNotIn('@within',guard)
+        self.assertIn('])PATCH(?:[',guard)
+        self.assertIn('phase:2',guard)
+        self.config['methodOverride']='off'
+        with self.assertRaisesRegex(ValueError,'method override'):policy.validate(self.config)
+
+    def test_method_compatibility_preserves_vendor_wildcard_and_removes_only_header_name_targets(self):
+        rendered=policy.render_modsecurity(self.config)
+        self.assertIn('Include /etc/nginx/modsec/rules/*.conf',rendered)
+        self.assertIn('SecRuleUpdateTargetById 920450 "!REQUEST_HEADERS_NAMES:',rendered)
+        self.assertNotIn('ruleRemoveById=920450',rendered)
+
     def test_bounded_resources(self):
         for field, value in [('connections', 100000), ('burst', 0), ('attackRetries', 1), ('banSeconds', 999999)]:
             with self.subTest(field=field), self.assertRaises(ValueError):

@@ -12,9 +12,39 @@ import subprocess
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
 import configure as manage
 import nginx_edit
+import policy
 
 
 class ManagedTrustTests(unittest.TestCase):
+    def test_method_gateway_capabilities_follow_scopes_includes_and_derived_variables(self):
+        def check(http,site,expected):
+            dump='# configuration file /etc/nginx/nginx.conf:\nhttp { '+http+' include /etc/nginx/site.conf; }\n# configuration file /etc/nginx/site.conf:\n'+site+'\n'
+            self.assertEqual(nginx_edit.method_override_controls(dump),expected)
+        plain='server { server_name normal.example; location / { proxy_pass http://backend; } }'
+        check('fastcgi_cache_key "$request_method$host";',plain,(False,set()))
+        check('map $request_method $realm { default off; DELETE admin; }',
+              plain.replace('location /','auth_basic $realm; location /'),(False,{'normal.example'}))
+        check('',plain.replace('proxy_pass','limit_except POST { deny all; } proxy_pass'),(False,{'normal.example'}))
+        check('auth_request /auth;',plain,(True,set()))
+        check('underscores_in_headers on;',plain,(True,set()))
+        for directive in ['proxy_set_header X-HTTP-Method-Override $arg_method;',
+                          'fastcgi_param HTTP_X_HTTP_METHOD_OVERRIDE $arg_method;',
+                          'if ($request_method = DELETE) { return 403; }',
+                          'modsecurity_rules "SecRule REQUEST_METHOD POST pass";']:
+            check('',plain.replace('location /',directive+' location /'),(False,{'normal.example'}))
+        check('map $request_method $a { default 0; POST 1; } map $a $b { default 0; 1 1; }',
+              plain.replace('location /','if ($b) { return 403; } location /'),(False,{'normal.example'}))
+        check('map $request_method $Guard { default off; DELETE admin; }',
+              plain.replace('location /','auth_basic $guard; location /'),(False,{'normal.example'}))
+        for directive in ['if ($REQUEST_METHOD = DELETE) { return 403; }',
+                          'set "$realm" $request_method; auth_basic $realm;',
+                          'access_by_lua_block { return 0; }',
+                          'set_by_lua $realm code; auth_basic $realm;']:
+            check('',plain.replace('location /',directive+' location /'),(False,{'normal.example'}))
+        check('map $request $blocked { default 0; ~^DELETE 1; }',
+              plain.replace('location /','if ($blocked) { return 403; } location /'),(False,{'normal.example'}))
+        check('',plain.replace('proxy_pass','if ($request_method = POST) { set $skip_cache 1; } proxy_pass'),(False,set()))
+
     def test_native_switch_reconciliation_preserves_profiles_and_trust(self):
         config={'mode':'on','sites':{'api.example':{'profile':'api','mode':'detect','cdn':'cloudflare'}}}
         with patch.object(manage,'read_config',return_value='events {} http { # modsecurity on;\nserver { modsecurity on; } }'):
@@ -179,6 +209,14 @@ class ConfigurationLifecycleTests(unittest.TestCase):
         self.assertEqual(status['siteCount'],2)
         config['sites']['two.example']={'mode':'on'}
         with patch.object(manage,'execute',return_value=dump):self.assertEqual(manage.configured_status(self.root,config)['mode'],'on')
+        profile=self.root/'conf.d/waf/profile-rules.conf'
+        self.atomic(profile,policy.render_profile_rules(config,(False,set())).encode())
+        with patch.object(manage,'execute',return_value=dump):self.assertTrue(manage.configured_status(self.root,config)['methodOverride']['synchronized'])
+        changed='# configuration file /etc/nginx/nginx.conf:\nhttp {modsecurity on; auth_request /auth;}'
+        with patch.object(manage,'execute',return_value=changed):
+            status=manage.configured_status(self.root,config)
+        self.assertTrue(status['methodOverride']['gatewayStrictAll'])
+        self.assertFalse(status['methodOverride']['synchronized'])
 
     def test_status_rejects_external_http_switch_instead_of_false_off(self):
         (self.root/'conf.d').mkdir()
