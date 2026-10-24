@@ -262,6 +262,29 @@ class ConfigurationLifecycleTests(unittest.TestCase):
                 manage.restore(self.root,backup)
 
     @unittest.skipUnless(os.name=='posix','Linux cron paths')
+    def test_rotation_bounds_normal_logs_and_preserves_unrelated_jobs(self):
+        legacy='0 2 * * * docker exec nginx apk add logrotate && docker exec nginx logrotate -f /etc/logrotate.conf'
+        custom='17 3 * * * /usr/local/bin/user-logrotate --custom'
+        before=custom+'\n'+legacy+'\n'
+        installed=[]
+        def run(args,**kwargs):
+            if args==['crontab','-l']:return subprocess.CompletedProcess(args,0,before,'')
+            installed.append(kwargs['input'])
+            return subprocess.CompletedProcess(args,0,'','')
+        with patch.object(manage.shutil,'which',side_effect=lambda name:'/usr/sbin/'+name),patch.object(manage,'execute'),patch.object(manage.subprocess,'run',side_effect=run):
+            manage.rotation(self.root,{})
+            before=installed[-1]
+            manage.rotation(self.root,{})
+        text=(self.root/'config/waf/logrotate.conf').read_text()
+        for name in ['waf-rate.log','waf-audit.json','error.log','access.log']:
+            self.assertIn(str(self.root/'log/nginx'/name),text)
+        self.assertIn('maxsize 50M',text)
+        self.assertEqual(installed[-1].count('# kejilion-waf-logrotate'),1)
+        self.assertIn(custom,installed[-1])
+        self.assertNotIn(legacy,installed[-1])
+        self.assertEqual(installed[-1],installed[-2])
+
+    @unittest.skipUnless(os.name=='posix','Linux cron paths')
     def test_cron_install_failure_restores_preexisting_cron_and_configuration(self):
         path=self.root/'config/waf/logrotate.conf';self.atomic(path,b'old rotation')
         before='17 3 * * * /usr/local/bin/user-backup\n'

@@ -79,7 +79,7 @@ python3 -B configure.py refresh-ips
 
 审计使用 ModSecurity JSON 的 AHZ 部分，省略原始请求头、请求体和响应体；URI 与规则匹配信息仍可能敏感，日志权限为 0640。不要公开原始审计日志。
 
-安装系统已有的 `logrotate`、`cron` 并启用 cron 后，可显式运行 `python3 -B configure.py rotation`。它保留其他 cron 项，按分钟检查两个 WAF 日志，单文件超过 10 MiB 或到每日轮转时切分，保留四份并压缩。高流量下一分钟内仍可能超过 10 MiB；`copytruncate` 有标准的短暂日志丢失窗口，不用于声称无损取证。
+安装系统已有的 `logrotate`、`cron` 并启用 cron 后，可显式运行 `python3 -B configure.py rotation`。它按分钟检查 WAF 专用日志和普通访问、错误日志，分别以 10 MiB、50 MiB 为轮转阈值，各保留四份；普通日志立即压缩，WAF 专用日志沿用延迟压缩。只移除包内已知的旧容器轮转任务，保留其他 cron 项。阈值不是硬磁盘配额，高流量下一分钟内仍可超出；`copytruncate` 保留在用文件描述符，但有标准的短暂日志丢失窗口，不用于声称无损取证，见 [logrotate 官方手册](https://github.com/logrotate/logrotate/blob/main/logrotate.8.in)。
 
 配置应用先校验完整 include/代理头继承图，保存精确原件，再检查候选语法、重载并观察新的工作进程；失败恢复原件。重复应用不增加相同配置备份。受管备份上限 128 份、64 MiB，达到限额会要求管理员归档，不静默删除恢复点。
 

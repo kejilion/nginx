@@ -202,13 +202,23 @@ def _rotation(root,config):
     copytruncate
     create 0640 root root
 }
+'''+str(root/'log/nginx/error.log')+' '+str(root/'log/nginx/access.log')+''' {
+    daily
+    maxsize 50M
+    rotate 4
+    missingok
+    notifempty
+    compress
+    copytruncate
+}
 ''').encode()
     crontab=subprocess.run(['crontab','-l'],capture_output=True,text=True,timeout=10)
     if crontab.returncode and 'no crontab' not in crontab.stderr.lower():raise ValueError('Unable to preserve existing crontab')
     before=crontab.stdout if crontab.returncode==0 else ''
     marker='# kejilion-waf-logrotate'
     job='* * * * * '+binary+' --state '+str(directory/'logrotate.status')+' '+str(path)+' >/dev/null 2>&1 '+marker
-    lines=[line for line in before.splitlines() if not line.endswith(marker)]
+    legacy='0 2 * * * docker exec nginx apk add logrotate && docker exec nginx logrotate -f /etc/logrotate.conf'
+    lines=[line for line in before.splitlines() if not line.endswith(marker) and line!=legacy]
     updated='\n'.join([*lines,job])+'\n'
     backup=directory/'logrotate-cron-preimage.txt'
     if not backup.exists():atomic(backup,before.encode())
