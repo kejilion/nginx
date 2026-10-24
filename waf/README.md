@@ -42,6 +42,24 @@ python3 -B configure.py status
 
 `--profile` 必须同时指定 `--site`。`wordpress` 使用已有官方排除插件；`artifact-proxy` 限定下载路径与 Git 协议；`kpanel` 限定方法、API 路径和密码/代码参数，其他查询及用户名仍接受检查。WebSocket/SSE、上传等配置档不替代应用鉴权、代理超时或上传容量配置。
 
+## 通用请求语义兼容
+
+共享修复 `eb58fe4` 将方法覆盖按协议行为统一处理，不绑定 Flarum、域名或 `/api` 路径。仅原始 POST、单个 `X-HTTP-Method-Override` / `X-HTTP-Method` / `X-Method-Override` 头、明确的 PUT/PATCH/DELETE 且完整匹配既有允许方法时，才可进入兼容处理。请求方法及正文不改写，SQLi/XSS 等攻击检查继续执行；重复、冲突、危险值、覆盖头与顶层 query/body `_method` 混用仍由协议守卫按原评分基线拦截。参数 `_method` 单独使用仍遵循原有 PL1/PL2 行为，此开关不替代框架授权或 CSRF 防护。
+
+默认策略为 `methodOverride: guarded`，但只有管理工具核对完整 `nginx -T` 能力图后才激活。遇到 `limit_except`、按原始方法派生的权限条件、认证子请求、脚本认证或方法头改写等不确定语义时，对相应作用域保持 strict。覆盖请求不继承 WordPress、KPanel、Git 及自定义参数的业务排除，避免把原 POST 的特例错误用于另一种方法。也可明确设置全局或站点 `methodOverride: strict`；原有 WAF Off/Detect/On 和 CDN 模式独立保留。
+
+```sh
+python3 -B configure.py configure --method-override guarded
+python3 -B configure.py configure --site example.com --method-override strict
+python3 -B configure.py doctor
+```
+
+`status` 的 `methodOverride.synchronized` 核对当前能力与实际受管规则是否一致；`doctor` 在漂移时失败。手工调整 ACL、认证或代理头后，先 `apply` / 原生刷新再重载并检查；已有原生受管重载入口会刷新配置。普通 `nginx -s reload` 本身不会重新生成管理策略。仅更新镜像且未刷新受管配置的旧链路保持严格行为，不宣称自动获得这一兼容功能。本轮不更改版本号或重建镜像，配置包按提交及摘要分发。
+
+该实现保留 CRS 完整 `rules/*.conf` 装载，仅从 920450 的头名目标中排除三个规范名字，由自有 phase 2 守卫承担其严格校验并保留 949 评分/审计事件；其他受限头仍由原规则处理。ModSecurity 3.0.17 的动态单目标控制存在大小写边界，因此采用经真实引擎验证的配置期正则目标。隔离验证通过 Linux 70 项单测与 147 项真实 Nginx/ModSecurity 集成，含 Express `method-override@3.0.0` 组件 9 项有效方法检查、SQLi/XSS、ACL、多站点、可信代理、业务排除、Off/Detect、日志和恢复。其他框架为行为分析及请求形状覆盖，未宣称都做过完整登录业务测试。
+
+依据：[CRS 4.30 协议规则](https://raw.githubusercontent.com/coreruleset/coreruleset/v4.30.0/rules/REQUEST-920-PROTOCOL-ENFORCEMENT.conf)、[ModSecurity 目标更新](https://github.com/owasp-modsecurity/ModSecurity/wiki/Reference-Manual-(v3.x)#secruleupdatetargetbyid)、[Express 方法覆盖组件](https://github.com/expressjs/method-override)、[Nginx 方法权限](https://nginx.org/en/docs/http/ngx_http_core_module.html#limit_except)。
+
 ## 来源地址与 CDN
 
 ```sh
