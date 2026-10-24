@@ -90,13 +90,13 @@ python3 tests/nginx_performance.py --official-image <已核验的官方镜像> \
 
 ## 1.0.5 WAF 性能调整
 
-沿用现有组件及开关，启用 CRS 的 `tx.early_blocking=1`。仅当请求头阶段已经达到原有拦截分数时，才提前拒绝，避免继续读取、解析和检查正文；正常请求仍执行原有规则。完整配置维持 PL1、入站 5 / 出站 4，检测模式仍检查正文。镜像兼容层候选增加同一开关，保留旧配置的阈值及审计设置，供仍使用旧共享包的环境在升级镜像后获得此项改进。
+沿用现有组件及开关，启用 CRS 的 `tx.early_blocking=1`。仅当请求头阶段已经达到原有拦截分数时，才提前拒绝，避免继续读取、解析和检查正文；正常请求仍执行原有规则。完整配置维持 PL1、入站 5 / 出站 4，检测模式仍检查正文。镜像兼容层增加同一开关，保留旧配置的阈值及审计设置，供仍使用旧共享包的环境在升级镜像后获得此项改进。
 
-[CRS 官方说明](https://coreruleset.org/docs/2-how-crs-works/2-1-anomaly_scoring/#early-blocking)指出，提前阻断会减少被拒请求的后续正文告警；这不等于漏过了该请求，但排查误报时应使用检测模式取得完整信息。本候选已验证 949111 审计事件继续匹配现有受信过滤器，检测模式保留扫描器与正文 SQLi 告警，Off 仍由原开关控制。
+[CRS 官方说明](https://coreruleset.org/docs/2-how-crs-works/2-1-anomaly_scoring/#early-blocking)指出，提前阻断会减少被拒请求的后续正文告警；这不等于漏过了该请求，但排查误报时应使用检测模式取得完整信息。本版已验证 949111 审计事件继续匹配现有受信过滤器，检测模式保留扫描器与正文 SQLi 告警，Off 仍由原开关控制。
 
-2026-10-24，在同一 amd64 虚拟机上对正式 Nginx 1.31.8 / ModSecurity 3.0.17 / CRS 4.30.0 镜像做隔离比较：分别分配 1 CPU / 512 MiB / 20 站点、2 CPU / 1024 MiB / 200 站点。WAF Off、1.0.4 和候选共 108 组矩阵；另做 12 组反向顺序复测、120 秒小 JSON、120 秒 1 MiB 上传及负载后恢复检查。普通异常状态、未发出的请求、网络错误及 OOM 会使验证失败；只有明确的单站共享出口限流工况允许 429，429 不计入业务成功吞吐量。
+2026-10-24，在同一 amd64 虚拟机上对正式 Nginx 1.31.8 / ModSecurity 3.0.17 / CRS 4.30.0 镜像做隔离比较：分别分配 1 CPU / 512 MiB / 20 站点、2 CPU / 1024 MiB / 200 站点。WAF Off、1.0.4 和 1.0.5 共 108 组矩阵；另做 12 组反向顺序复测、120 秒小 JSON、120 秒 1 MiB 上传及负载后恢复检查。普通异常状态、未发出的请求、网络错误及 OOM 会使验证失败；只有明确的单站共享出口限流工况允许 429，429 不计入业务成功吞吐量。
 
-下表为候选在本轮夹具上的观测值，CPU 百分比按该档分配的总核数归一化。各行是独立负载，不应相加；上游为轻量测试服务，不能代替客户应用的容量测试。
+下表为 1.0.5 在本轮夹具上的观测值，CPU 百分比按该档分配的总核数归一化。各行是独立负载，不应相加；上游为轻量测试服务，不能代替客户应用的容量测试。
 
 | CPU / 站点 | 请求形态 | 有效请求/秒 | 观测 P99 | CPU 利用率 |
 | --- | --- | ---: | ---: | ---: |
@@ -125,13 +125,15 @@ python3 waf/tests/performance.py --image <已核验的本地镜像> \
 
 ## 验证与依据
 
+2026-10-24 的 [1.0.5 正式构建](https://github.com/kejilion/docker/actions/runs/40041358151)完成 amd64 / arm64 各 36 项兼容检查，组件仍为 Nginx 1.31.8 / ModSecurity 3.0.17 / CRS 4.30.0。该批产物在隔离环境完成新共享包 73 项和旧共享包 71 项通用检查、56 组站点模板及 67 项核心 Linux 单测。原生脚本模板更新器完成 42 项 Linux 测试、10 项固定包引导测试，官方及 WAF 镜像各完成一次真实 Docker 更新与失败恢复验证；未在生产执行数据库更新或故障注入。
+
 ```sh
 python3 -m unittest discover -s waf/tests -p 'test_*.py'
 ```
 
 2026-10-23 的正式 Nginx 1.31.8 镜像完成 amd64 / arm64 各 36 项镜像检查；完整配置完成 71 项通用场景、15 项真实 KPanel、18 项原生升级回滚和 56 项模板组合检查，核心 Linux 单测 62 项通过。正式服镜像与配置试点为 20 站点拦截模式，40 项正常访问检查无差异。KPanel 适配候选的完整 L2 通过，包含 314 个前端测试文件、3115 项通过和 6 项跳过，以及固定脚本来源的实际镜像构建。
 
-[正式构建](https://github.com/kejilion/docker/actions/runs/39971721735)与[已验证产物发布](https://github.com/kejilion/docker/actions/runs/39974763991)使用同一批产物。发布标签为 `kjlion/nginx:alpine`、`kjlion/nginx:1.31.8-alpine`；本次不可变镜像为 `kjlion/nginx@sha256:7827d4c2e19bfce579f6fb4ce94884a126b5ab8ea74943e5448fa4c2b3d7f894`。源码固定、CI 产物和公开镜像摘要均已核验。
+上一版 1.0.4 的[正式构建](https://github.com/kejilion/docker/actions/runs/39971721735)与[已验证产物发布](https://github.com/kejilion/docker/actions/runs/39974763991)使用同一批产物。发布标签为 `kjlion/nginx:alpine`、`kjlion/nginx:1.31.8-alpine`；该回滚版本的不可变镜像为 `kjlion/nginx@sha256:7827d4c2e19bfce579f6fb4ce94884a126b5ab8ea74943e5448fa4c2b3d7f894`。源码固定、CI 产物和公开镜像摘要均已核验。
 
 生产副本迁移及真实 KPanel 用例位于 `tests/pilot_config.py`、`tests/kpanel_profile.py`。它们使用无外网、无公开端口的隔离容器；KPanel 用例不挂载 Agent，因此文件内容测试只验证请求通过 WAF 到达 Agent 边界，不代表实际写文件功能通过。
 
