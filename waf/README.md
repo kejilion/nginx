@@ -2,6 +2,8 @@
 
 本目录管理现有 Docker Nginx + ModSecurity v3 + OWASP CRS 的配置。1.0.5 包含通用 Nginx 响应缓冲和 CRS 提前阻断调优，已在正式服 20 个站点完成分步试点。既有 KPanel 同源适配分支已通过完整 L2，面板版本发行另行进行。
 
+后续性能、安全、官方新特性和依赖迭代统一遵循 [通用 Nginx 性能与安全规范](PRINCIPLES.md)。以官方 Nginx 为共同基线，WAF 按需扩展；按“官方核对→隔离比较→独立复核→正式服试点→同一产物发布→公开与消费回读”推进。已启用、仅版本支持和待评估的特性分别记录，未验证收益不计入完成项。
+
 ## 架构边界
 
 沿用已有 CDN、Nginx、ModSecurity/CRS 和 Fail2Ban 链路。配置工具使用 Python 3.11+ 标准库，不安装 WAF 常驻服务，不新增 HTTP/Unix Socket 检查服务，不自动替换封禁后端。新增后端须另行评估。
@@ -15,13 +17,13 @@
 日常仍使用原生环境防护菜单中的 WAF 开关。接入后可使用 `k web waf status`、`k web waf doctor` 诊断。原生脚本固定共享提交及六文件摘要；下列 Python 入口用于已经取得并核验完整配置包后的高级设置：
 
 ```sh
-python3 configure.py configure --mode detect
-python3 configure.py doctor
-python3 configure.py configure --site example.com --profile wordpress --mode on
-python3 configure.py configure --site api.example.com --profile api --mode on
-python3 configure.py configure --site proxy.example.com --profile artifact-proxy --mode on
-python3 configure.py configure --site panel.example.com --profile kpanel --mode on
-python3 configure.py status
+python3 -B configure.py configure --mode detect
+python3 -B configure.py doctor
+python3 -B configure.py configure --site example.com --profile wordpress --mode on
+python3 -B configure.py configure --site api.example.com --profile api --mode on
+python3 -B configure.py configure --site proxy.example.com --profile artifact-proxy --mode on
+python3 -B configure.py configure --site panel.example.com --profile kpanel --mode on
+python3 -B configure.py status
 ```
 
 不带 `--site` 的 `configure --mode` 会统一全部站点模式并清除模式覆盖；已有业务配置档及精确排除仍保留。`off` 关闭规则引擎检查，Nginx 的独立限流仍有效。历史整站 Off 自动迁移到检测模式，须完成业务验证后再开启拦截；位置级自定义关闭保持原状并由管理员继续盘点。
@@ -35,10 +37,10 @@ python3 configure.py status
 ## 来源地址与 CDN
 
 ```sh
-python3 configure.py configure --site direct.example.com --cdn direct
-python3 configure.py configure --site cdn.example.com --cdn cloudflare
-python3 configure.py trust-cloudflare
-python3 configure.py refresh-ips
+python3 -B configure.py configure --site direct.example.com --cdn direct
+python3 -B configure.py configure --site cdn.example.com --cdn cloudflare
+python3 -B configure.py trust-cloudflare
+python3 -B configure.py refresh-ips
 ```
 
 直连不信任客户端自带的转发头。Cloudflare 模式仅信任官方 IPv4/IPv6 CIDR；`mixed` 同时允许直连与 Cloudflare，直连伪造头仍无效。其他代理须在策略 JSON 中明确声明 `trustedProxies` 和 `proxyHeader`，多级代理必须实际清洗并维护可信转发链，不能自动信任整个 Docker/私网。
@@ -51,12 +53,12 @@ python3 configure.py refresh-ips
 
 审计使用 ModSecurity JSON 的 AHZ 部分，省略原始请求头、请求体和响应体；URI 与规则匹配信息仍可能敏感，日志权限为 0640。不要公开原始审计日志。
 
-安装系统已有的 `logrotate`、`cron` 并启用 cron 后，可显式运行 `python3 configure.py rotation`。它保留其他 cron 项，按分钟检查两个 WAF 日志，单文件超过 10 MiB 或到每日轮转时切分，保留四份并压缩。高流量下一分钟内仍可能超过 10 MiB；`copytruncate` 有标准的短暂日志丢失窗口，不用于声称无损取证。
+安装系统已有的 `logrotate`、`cron` 并启用 cron 后，可显式运行 `python3 -B configure.py rotation`。它保留其他 cron 项，按分钟检查两个 WAF 日志，单文件超过 10 MiB 或到每日轮转时切分，保留四份并压缩。高流量下一分钟内仍可能超过 10 MiB；`copytruncate` 有标准的短暂日志丢失窗口，不用于声称无损取证。
 
 配置应用先校验完整 include/代理头继承图，保存精确原件，再检查候选语法、重载并观察新的工作进程；失败恢复原件。重复应用不增加相同配置备份。受管备份上限 128 份、64 MiB，达到限额会要求管理员归档，不静默删除恢复点。
 
 ```sh
-python3 configure.py rollback --backup /home/web/backups/waf-managed/具体备份目录
+python3 -B configure.py rollback --backup /home/web/backups/waf-managed/具体备份目录
 ```
 
 后续人工改动发生冲突时回滚会拒绝覆盖，须先核对差异。停用请使用 `configure --mode off`；原生整个环境卸载会清理本包带标记的轮转任务，保留其他 Cron；备份、停容器或清理失败会中止。该入口不自动拆除管理员原有 Fail2Ban 动作或迁移封禁后端，本包也没有独立的自动卸载命令。
@@ -137,4 +139,4 @@ python3 -m unittest discover -s waf/tests -p 'test_*.py'
 
 生产副本迁移及真实 KPanel 用例位于 `tests/pilot_config.py`、`tests/kpanel_profile.py`。它们使用无外网、无公开端口的隔离容器；KPanel 用例不挂载 Agent，因此文件内容测试只验证请求通过 WAF 到达 Agent 边界，不代表实际写文件功能通过。
 
-原则和组件官方依据见 [PRINCIPLES.md](PRINCIPLES.md)。限流余量不能代替精确误报排除，WAF 配置通过也不等于 OWASP ASVS 整体符合性。
+持续迭代规范、当前特性状态、后续评估队列和组件官方依据见 [PRINCIPLES.md](PRINCIPLES.md)。限流余量不能代替精确误报排除，WAF 配置通过也不等于 OWASP ASVS 整体符合性。
