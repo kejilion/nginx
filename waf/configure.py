@@ -202,7 +202,7 @@ def _rotation(root,config):
     copytruncate
     create 0640 root root
 }
-'''+str(root/'log/nginx/error.log')+' '+str(root/'log/nginx/access.log')+''' {
+'''+str(root/'log/nginx/error.log')+' '+str(root/'log/nginx/access.log')+' '+str(root/'log/nginx/waf-protocol.log')+''' {
     daily
     maxsize 50M
     rotate 4

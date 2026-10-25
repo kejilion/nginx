@@ -79,10 +79,10 @@ def validate(config: dict) -> dict:
         for rule in site.get("exclusions", []):
             if not isinstance(rule.get("ruleId"), int) or not 900000 <= rule["ruleId"] <= 999999:
                 raise ValueError("Exclusions must identify a CRS rule")
-            if not re.fullmatch(r"/[A-Za-z0-9_./-]{0,250}", rule.get("path", "")):
+            if not re.fullmatch(r"/[\w./-]{0,250}", rule.get("path", "")):
                 raise ValueError("Exclusion requires an exact path")
-            if not re.fullmatch(r"ARGS:[A-Za-z0-9_.\[\]-]{1,100}", rule.get("target", "")):
-                raise ValueError("Exclusion requires one named argument")
+            if rule.get('target')!='REQUEST_FILENAME' and not re.fullmatch(r"ARGS:[A-Za-z0-9_.\[\]-]{1,100}", rule.get("target", "")):
+                raise ValueError("Exclusion requires one named argument or exact filename")
         if len(site.get("exclusions", [])) > 32:
             raise ValueError("Too many exclusions")
         if "cdn" in site:
@@ -156,6 +156,7 @@ map "$limit_req_status:$limit_conn_status" $waf_rate_event {{
     ~^(REJECTED:|[^:]*:REJECTED$) 1;
 }}
 log_format waf_rate escape=json '$time_iso8601 key="$server_name|$remote_addr" event=rate request_limit="$limit_req_status" connection_limit="$limit_conn_status"';
+log_format waf_protocol escape=json '{{"time":"$time_iso8601","client":"$remote_addr","method":"$request_method","path":"$uri","status":$status,"upstream":"$upstream_status","duration":$request_time,"id":"$request_id","agent":"$http_user_agent"}}';
 access_log /var/log/nginx/waf-rate.log waf_rate if=$waf_rate_event;
 limit_req_zone $waf_normal_key zone=waf_requests:20m rate={rate}r/s;
 limit_req_zone $waf_upload_key zone=waf_uploads:5m rate={max(1, rate * 2 // 5)}r/s;
@@ -230,8 +231,10 @@ def render_profile_rules(config: dict, method_controls=None) -> str:
             exceptions += [
                 f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                 '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
-                f'    SecRule REQUEST_FILENAME "@streq {item["path"]}" "t:none,ctl:ruleRemoveTargetById={item["ruleId"]};{item["target"]}"',
             ]
+            if item['target']=='REQUEST_FILENAME':
+                exceptions.append('    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"')
+            exceptions.append(f'    SecRule REQUEST_FILENAME "@streq {item["path"]}" "t:none,ctl:ruleRemoveTargetById={item["ruleId"]};{item["target"]}"')
             rid += 1
     if global_mode != "on" and engine_enabled(config):
         lines.append('SecRule &TX:waf_mode_override "@eq 0" "id:1190,phase:1,pass,nolog,ctl:ruleEngine=' + {"off":"Off", "detect":"DetectionOnly"}[global_mode] + '"')
@@ -291,7 +294,7 @@ SecRequestBodyJsonDepthLimit 64
 SecArgumentsLimit 2048
 SecRule REQUEST_HEADERS:Content-Type "^application/(?:[a-z0-9.+-]+\\+)?json(?:;|$)" "id:200001,phase:1,pass,nolog,t:none,t:lowercase,ctl:requestBodyProcessor=JSON"
 SecRule REQUEST_HEADERS:Content-Type "^(?:application/(?:soap\\+)?xml|text/xml)(?:;|$)" "id:200000,phase:1,pass,nolog,t:none,t:lowercase,ctl:requestBodyProcessor=XML"
-SecRule REQBODY_ERROR "!@eq 0" "id:200002,phase:2,deny,status:400,log,msg:'WAF request body parsing failed'"
+SecRule REQBODY_ERROR "!@eq 0" "id:200002,phase:2,deny,status:400,nolog,msg:'WAF request body parsing failed'"
 SecRule INBOUND_DATA_ERROR "@eq 1" "id:200006,phase:2,deny,status:413,log,msg:'WAF request body limit exceeded'"
 SecRule &ARGS "@ge 2048" "id:200007,phase:2,deny,status:400,log,msg:'WAF argument budget exceeded'"
 SecResponseBodyAccess Off

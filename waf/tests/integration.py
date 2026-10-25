@@ -60,7 +60,7 @@ class Backend(http.server.BaseHTTPRequestHandler):
             self.wfile.flush()
             self.close_connection = True
             return
-        status = int(self.path.rsplit('/', 1)[-1]) if self.path.startswith('/status/') else 200
+        status = int(self.path.rsplit('/', 1)[-1]) if self.path.startswith('/status/') else int(self.headers.get('X-Fixture-Status','200'))
         framework=None
         if FRAMEWORK_MODULE and self.path.startswith('/framework/'):
             header=self.path.rsplit('/',1)[-1]
@@ -114,6 +114,7 @@ def main():
                          'detect.example': {'mode': 'detect'}, 'stream.example': {'profile': 'streaming'},
                          'upload.example': {'profile': 'upload'}, 'api.example': {'profile': 'api'},'artifact.example':{'profile':'artifact-proxy'},
                          'strict.example':{'methodOverride':'strict'},
+                         'unicode.example':{'exclusions':[{'ruleId':932260,'path':'/category/docker-项目/','target':'REQUEST_FILENAME'}]},
                          'proxy.example': {'cdn':'proxy','trustedProxies':['127.0.0.1/32','127.0.0.2/32']}})
     cf = policy.networks(json.loads((bundle / 'cloudflare-ips.json').read_text()))
     generated = work / 'conf.d/waf'
@@ -144,7 +145,7 @@ proxy_pass http://fixture_backend;
 '''
     blocks = []
     for host in ['one.example', 'two.example', 'wordpress.example', 'off.example', 'detect.example',
-                 'stream.example', 'upload.example', 'api.example', 'rate.example','artifact.example','strict.example','narrow.example','underscore.example']:
+                 'stream.example', 'upload.example', 'api.example', 'rate.example','artifact.example','strict.example','narrow.example','underscore.example','unicode.example']:
         blocks.append('server { listen unix:/test/front.sock; server_name ' + host + ';\n'
                       'set_real_ip_from unix:; real_ip_header CF-Connecting-IP;\n'
                       'include /etc/nginx/conf.d/waf/server-default.inc;\n'
@@ -163,6 +164,7 @@ proxy_pass http://fixture_backend;
     duplicate='server { listen unix:/test/front.sock; server_name duplicate.example; set_real_ip_from unix:; real_ip_header CF-Connecting-IP; include /etc/nginx/conf.d/waf/server-default.inc; location / { proxy_set_header x-forwarded-for $http_x_forwarded_for; proxy_set_header X-Forwarded-For bad; proxy_pass http://fixture_backend; } }'
     blocks.append(nginx_edit.patch_application(duplicate))
     blocks.append('server { listen unix:/test/front.sock; server_name acl.example; include /etc/nginx/conf.d/waf/server-default.inc; location / { limit_except POST { deny all; } '+proxy+' } }')
+    blocks.append('server { listen unix:/test/front.sock; server_name quiet.example; include /etc/nginx/conf.d/waf/server-default.inc; location = /api/log { error_log /var/log/nginx/error.log crit; access_log /var/log/nginx/waf-protocol.log waf_protocol; '+proxy+' } }')
     blocks.append('server { listen unix:/test/front.sock; server_name realm.example; include /etc/nginx/conf.d/waf/server-default.inc; auth_basic $fixture_realm; auth_basic_user_file /test/empty.htpasswd; location / { '+proxy+' } }')
     (work/'empty.htpasswd').write_text('')
     child='server { listen unix:/test/front.sock; server_name child.example; modsecurity on; set_real_ip_from unix:; real_ip_header CF-Connecting-IP; location / { modsecurity on; '+proxy+' } location /custom-off { modsecurity off; '+proxy+' } }'
@@ -178,6 +180,7 @@ http {
 include /etc/nginx/mime.types;
 modsecurity on;
 include /etc/nginx/conf.d/waf/http.conf;
+access_log /var/log/nginx/access.log combined;
 map $http_upgrade $fixture_connection { default upgrade; '' close; }
 map $request_method $fixture_realm { default off; DELETE admin; }
 limit_req_zone $remote_addr zone=fixture_rate:1m rate=1r/s;
@@ -303,6 +306,11 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         check('artifact-query-file-traversal-still-denied',host='artifact.example',path='/?file=../../etc/passwd',expected=403)
         check('schemeless-exclusion-never-applies-to-other-sites',path='/raw.githubusercontent.com/org/repo/main/test.sh',expected=403)
         check('JSON', host='api.example', method='POST', body=b'{"name":"hello","count":2}', headers={'Content-Type': 'application/json'})
+        check('unicode-filename-exclusion',host='unicode.example',path=urllib.parse.quote('/category/docker-项目/'))
+        check('unicode-filename-exclusion-keeps-query-protection',host='unicode.example',
+              path=urllib.parse.quote('/category/docker-项目/')+'?q='+urllib.parse.quote("1' UNION SELECT password FROM users--"),expected=403)
+        check('unicode-filename-exclusion-is-read-only',host='unicode.example',path=urllib.parse.quote('/category/docker-项目/'),
+              method='POST',body=b'{"text":"valid"}',headers={'Content-Type':'application/json'},expected=403)
         check('vendor-JSON', host='api.example', method='PATCH', body=b'{"name":"hello"}', headers={'Content-Type': 'application/vnd.api+json'})
         check('XML',host='api.example',method='POST',body=b'<root>hello</root>',headers={'Content-Type':'application/xml'})
         check('malformed-XML',host='api.example',method='POST',body=b'<root>',headers={'Content-Type':'application/xml'},expected=(400,403))
@@ -368,6 +376,36 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         check('override-does-not-inherit-git-protocol-exclusion',host='artifact.example',path='/https://github.com/org/repo.git/git-upload-pack',method='POST',
               body=b'0000',headers={'Content-Type':'application/x-git-upload-pack-request','X-HTTP-Method-Override':'PATCH'},expected=403)
         check('malformed-JSON', host='api.example', method='POST', body=b'{broken', headers={'Content-Type': 'application/json'}, expected=(400, 403))
+        marker='/parser-noise-observation'
+        check('malformed-JSON-keeps-denial-with-compact-access-record',host='api.example',path=marker,
+              method='POST',body=b'{"action":"raw\x1bcontrol"}',headers={'Content-Type':'application/json'},expected=400)
+        deadline=time.monotonic()+2
+        while marker not in (work/'logs/access.log').read_text():
+            if time.monotonic()>=deadline:raise AssertionError('Missing ordinary access record for rejected JSON')
+            time.sleep(.025)
+        # Connector 1.0.4 always emits an intervention error even with nolog.
+        assert marker in (work/'logs/error.log').read_text()
+        assert marker not in (work/'logs/waf-audit.json').read_text()
+        results.append({'test':'malformed-JSON-no-duplicate-audit','passed':True})
+        check('quiet-endpoint-still-rejects-malformed-JSON',host='quiet.example',path='/api/log',method='POST',
+              body=b'{"action":"raw\x1bcontrol"}',headers={'Content-Type':'application/json'},expected=400)
+        check('quiet-endpoint-retains-upstream-failure-status',host='quiet.example',path='/api/log',method='POST',
+              body=b'{"action":"valid"}',headers={'Content-Type':'application/json','X-Fixture-Status':'503'},expected=503)
+        check('quiet-endpoint-keeps-attack-audit',host='quiet.example',path='/api/log',method='POST',
+              body=b'{"action":"valid"}',headers={'Content-Type':'application/json','User-Agent':'sqlmap/1.8'},expected=403)
+        deadline=time.monotonic()+2
+        while True:
+            records=[json.loads(line) for line in (work/'logs/waf-protocol.log').read_text().splitlines()]
+            audits=[json.loads(line)['transaction'] for line in (work/'logs/waf-audit.json').read_text().splitlines()]
+            quiet=[item for item in audits if item['unique_id'].startswith('quiet.example|')]
+            if len(records)>=3 and quiet:break
+            if time.monotonic()>=deadline:raise AssertionError('Quiet endpoint logging did not finish')
+            time.sleep(.025)
+        assert {item['status'] for item in records}=={400,403,503}
+        assert any(item['upstream']=='503' for item in records)
+        assert all(item['response']['http_code']==403 for item in quiet)
+        assert 'quiet.example' not in (work/'logs/error.log').read_text()
+        results.append({'test':'quiet-endpoint-complete-access-and-security-audit','passed':True})
         check('deep-JSON', host='api.example', method='POST', body=('[' * 70 + '0' + ']' * 70).encode(), headers={'Content-Type': 'application/json'}, expected=(400, 403))
         check('large-valid-JSON', host='api.example', method='POST', body=json.dumps({'text': 'a' * (1024*1024)}).encode(), headers={'Content-Type': 'application/json'})
         boundary = 'fixtureBoundary'

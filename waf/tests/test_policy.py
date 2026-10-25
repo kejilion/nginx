@@ -110,6 +110,20 @@ class PolicyTests(unittest.TestCase):
         for path in ['/feed', '/readme.html', '/xmlrpc.php', 'allow,', 'ruleEngine=Off']:
             self.assertNotIn(path, rendered)
 
+    def test_unicode_filename_exclusion_keeps_exact_site_path_and_target(self):
+        entry={'ruleId':932260,'path':'/category/docker-项目/','target':'REQUEST_FILENAME'}
+        self.config['sites']={'one.example':{'exclusions':[entry]}}
+        policy.validate(self.config)
+        rendered=policy.render_profile_rules(self.config)
+        self.assertIn('@beginsWith one.example|',rendered)
+        self.assertIn('@streq /category/docker-项目/',rendered)
+        self.assertIn('ruleRemoveTargetById=932260;REQUEST_FILENAME',rendered)
+        self.assertIn('REQUEST_METHOD "@rx ^(?:GET|HEAD)$"',rendered)
+        self.assertNotIn('ruleRemoveById=932260',rendered)
+        for path in ['/bad"path','/bad\npath','/bad;path']:
+            entry['path']=path
+            with self.subTest(path=path),self.assertRaises(ValueError):policy.validate(self.config)
+
     def test_headroom_does_not_raise_crs_threshold(self):
         self.config.update(burst=400, connections=512)
         self.assertIn('inbound_anomaly_score_threshold=5', policy.render_profile_rules(self.config))
@@ -125,8 +139,11 @@ class PolicyTests(unittest.TestCase):
     def test_events_use_engine_signals_not_response_status(self):
         rendered = policy.render_http(self.config)
         self.assertIn('$limit_req_status:$limit_conn_status', rendered)
-        self.assertNotIn('$status', rendered)
-        self.assertNotIn('$http_', rendered)
+        # Optional access observability must not become a ban input.
+        event_config='\n'.join(line for line in rendered.splitlines() if not line.startswith('log_format waf_protocol '))
+        self.assertNotIn('$status', event_config)
+        self.assertNotIn('$http_', event_config)
+        self.assertIn('"upstream":"$upstream_status"',rendered)
 
     def test_method_compatibility_needs_proof_and_preserves_all_other_restrictions(self):
         self.assertIn('waf_method_override_guarded=0',policy.render_profile_rules(self.config))
@@ -155,6 +172,14 @@ class PolicyTests(unittest.TestCase):
         for field, value in [('connections', 100000), ('burst', 0), ('attackRetries', 1), ('banSeconds', 999999)]:
             with self.subTest(field=field), self.assertRaises(ValueError):
                 policy.validate(dict(self.config, **{field: value}))
+
+    def test_body_parser_errors_remain_denied_without_duplicate_full_logs(self):
+        rendered=policy.render_modsecurity(self.config)
+        rule=next(line for line in rendered.splitlines() if 'id:200002,' in line)
+        self.assertIn('deny,status:400,nolog',rule)
+        self.assertIn('SecRequestBodyAccess On',rendered)
+        self.assertIn('SecAuditLogRelevantStatus "^403$"',rendered)
+        self.assertIn('ctl:auditEngine=On',rendered)
 
 
 if __name__ == '__main__':

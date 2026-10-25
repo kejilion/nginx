@@ -77,7 +77,9 @@ python3 -B configure.py refresh-ips
 
 `existing-filters` 仅更新带有共享方案管理标记的既有 Fail2Ban 过滤器，不创建 jail 或动作。`retire-jails` 是显式迁移动作：只停用旧脚本按普通业务状态计数的九个网站 jail，保留 SSH 和自定义 jail；执行前应确认替代的受信事件链路已可用。不要把该动作当作新用户完整安装流程。公共旧网站 jail 模板默认关闭，不自动改变已安装的 jail；原生重装或重新配置 CF/Fail2Ban 会重新下载模板，须回读传统 jail 的启用状态，不能把配置成功等同于累计封禁已经生效。
 
-审计使用 ModSecurity JSON 的 AHZ 部分，省略原始请求头、请求体和响应体；URI 与规则匹配信息仍可能敏感，日志权限为 0640。不要公开原始审计日志。
+审计使用 ModSecurity JSON 的 AHZ 部分，省略原始请求头、请求体和响应体；URI 与规则匹配信息仍可能敏感，日志权限为 0640。不要公开原始审计日志。请求体解析失败仍在 WAF 返回 400，由访问日志保留请求与状态，`nolog` 减少重复审计，其他攻击规则继续审计。当前 1.0.4 连接器仍强制写入拦截错误，不能将 `nolog` 宣称为完全抑制错误日志，见[连接器源码](https://github.com/owasp-modsecurity/ModSecurity-nginx/blob/v1.0.4/src/ngx_http_modsecurity_module.c)。
+
+高频上报等单一业务可在管理员确认后，针对精确 `location` 使用 `error_log /var/log/nginx/error.log crit` 和 `access_log /var/log/nginx/waf-protocol.log waf_protocol`，同时保留现有 WAF 限流访问日志。该可选策略保留每次请求的状态、上游状态、耗时及请求编号，减少重复的拦截错误；正文校验、400 拒绝和 403 攻击审计保持开启。它也会减少该位置其他非致命错误细节，因此不能自动推广到所有业务位置。共享轮转同时覆盖 `waf-protocol.log`。
 
 安装系统已有的 `logrotate`、`cron` 并启用 cron 后，可显式运行 `python3 -B configure.py rotation`。它按分钟检查 WAF 专用日志和普通访问、错误日志，分别以 10 MiB、50 MiB 为轮转阈值，各保留四份；普通日志立即压缩，WAF 专用日志沿用延迟压缩。只移除包内已知的旧容器轮转任务，保留其他 cron 项。阈值不是硬磁盘配额，高流量下一分钟内仍可超出；`copytruncate` 保留在用文件描述符，但有标准的短暂日志丢失窗口，不用于声称无损取证，见 [logrotate 官方手册](https://github.com/logrotate/logrotate/blob/main/logrotate.8.in)。
 
