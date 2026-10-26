@@ -180,7 +180,7 @@ python3 -m unittest discover -s waf/tests -p 'test_*.py'
 
 持续迭代规范、当前特性状态、后续评估队列和组件官方依据见 [PRINCIPLES.md](PRINCIPLES.md)。限流余量不能代替精确误报排除，WAF 配置通过也不等于 OWASP ASVS 整体符合性。
 
-## 2026-10-26 公共应用兼容候选（尚未部署或发布）
+## 2026-10-26 公共应用兼容发布
 
 本轮修改共享配置包，不修改 KPanel 程序、不重建镜像、不提升版本号。通用反代模板生成的混合大小写 upstream 现可正确匹配 KPanel 容器端点；混合后端、未知业务 include 或脚本转发不能自动获得 KPanel 例外。已有显式 profile 优先。Flarum 自动识别同时要求项目及安装包元数据，遇到其他反代、不同 root、未知 include 或无法证明的 PHP 脚本路径时保持默认配置档。
 
@@ -199,8 +199,12 @@ python3 -m unittest discover -s waf/tests -p 'test_*.py'
 
 KPanel 站点解析上限为 8192，默认请求达到 2048 参数仍拒绝；仅 PUT 桌面 workspace 的 JSON 正文允许至 8192 的专用预算（达到上限拒绝，防止解析截断后遗漏尾部字段）。其他站点解析上限保持 2048。该余量覆盖桌面 512 位置、512 标签及 512 隐藏项等合法结构；不提高全局正文容量或攻击评分阈值。
 
-隔离验证使用实际 ARM64 Nginx 1.31.8 / ModSecurity 3.0.17 / CRS 4.30.0，固定本地镜像，不连接生产应用数据、Agent 或 Docker socket：77 项 Linux 单测、123 项公共应用请求形状、21 项真实 KPanel 鉴权/保存读回及 147 项原有真实引擎集成通过。覆盖查询与元数据攻击反例、畸形/超深 JSON、多站点、2048/8192 参数边界及超限尾部字段、9 MiB 原始文件正文、multipart、WebSocket/SSE、CDN 信任、Off/Detect/On 和重载恢复。Windows 单测 73 通过、4 项平台跳过；Linux 须使用受信私有 `TMPDIR`，不能以全局 `/tmp` 作为管理配置根目录。
+隔离验证使用实际 ARM64 Nginx 1.31.8 / ModSecurity 3.0.17 / CRS 4.30.0，固定本地镜像，不连接生产应用数据、Agent 或 Docker socket：79 项 Linux 单测、146 项公共应用请求形状及缓存语义、22 项真实 KPanel 鉴权/保存读回及 147 项原有真实引擎集成通过。覆盖查询与元数据攻击反例、畸形/超深 JSON、多站点、2048/8192 参数边界及超限尾部字段、9 MiB 原始文件正文、multipart、WebSocket/SSE、CDN 信任、Off/Detect/On 和重载恢复。Windows 单测 75 通过、4 项平台跳过；Linux 须使用受信私有 `TMPDIR`，不能以全局 `/tmp` 作为管理配置根目录。
 
-失败尝试保留在隔离证据中：初版遇到 Java 原始 JSON 重复扫描、桌面参数不足、为不存在的数组项添加大量动态例外导致超时，均先复现后调整；新增例外仅对实际存在字段添加，规则列表按配置档共享编译。单 CPU ARM64 隔离样本的 32 帧输入约 246 ms，最大桌面元数据约 1 s、64 个代码快捷方式约 3.6 s、8191 个普通叶子约 6.4 s；这些是边界单次样本，不代表所有用户性能或长时间稳定性。512 MiB 旧式单体上传、所有扩展/第三方应用及真实用户终端执行未全部验证；实际应用测试只做到保存、鉴权和 Agent 边界。生产试点、公共固定摘要更新及消费者回读仍待完成，不把本地候选称为生态已交付。
+失败尝试保留在隔离证据中：初版遇到 Java 原始 JSON 重复扫描、桌面参数不足、为不存在的数组项添加大量动态例外导致超时，均先复现后调整；新增例外仅对实际存在字段添加，规则列表按配置档共享编译。单 CPU ARM64 隔离样本的 32 帧输入约 246 ms，最大桌面元数据约 1 s、64 个代码快捷方式约 3.6 s、8191 个普通叶子约 6.4 s；这些是边界单次样本，不代表所有用户性能或长时间稳定性。512 MiB 旧式单体上传、所有扩展/第三方应用及真实用户终端执行未全部验证；实际应用测试只做到保存、鉴权和 Agent 边界。
+
+最终共享配置固定为 [993ab1d](https://github.com/kejilion/nginx/commit/993ab1d89c2b19abbb89205ddc936c5962ad6828)，根/CN 脚本入口为 [d9ee024](https://github.com/kejilion/sh/commit/d9ee024ceed6b3057edad4caa3bb526e186e9cd4)，版本仍为配置包 1.0.5 / 脚本 4.5.14，不重建镜像。授权 EU 试点保持 mixed 来源信任并开启 WAF；重载/doctor、10 项正常生产请求、真实 Docker/终端 WebP、应用会话拒绝及重复计划零漂移通过。原有镜像身份不变。公开六文件与两脚本字节校验一致，生产机器已通过发布脚本实际下载、校验和幂等应用；本机两份旧入口仅对齐 WAF 固定来源与摘要，其他内容保留，恢复点分别保留。真实账户的 Docker 操作与终端执行仍需按用户实际业务复验，生产 401 只证明到达应用鉴权，不代表执行成功。
+
+其他用户需更新脚本并通过现有 WAF 开关/共享刷新入口取得新配置；只拉取 WAF 镜像不会自动替换旧的宿主策略。已安装面板若固化旧脚本，仍需核对或更新其实际调用来源，不宣称所有旧发行包已自动升级。
 
 依据：[CRS 精确排除](https://coreruleset.org/docs/2-how-crs-works/2-3-false-positives-and-tuning/)、[CRS 4.30 路径检查变更](https://coreruleset.org/20261002/crs-versions-4.30.0-and-4.25.2-lts-released/)、[ModSecurity v3 指令及 ctl 限制](https://github.com/owasp-modsecurity/ModSecurity/wiki/Reference-Manual-%28v3.x%29)、[3.0.17 正文处理实现](https://github.com/owasp-modsecurity/ModSecurity/blob/v3.0.17/src/transaction.cc)、[Flarum JSON:API](https://docs.flarum.org/extend/api/)。本轮仍沿用六文件固定配置包，直连/CDN 信任和现有 WAF 开关独立保留。
