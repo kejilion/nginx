@@ -25,10 +25,27 @@ import nginx_edit
 from integration import Backend, UnixHTTP
 
 
+class ApplicationBackend(Backend):
+    def do_GET(self):
+        if self.path!='/cache-fixture':return super().do_GET()
+        identity=self.headers.get('Cookie') or self.headers.get('Authorization')
+        data=(identity or 'anonymous').encode()
+        self.send_response(200 if identity else 404)
+        self.send_header('Content-Length',str(len(data)));self.send_header('Content-Type','text/plain')
+        self.send_header('Connection','close');self.end_headers();self.wfile.write(data);self.close_connection=True
+
+
 def cases():
     result=[]
-    def add(label,method,path,body=None,expected=200,headers=None,host='panel.example'):
-        result.append(dict(label=label,method=method,path=path,body=body,expected=expected,headers=headers or {},host=host))
+    def add(label,method,path,body=None,expected=200,headers=None,host='panel.example',expected_body=None,expected_cache=None):
+        result.append(dict(label=label,method=method,path=path,body=body,expected=expected,headers=headers or {},host=host,expected_body=expected_body,expected_cache=expected_cache))
+    for label,headers,status,body,cache in [
+        ('anonymous-miss',{},404,b'anonymous','MISS'),('anonymous-hit',{},404,b'anonymous','HIT'),
+        ('cookie-a',{'Cookie':'session=a'},200,b'session=a','BYPASS'),
+        ('cookie-b',{'Cookie':'session=b'},200,b'session=b','BYPASS'),
+        ('authorization',{'Authorization':'Bearer fixture'},200,b'Bearer fixture','BYPASS'),
+        ('anonymous-remains-anonymous',{},404,b'anonymous','HIT')]:
+        add('auth-cache-'+label,'GET','/cache-fixture',expected=status,headers=headers,expected_body=body,expected_cache=cache)
     for suffix in ['summary','environment','containers','compose-projects','images','networks','volumes','backups','jobs']:
         add('docker-'+suffix,'GET','/api/v1/docker/'+suffix)
     for method in ['GET','HEAD']:
@@ -127,10 +144,10 @@ def main():
     cf=policy.networks(json.loads((bundle/'cloudflare-ips.json').read_text()))
     for name,text in policy.bundle_files(config,cf).items():(generated/name).write_text(text)
     (generated/'blocked.map').write_text(policy.render_bans({},int(time.time())))
-    backend=UnixHTTP(str(work/'backend.sock'),Backend);os.chmod(work/'backend.sock',0o666)
+    backend=UnixHTTP(str(work/'backend.sock'),ApplicationBackend);os.chmod(work/'backend.sock',0o666)
     threading.Thread(target=backend.serve_forever,daemon=True).start()
-    servers='\n'.join(nginx_edit.patch_site('server { listen unix:/test/front.sock; server_name '+host+'; location / { proxy_pass http://fixture; proxy_http_version 1.1; proxy_set_header Connection close; } }',config)for host in [*profiles,'other.example'])
-    (work/'nginx.conf').write_text('load_module /etc/nginx/modules/ngx_http_modsecurity_module.so;\npid /run/nginx.pid;\nerror_log /var/log/nginx/error.log error;\nworker_processes 1;\nevents { worker_connections 128; }\nhttp { client_max_body_size 16m; modsecurity on; include /etc/nginx/conf.d/waf/http.conf; upstream fixture {server unix:/test/backend.sock;}\n'+servers+'\n}\n')
+    servers='\n'.join(nginx_edit.patch_site('server { listen unix:/test/front.sock; server_name '+host+'; location = /cache-fixture { proxy_pass http://fixture; proxy_cache fixture; proxy_cache_valid 200 404 10m; proxy_cache_key "$host$request_uri"; add_header X-Fixture-Cache $upstream_cache_status always; } location / { proxy_pass http://fixture; proxy_http_version 1.1; proxy_set_header Connection close; } }',config)for host in [*profiles,'other.example'])
+    (work/'nginx.conf').write_text('load_module /etc/nginx/modules/ngx_http_modsecurity_module.so;\npid /run/nginx.pid;\nerror_log /var/log/nginx/error.log error;\nworker_processes 1;\nevents { worker_connections 128; }\nhttp { proxy_cache_path /var/cache/nginx/fixture levels=1:2 keys_zone=fixture:1m; client_max_body_size 16m; modsecurity on; include /etc/nginx/conf.d/waf/http.conf; upstream fixture {server unix:/test/backend.sock;}\n'+servers+'\n}\n')
     name='waf-kpanel-contract-'+uuid.uuid4().hex[:8];results=[]
     def run(cmd):return subprocess.run(cmd,capture_output=True,check=True,timeout=60)
     try:
@@ -149,8 +166,9 @@ def main():
                 if not isinstance(body,bytes):body=json.dumps(body).encode()
                 headers.setdefault('Content-Type','application/json')
             started=time.monotonic()
-            c.request(item['method'],item['path'],body,headers);r=c.getresponse();r.read();status=r.status;c.close()
-            results.append({'test':item['label'],'status':status,'expected':item['expected'],'passed':status==item['expected'],'elapsed_ms':round((time.monotonic()-started)*1000,2)})
+            c.request(item['method'],item['path'],body,headers);r=c.getresponse();payload=r.read();status=r.status;cache=r.getheader('X-Fixture-Cache');c.close()
+            passed=status==item['expected'] and (item['expected_body'] is None or payload==item['expected_body']) and (item['expected_cache'] is None or cache==item['expected_cache'])
+            results.append({'test':item['label'],'status':status,'expected':item['expected'],'passed':passed,'cache':cache,'elapsed_ms':round((time.monotonic()-started)*1000,2)})
         failures=[r for r in results if not r['passed']]
         print(json.dumps({'cases':len(results),'passed':len(results)-len(failures),'failures':failures,'workspace':str(work)}),flush=True)
         if failures and not args.observe:raise AssertionError('KPanel contract regression failed')

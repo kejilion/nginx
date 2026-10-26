@@ -186,6 +186,8 @@ python3 -m unittest discover -s waf/tests -p 'test_*.py'
 
 首次授权生产试点发现打包图标 `/desktop-icons/` 的普通文件名仍触发 `932260`，已在发布前精确回滚。补充配置档内 `assets` / `desktop-icons` 的 GET/HEAD 静态文件语法：限定目录深度、文件名与扩展名，拒绝双点及 shell 字符，仅排除该规则的路径目标；查询、正文及其他规则继续扫描。新增 12 项真实引擎正反例和真实 KPanel WebP 文件内容检查通过，公共矩阵增为 135 项、真实应用检查增为 22 项。该回退与补齐不能省略为“首次试点全部正常”。
 
+同一试点还确认既有反代把未登录图标的 404 缓存了 10 分钟，带入口 Cookie 的后续请求仍命中该结果。KPanel 共享配置档的 server hook 增加 `proxy_cache_bypass $http_authorization $http_cookie` 与 `proxy_no_cache $http_authorization $http_cookie`，同时避免已认证内容进入共享缓存；generic 默认及管理员位置级显式覆盖保持原样。真实缓存的匿名 MISS/HIT、两个 Cookie 独立内容、Authorization BYPASS 及匿名结果保持共 6 项通过，公共矩阵增为 141 项，Linux 单测增为 78 项。此保守选择会减少带 Cookie 的静态请求缓存命中；浏览器缓存与 CDN 策略独立，不声称没有性能代价。依据：[Nginx 缓存读取条件](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cache_bypass)及[写入条件](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_no_cache)。
+
 - KPanel：桌面窗口路径、快捷命令/链接、文件路径及操作、Compose/环境变量、终端历史、交互输入和联合通信按明确方法、端点和字段兼容。Base64 终端输入及 Noise 消息仅排除 SQLi 字段目标，不把元数据一并放行。JSON 例外拒绝同名 `json.*` 查询参数和方法覆盖头；其他字段、Cookie、头和请求解析检查保留。
 - 二进制上传：仅已知文件上传/分片接口的 `application/octet-stream` 及快捷图标接口的 PNG/JPEG/WebP，调整 `920420` 与注入规则的 `REQUEST_BODY` 目标。查询参数继续检查；JSON、其他媒体类型、其他路径及其他站点不借用例外。`SecRequestBodyAccess` 保持 On；ModSecurity 3.0.17 在 Off 时会跳过 phase 2，不能用它实现“只跳过文件内容”。应用仍负责会话、CSRF、文件类型、目录权限和大小校验；WAF 不是病毒扫描器。
 - WordPress：仅 GET/HEAD 的标准分类/标签/作者路径、受限含连字符的文章路径移除 `932260` 的 `REQUEST_FILENAME` 目标。其他 RCE 规则、查询和正文继续检查；不接受 shell 分隔符或编码绕过作为路径语法。

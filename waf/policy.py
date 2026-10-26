@@ -180,11 +180,12 @@ modsecurity_transaction_id "$server_name|$remote_addr|$request_id";
     return rendered
 
 
-def render_server(realip: str = "realip.conf", existing_bans=True, argument_limit=None) -> str:
+def render_server(realip: str = "realip.conf", existing_bans=True, argument_limit=None, authenticated_proxy=False) -> str:
     return ("# Managed per-server configuration; existing ban backend is opt-in.\n"+
             ("if ($waf_blocked) { return 403; }\n" if existing_bans else '')+
             "include " + BASE + "/" + realip + ";\n"+
-            ("modsecurity_rules 'SecArgumentsLimit 8192';\n" if argument_limit==8192 else ''))
+            ("modsecurity_rules 'SecArgumentsLimit 8192';\n" if argument_limit==8192 else '')+
+            ("proxy_cache_bypass $http_authorization $http_cookie;\nproxy_no_cache $http_authorization $http_cookie;\n" if authenticated_proxy else ''))
 
 
 def engine_enabled(config: dict) -> bool:
@@ -531,7 +532,8 @@ def bundle_files(config: dict, cloudflare: list[str], method_controls=None) -> d
                 realip=f'realip-{ident}.conf'
                 result[realip] = render_realip(settings, cloudflare)
             result[f"server-{ident}.inc"] = render_server(realip,config.get('banBackend','existing')=='existing',
-                                                        8192 if site.get('profile')=='kpanel' else None)
+                                                        8192 if site.get('profile')=='kpanel' else None,
+                                                        authenticated_proxy=site.get('profile')=='kpanel')
     return result
 
 

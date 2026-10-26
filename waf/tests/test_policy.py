@@ -9,6 +9,15 @@ import policy
 
 
 class PolicyTests(unittest.TestCase):
+    def test_authenticated_application_profile_does_not_share_proxy_cache(self):
+        self.assertNotIn('proxy_cache_bypass',policy.render_server())
+        import hashlib
+        self.config['sites']={'panel.example':{'profile':'kpanel'}}
+        files=policy.bundle_files(self.config,policy.networks(json.loads((self.root/'cloudflare-ips.json').read_text())))
+        hook=files['server-'+hashlib.sha256(b'panel.example').hexdigest()[:16]+'.inc']
+        self.assertIn('proxy_cache_bypass $http_authorization $http_cookie;',hook)
+        self.assertIn('proxy_no_cache $http_authorization $http_cookie;',hook)
+
     def test_kpanel_typed_rules_are_shared_without_cross_site_activation(self):
         self.config['sites']={f'panel{i}.example':{'profile':'kpanel'} for i in range(200)}
         text=policy.render_profile_rules(self.config)
