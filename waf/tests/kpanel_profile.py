@@ -129,6 +129,8 @@ server {
         deadline=time.monotonic()+10
         while not (sockets/'front.sock').exists() and time.monotonic()<deadline:time.sleep(0.1)
         request('real-panel-health','GET','/api/v1/health')
+        icon=request('real-bundled-Docker-icon','GET','/desktop-icons/docker-kpanel-flat-v1.webp')
+        assert isinstance(icon,bytes) and icon[:4]==b'RIFF' and icon[8:12]==b'WEBP'
         password='Fixture9! '+"1' UNION SELECT password FROM users--"+' <script>alert(1)</script>'
         request('real-bootstrap-complex-password','POST','/api/v1/auth/bootstrap',
                 {'token':token,'username':'waf-fixture','password':password},201)

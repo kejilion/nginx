@@ -31,6 +31,13 @@ def cases():
         result.append(dict(label=label,method=method,path=path,body=body,expected=expected,headers=headers or {},host=host))
     for suffix in ['summary','environment','containers','compose-projects','images','networks','volumes','backups','jobs']:
         add('docker-'+suffix,'GET','/api/v1/docker/'+suffix)
+    for method in ['GET','HEAD']:
+        for path in ['/desktop-icons/docker-kpanel-flat-v1.webp','/desktop-icons/modern/docker-v1.svg','/assets/docker-compose-client.js']:
+            add('bundled-static-'+method+path,method,path)
+    for path in ['/desktop-icons/docker-kpanel-flat-v1.webp?q=%3Cscript%3Ealert(1)%3C/script%3E','/desktop-icons/docker-;id.webp','/desktop-icons/docker-../icon.webp','/desktop-icons/docker-kpanel-flat-v1.php']:
+        add('asset-must-not-borrow-exclusion-'+path,'GET',path,expected=403)
+    add('asset-exclusion-is-read-only','POST','/desktop-icons/docker-kpanel-flat-v1.webp',{},403)
+    add('asset-exclusion-is-profile-scoped','GET','/desktop-icons/docker-kpanel-flat-v1.webp',expected=403,host='other.example')
     for suffix in ['logs','stats','run-command']:
         add('docker-container-'+suffix,'GET','/api/v1/docker/containers/'+'a'*64+'/'+suffix)
     for suffix in ['start','stop','restart','pause','unpause','remove','check_update']:

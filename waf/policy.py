@@ -292,6 +292,11 @@ def _kpanel_rules(sites, first_id):
     # exempt arbitrary app suffixes or any query/body target from this rule.
     route(['POST'], r'/api/v1/apps/(?:builtin|thirdparty|local)-[A-Za-z0-9][A-Za-z0-9_-]{0,63}/manage',
           ['ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME'])
+    # Bundled static assets have literal file names, not command arguments.
+    # Keep this inside the known application profile, reject traversal/shell
+    # syntax and leave query/body/other path rules inspected.
+    route(['GET','HEAD'], r'/(?:assets|desktop-icons)/(?:[A-Za-z0-9_-]{1,64}/){0,4}(?![^/]*[.][.])[A-Za-z0-9][A-Za-z0-9_.-]{0,199}[.](?:webp|png|jpe?g|svg|ico|gif|avif|css|js|woff2?)',
+          ['ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME'])
     route(['GET', 'PUT'], r'/api/v1/files(?:/(?:entry|content|archive))?',
           ['ctl:ruleRemoveTargetByTag=' + tag + ';ARGS:path' for tag in PATH_TAGS])
     return lines, rid
