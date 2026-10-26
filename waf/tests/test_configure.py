@@ -16,6 +16,24 @@ import policy
 
 
 class ManagedTrustTests(unittest.TestCase):
+    def test_cache_predicates_preserve_http_server_and_location_inheritance(self):
+        def check(server):
+            return nginx_edit.cache_inheritance('# configuration file /etc/nginx/nginx.conf:\nhttp { proxy_cache_bypass $arg_nocache; proxy_no_cache $http_x_private; '+server+' }')['panel.example']
+        self.assertEqual(check('server { server_name panel.example; }'),{'proxy_cache_bypass':['$arg_nocache'],'proxy_no_cache':['$http_x_private']})
+        self.assertEqual(check('server { server_name panel.example; proxy_cache_bypass $http_x_custom; }'),{'proxy_cache_bypass':[],'proxy_no_cache':['$http_x_private']})
+        self.assertEqual(check('server { server_name panel.example; location / { proxy_cache_bypass $http_x_location; proxy_no_cache $http_x_location; } }'),{'proxy_cache_bypass':['$arg_nocache'],'proxy_no_cache':['$http_x_private']})
+        dump='# configuration file /etc/nginx/nginx.conf:\nhttp { proxy_cache_bypass $arg_nocache; proxy_no_cache $http_x_private; server { server_name panel.example; include /etc/nginx/conf.d/waf/server-default.inc; } }\n# configuration file /etc/nginx/conf.d/waf/server-default.inc:\nproxy_cache_bypass $http_cookie; proxy_no_cache $http_cookie;\n'
+        self.assertEqual(nginx_edit.cache_inheritance(dump)['panel.example'],check('server { server_name panel.example; }'))
+        self.assertEqual(nginx_edit.cache_inheritance(dump.replace('panel.example','Panel.Example'))['panel.example'],check('server { server_name panel.example; }'))
+        self.assertEqual(check('server { server_name panel.example; }'),nginx_edit.cache_inheritance(dump.replace('proxy_cache_bypass','"proxy_cache_bypass"'))['panel.example'])
+        ambiguous='# configuration file /etc/nginx/nginx.conf:\nhttp { proxy_cache_bypass $arg_http; server { server_name panel.example; proxy_cache_bypass $arg_server; } server { server_name panel.example; } }'
+        self.assertIsNone(nginx_edit.cache_inheritance(ambiguous)['panel.example'])
+        config=json.loads((manage.BUNDLE/'example-policy.json').read_text());config['sites']={'panel.example':{'profile':'kpanel'}}
+        with self.assertRaisesRegex(ValueError,'Conflicting cache inheritance'):
+            policy.bundle_files(config,[],cache_controls=nginx_edit.cache_inheritance(ambiguous))
+        config['sites']['panel.example']['profile']='generic'
+        policy.bundle_files(config,[],cache_controls=nginx_edit.cache_inheritance(ambiguous))
+
     def test_flarum_metadata_and_mixed_application_scope(self):
         with tempfile.TemporaryDirectory() as directory:
             root=pathlib.Path(directory);(root/'public').mkdir();(root/'vendor/flarum/core').mkdir(parents=True)

@@ -381,6 +381,7 @@ def make_plan(root, config, cfdata=None):
     effective=execute('docker','exec',config['container'],'nginx','-T')
     header_scopes=nginx_edit.configuration_headers(effective,allowed_proxy_files)
     method_controls=nginx_edit.method_override_controls(effective)
+    cache_controls=nginx_edit.cache_inheritance(effective)
     if any(name not in allowed_proxy_files and not name.startswith('/etc/nginx/conf.d/waf/') for name,_ in header_scopes):
         raise ValueError('Proxy directives outside managed site files need explicit integration')
     main_text=read_config(main)
@@ -430,7 +431,7 @@ def make_plan(root, config, cfdata=None):
         raise ValueError('Site count exceeds supported budget')
     policy.validate(config)
     directory = root / 'conf.d/waf'
-    for name, content in policy.bundle_files(config, cloudflare,method_controls).items():
+    for name, content in policy.bundle_files(config, cloudflare,method_controls,cache_controls).items():
         changes[directory / name] = content.encode()
     changes[directory / 'cloudflare-ips.json'] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()
     changes[current] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()

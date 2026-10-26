@@ -27,7 +27,7 @@ from integration import Backend, UnixHTTP
 
 class ApplicationBackend(Backend):
     def do_GET(self):
-        if self.path!='/cache-fixture':return super().do_GET()
+        if self.path.split('?',1)[0]!='/cache-fixture':return super().do_GET()
         identity=self.headers.get('Cookie') or self.headers.get('Authorization')
         data=(identity or 'anonymous').encode()
         self.send_response(200 if identity else 404)
@@ -46,6 +46,13 @@ def cases():
         ('authorization',{'Authorization':'Bearer fixture'},200,b'Bearer fixture','BYPASS'),
         ('anonymous-remains-anonymous',{},404,b'anonymous','HIT')]:
         add('auth-cache-'+label,'GET','/cache-fixture',expected=status,headers=headers,expected_body=body,expected_cache=cache)
+    for label,host,path,headers,cache in [
+        ('http-inherited','panel.example','/cache-fixture?nocache=1',{},'BYPASS'),
+        ('server-own','servercache.example','/cache-fixture',{'X-Skip-Cache':'1'},'BYPASS'),
+        ('server-replaces-http','servercache.example','/cache-fixture?nocache=1',{},'MISS'),
+        ('location-own','locationcache.example','/cache-fixture',{'X-Location-Cache':'1'},'BYPASS'),
+        ('location-replaces-server','locationcache.example','/cache-fixture?nocache=1',{},'MISS')]:
+        add('cache-predicate-'+label,'GET',path,expected=404,headers=headers,host=host,expected_body=b'anonymous',expected_cache=cache)
     for suffix in ['summary','environment','containers','compose-projects','images','networks','volumes','backups','jobs']:
         add('docker-'+suffix,'GET','/api/v1/docker/'+suffix)
     for method in ['GET','HEAD']:
@@ -139,15 +146,22 @@ def main():
     parser=argparse.ArgumentParser();parser.add_argument('--image',required=True);parser.add_argument('--work-dir',type=Path,required=True);parser.add_argument('--observe',action='store_true');args=parser.parse_args()
     work=args.work_dir.absolute();work.mkdir(mode=0o755)
     bundle=Path(__file__).resolve().parents[1];generated=work/'waf';generated.mkdir();logs=work/'logs';logs.mkdir()
-    profiles={'panel.example':'kpanel','generic.example':'generic','api.example':'api','cms.example':'wordpress','forum.example':'flarum','upload.example':'upload','stream.example':'streaming'}
+    profiles={'panel.example':'kpanel','servercache.example':'kpanel','locationcache.example':'kpanel','generic.example':'generic','api.example':'api','cms.example':'wordpress','forum.example':'flarum','upload.example':'upload','stream.example':'streaming'}
     config=json.loads((bundle/'example-policy.json').read_text());config.update(mode='on',cdn='direct',sites={name:{'profile':profile}for name,profile in profiles.items()})
     cf=policy.networks(json.loads((bundle/'cloudflare-ips.json').read_text()))
-    for name,text in policy.bundle_files(config,cf).items():(generated/name).write_text(text)
+    def server(host):
+        own='proxy_cache_bypass $http_x_skip_cache; proxy_no_cache $http_x_skip_cache;' if host=='servercache.example' else ''
+        location='proxy_cache_bypass $http_x_location_cache; proxy_no_cache $http_x_location_cache;' if host=='locationcache.example' else ''
+        return 'server { listen unix:/test/front.sock; server_name '+host+'; '+own+' location = /cache-fixture { '+location+' proxy_pass http://fixture; proxy_cache fixture; proxy_cache_valid 200 404 10m; proxy_cache_key "$host$request_uri"; add_header X-Fixture-Cache $upstream_cache_status always; } location / { proxy_pass http://fixture; proxy_http_version 1.1; proxy_set_header Connection close; } }'
+    raw_servers='\n'.join(server(host)for host in [*profiles,'other.example'])
+    inherited='proxy_cache_bypass $arg_nocache; proxy_no_cache $arg_nocache;'
+    controls=nginx_edit.cache_inheritance('# configuration file /etc/nginx/nginx.conf:\nhttp { '+inherited+raw_servers+' }')
+    for name,text in policy.bundle_files(config,cf,cache_controls=controls).items():(generated/name).write_text(text)
     (generated/'blocked.map').write_text(policy.render_bans({},int(time.time())))
     backend=UnixHTTP(str(work/'backend.sock'),ApplicationBackend);os.chmod(work/'backend.sock',0o666)
     threading.Thread(target=backend.serve_forever,daemon=True).start()
-    servers='\n'.join(nginx_edit.patch_site('server { listen unix:/test/front.sock; server_name '+host+'; location = /cache-fixture { proxy_pass http://fixture; proxy_cache fixture; proxy_cache_valid 200 404 10m; proxy_cache_key "$host$request_uri"; add_header X-Fixture-Cache $upstream_cache_status always; } location / { proxy_pass http://fixture; proxy_http_version 1.1; proxy_set_header Connection close; } }',config)for host in [*profiles,'other.example'])
-    (work/'nginx.conf').write_text('load_module /etc/nginx/modules/ngx_http_modsecurity_module.so;\npid /run/nginx.pid;\nerror_log /var/log/nginx/error.log error;\nworker_processes 1;\nevents { worker_connections 128; }\nhttp { proxy_cache_path /var/cache/nginx/fixture levels=1:2 keys_zone=fixture:1m; client_max_body_size 16m; modsecurity on; include /etc/nginx/conf.d/waf/http.conf; upstream fixture {server unix:/test/backend.sock;}\n'+servers+'\n}\n')
+    servers=nginx_edit.patch_site(raw_servers,config)
+    (work/'nginx.conf').write_text('load_module /etc/nginx/modules/ngx_http_modsecurity_module.so;\npid /run/nginx.pid;\nerror_log /var/log/nginx/error.log error;\nworker_processes 1;\nevents { worker_connections 128; }\nhttp { proxy_cache_path /var/cache/nginx/fixture levels=1:2 keys_zone=fixture:1m; client_max_body_size 16m; modsecurity on; include /etc/nginx/conf.d/waf/http.conf; upstream fixture {server unix:/test/backend.sock;}\n'+inherited+servers+'\n}\n')
     name='waf-kpanel-contract-'+uuid.uuid4().hex[:8];results=[]
     def run(cmd):return subprocess.run(cmd,capture_output=True,check=True,timeout=60)
     try:

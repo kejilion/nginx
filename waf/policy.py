@@ -180,12 +180,15 @@ modsecurity_transaction_id "$server_name|$remote_addr|$request_id";
     return rendered
 
 
-def render_server(realip: str = "realip.conf", existing_bans=True, argument_limit=None, authenticated_proxy=False) -> str:
+def render_server(realip: str = "realip.conf", existing_bans=True, argument_limit=None, authenticated_proxy=False, cache_conditions=None) -> str:
+    cache_conditions=cache_conditions or {}
+    cache=''.join(directive+' '+' '.join(cache_conditions.get(directive,[])+['$http_authorization','$http_cookie'])+';\n'
+                  for directive in ['proxy_cache_bypass','proxy_no_cache']) if authenticated_proxy else ''
     return ("# Managed per-server configuration; existing ban backend is opt-in.\n"+
             ("if ($waf_blocked) { return 403; }\n" if existing_bans else '')+
             "include " + BASE + "/" + realip + ";\n"+
             ("modsecurity_rules 'SecArgumentsLimit 8192';\n" if argument_limit==8192 else '')+
-            ("proxy_cache_bypass $http_authorization $http_cookie;\nproxy_no_cache $http_authorization $http_cookie;\n" if authenticated_proxy else ''))
+            cache)
 
 
 def engine_enabled(config: dict) -> bool:
@@ -511,7 +514,7 @@ def render_bans(records: dict, now: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def bundle_files(config: dict, cloudflare: list[str], method_controls=None) -> dict[str, str]:
+def bundle_files(config: dict, cloudflare: list[str], method_controls=None, cache_controls=None) -> dict[str, str]:
     validate(config)
     result = {
         "http.conf": render_http(config), "realip.conf": render_realip(config, cloudflare),
@@ -523,6 +526,8 @@ def bundle_files(config: dict, cloudflare: list[str], method_controls=None) -> d
     }
     import hashlib
     for name, site in config["sites"].items():
+        if site.get('profile')=='kpanel' and cache_controls is not None and name in cache_controls and cache_controls[name] is None:
+            raise ValueError('Conflicting cache inheritance for same-name application servers: '+name)
         if "cdn" in site or site.get('profile')=='kpanel':
             ident = hashlib.sha256(name.encode()).hexdigest()[:16]
             realip='realip.conf'
@@ -533,7 +538,8 @@ def bundle_files(config: dict, cloudflare: list[str], method_controls=None) -> d
                 result[realip] = render_realip(settings, cloudflare)
             result[f"server-{ident}.inc"] = render_server(realip,config.get('banBackend','existing')=='existing',
                                                         8192 if site.get('profile')=='kpanel' else None,
-                                                        authenticated_proxy=site.get('profile')=='kpanel')
+                                                        authenticated_proxy=site.get('profile')=='kpanel',
+                                                        cache_conditions=(cache_controls or {}).get(name))
     return result
 
 

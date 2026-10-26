@@ -257,6 +257,30 @@ def configuration_scopes(dump):
     return statement_scopes(expand(main))
 
 
+def cache_inheritance(dump):
+    """Preserve HTTP cache predicates when a managed server adds its own list."""
+    groups=configuration_scopes(dump);result={}
+    directives=['proxy_cache_bypass','proxy_no_cache']
+    for ident,group in groups.items():
+        if group['kind'].strip('\"\'')!='server':continue
+        names=[t.value.strip('\"\'').lower() for s in group['statements'] if s[0].value.strip('\"\'')=='server_name' for t in s[1:-1]]
+        controls={}
+        for directive in directives:
+            current=ident
+            while current is not None:
+                statements=[s for s in groups[current]['statements'] if s[0].value.strip('\"\'')==directive and not re.fullmatch(r'/etc/nginx/conf[.]d/waf/server-(?:default|[a-f0-9]{16})[.]inc',s[0].source)]
+                if statements:
+                    # Existing server predicates are already in that scope;
+                    # only inherited parent lists need copying into the hook.
+                    controls[directive]=[] if current==ident else [t.value for s in statements for t in s[1:-1]]
+                    break
+                current=groups[current]['parent']
+            else:controls[directive]=[]
+        for name in names:
+            result[name]=None if name in result and result[name]!=controls else controls
+    return result
+
+
 def method_override_controls(dump):
     """Keep method-dependent gateway authorization stricter than compatibility.
 
