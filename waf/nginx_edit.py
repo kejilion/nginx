@@ -120,7 +120,7 @@ def patch_site(text: str, config: dict) -> str:
         if name == '_' and re.search(r'\breturn\s+444\s*;', body):
             continue
         filename = 'server-default*.inc'
-        if 'cdn' in config.get('sites', {}).get(name, {}):
+        if 'cdn' in config.get('sites', {}).get(name, {}) or config.get('sites', {}).get(name, {}).get('profile')=='kpanel':
             filename = 'server-' + hashlib.sha256(name.encode()).hexdigest()[:16] + '.inc'
         suffix='' if text[block['open']:].startswith('\n') else '\n'
         insertions.append((block['open'], '\n    include /etc/nginx/conf.d/waf/' + filename + ';'+suffix))
@@ -301,7 +301,7 @@ def method_override_controls(dump):
             if key in {'proxy_set_header','fastcgi_param','uwsgi_param','scgi_param'} and len(statement)>2:
                 target=statement[1].value.strip('\"\'').lower().replace('_','-')
                 if target.removeprefix('http-') in {'x-http-method-override','x-http-method','x-method-override'}:sensitive=True
-            if key=='modsecurity_rules':sensitive=True
+            if key=='modsecurity_rules' and statement[1].value.strip('\"\'')!='SecArgumentsLimit 8192':sensitive=True
             if key=='modsecurity_rules_file' and statement[1].value.strip('\"\'') not in {'/etc/nginx/modsec/modsecurity.conf','/etc/nginx/conf.d/waf/modsecurity.conf'}:sensitive=True
             dependent=variable(' '.join(t.value for t in statement[1:-1])) & variables
             standard_method=(key in {'fastcgi_param','uwsgi_param','scgi_param'} and

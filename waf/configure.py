@@ -289,22 +289,61 @@ def app_is_kpanel(text,block,endpoints):
     groups=nginx_edit.statement_scopes(nginx_edit.tokens(text))
     upstreams={}
     for group in groups.values():
-        if group['kind']=='upstream':
+        if group['kind'].strip('\"\'')=='upstream':
             head=group['head']
             if len(head)>1:
-                upstreams[head[1]]=[s[1].value for s in group['statements'] if s[0].value=='server']
+                # URL hostnames are case-insensitive; native reverse-proxy
+                # templates deliberately generate mixed-case upstream names.
+                upstreams[head[1].strip('\"\'').lower()]=[s[1].value.strip('\"\'') for s in group['statements'] if s[0].value.strip('\"\'')=='server']
     body=text[block['open']:block['close']]
+    matched=[]
     for group in nginx_edit.statement_scopes(nginx_edit.tokens(body)).values():
         for statement in group['statements']:
-            if statement[0].value!='proxy_pass':continue
-            value=urllib.parse.urlsplit(statement[1].value)
-            targets=upstreams.get(value.hostname,[statement[1].value])
+            directive=statement[0].value.strip('\"\'')
+            if directive in {'fastcgi_pass','uwsgi_pass','scgi_pass','grpc_pass'} or directive.startswith(('access_by_lua','rewrite_by_lua','content_by_lua','js_','perl')):return False
+            if directive=='include':
+                include=statement[1].value.strip('\"\'')
+                if not re.fullmatch(r'/etc/nginx/conf\.d/waf/(?:server-(?:default\*?|[a-f0-9]{16})|access-log\*?)\.inc',include):return False
+            if directive!='proxy_pass':continue
+            target_value=statement[1].value.strip('\"\'')
+            value=urllib.parse.urlsplit(target_value)
+            targets=upstreams.get(value.hostname,[target_value])
             for target in targets:
                 address=urllib.parse.urlsplit(target if '://' in target else 'http://'+target)
                 try:port=str(address.port or (443 if address.scheme=='https' else 80))
-                except ValueError:continue
-                if (address.hostname,port) in endpoints:return True
-    return False
+                except ValueError:return False
+                matched.append(address.scheme in {'http','https'} and (address.hostname,port) in endpoints)
+    # A mixed application or mixed upstream must retain its explicit/default
+    # profile rather than inheriting another application's typed exceptions.
+    return bool(matched) and all(matched)
+
+
+def app_is_flarum(document_root):
+    project=document_root.parent if document_root.name=='public' else document_root
+    paths=[project/'composer.json',project/'vendor/flarum/core/composer.json']
+    metadata=[]
+    for path in paths:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size>65536:return False
+        try:metadata.append(json.loads(path.read_text(encoding='utf-8')))
+        except (ValueError,OSError):return False
+    return (all(isinstance(item,dict) for item in metadata) and
+            isinstance(metadata[0].get('require'),dict) and
+            'flarum/core' in metadata[0]['require'] and metadata[1].get('name')=='flarum/core')
+
+
+def flarum_scope_is_unmixed(groups):
+    """Do not infer source-text exclusions for another app in a shared vhost."""
+    for scope,group in groups.items():
+        for statement in group['statements']:
+            directive=statement[0].value.strip('\"\'')
+            if directive in {'proxy_pass','uwsgi_pass','scgi_pass','grpc_pass','alias'}:return False
+            if directive.startswith(('access_by_lua','rewrite_by_lua','content_by_lua','js_','perl')):return False
+            if directive=='root' and scope!=0:return False
+            if directive=='fastcgi_param' and statement[1].value.strip('\"\'').upper()=='SCRIPT_FILENAME' and statement[2].value.strip('\"\'') not in {'$document_root$fastcgi_script_name','$realpath_root$fastcgi_script_name'}:return False
+            if directive=='include':
+                value=statement[1].value.strip('\"\'')
+                if value not in {'fastcgi_params','fastcgi.conf','/etc/nginx/fastcgi_params','/etc/nginx/fastcgi.conf'} and not re.fullmatch(r'/etc/nginx/conf\.d/waf/(?:server-(?:default\*?|[a-f0-9]{16})|access-log\*?)\.inc',value):return False
+    return True
 
 
 def read_config(path):
@@ -374,6 +413,8 @@ def make_plan(root, config, cfdata=None):
             roots=[r for r in roots if re.fullmatch(r'/var/www/html/[A-Za-z0-9_./-]+',r)]
             if any((root/'html'/value.removeprefix('/var/www/html/')/'wp-includes').is_dir() for value in roots):
                 config['sites'].setdefault(name,{}).setdefault('profile','wordpress')
+            if flarum_scope_is_unmixed(groups) and any(app_is_flarum(root/'html'/value.removeprefix('/var/www/html/')) for value in roots):
+                config['sites'].setdefault(name,{}).setdefault('profile','flarum')
         text=nginx_edit.patch_application(text,header_scopes,'/etc/nginx/conf.d/'+path.name)
         if path.name == 'default.conf':
             text = nginx_edit.strip_legacy_default_realip(text,cloudflare)

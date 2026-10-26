@@ -31,6 +31,7 @@ python3 -B configure.py configure --site example.com --profile wordpress --mode 
 python3 -B configure.py configure --site api.example.com --profile api --mode on
 python3 -B configure.py configure --site proxy.example.com --profile artifact-proxy --mode on
 python3 -B configure.py configure --site panel.example.com --profile kpanel --mode on
+python3 -B configure.py configure --site forum.example.com --profile flarum --mode on
 python3 -B configure.py status
 ```
 
@@ -40,7 +41,7 @@ python3 -B configure.py status
 
 兼容镜像只提供容器内部的规则基线与请求解析余量，不改宿主挂载、CF 模式或封禁动作。完整站点策略、受信代理、日志轮转与可回滚升级由同源固定版本配置包接入；不应把单独更新镜像解释为已完成所有宿主配置迁移。旧规则的评分阈值与审计开关由镜像兼容层保留，启用完整配置包后才使用本方案的阈值和审计策略。用户日常仍通过原生 WAF 开关操作。
 
-`--profile` 必须同时指定 `--site`。`wordpress` 使用已有官方排除插件；`artifact-proxy` 限定下载路径与 Git 协议；`kpanel` 限定方法、API 路径和密码/代码参数，其他查询及用户名仍接受检查。WebSocket/SSE、上传等配置档不替代应用鉴权、代理超时或上传容量配置。
+`--profile` 必须同时指定 `--site`。`wordpress` 使用已有官方排除插件及受限文章路径兼容；`flarum` 仅对 JSON:API 发帖正文和登录密码作精确例外；`artifact-proxy` 限定下载路径与 Git 协议；`kpanel` 限定方法、API 路径和已知业务参数，其他查询及用户名仍接受检查。WebSocket/SSE、上传等配置档不替代应用鉴权、代理超时或上传容量配置。
 
 站点 `exclusions` 支持 Unicode 字面路径，例如 `{"ruleId":932260,"path":"/category/docker-项目/","target":"REQUEST_FILENAME"}`。路径填写解码后的文字，不接受百分号编码、通配符或正则表达式。`REQUEST_FILENAME` 例外只适用于 GET/HEAD 且无方法覆盖头的精确路径；仅移除指定规则的路径目标，查询、正文和其他规则保持检查。既有 `ARGS:参数名` 例外行为不变。部署域名及具体业务路径留在用户策略内，不进入公共默认值。这遵循 [CRS 精确排除建议](https://coreruleset.org/docs/2-how-crs-works/2-3-false-positives-and-tuning/)；CRS 4.30 加入路径命令注入检查后，[官方要求关注路径误报](https://coreruleset.org/20261002/crs-versions-4.30.0-and-4.25.2-lts-released/)，不能为兼容而整体关闭 RCE 路径检测。
 
@@ -178,3 +179,20 @@ python3 -m unittest discover -s waf/tests -p 'test_*.py'
 生产副本迁移及真实 KPanel 用例位于 `tests/pilot_config.py`、`tests/kpanel_profile.py`。它们使用无外网、无公开端口的隔离容器；KPanel 用例不挂载 Agent，因此文件内容测试只验证请求通过 WAF 到达 Agent 边界，不代表实际写文件功能通过。
 
 持续迭代规范、当前特性状态、后续评估队列和组件官方依据见 [PRINCIPLES.md](PRINCIPLES.md)。限流余量不能代替精确误报排除，WAF 配置通过也不等于 OWASP ASVS 整体符合性。
+
+## 2026-10-26 公共应用兼容候选（尚未部署或发布）
+
+本轮修改共享配置包，不修改 KPanel 程序、不重建镜像、不提升版本号。通用反代模板生成的混合大小写 upstream 现可正确匹配 KPanel 容器端点；混合后端、未知业务 include 或脚本转发不能自动获得 KPanel 例外。已有显式 profile 优先。Flarum 自动识别同时要求项目及安装包元数据，遇到其他反代、不同 root、未知 include 或无法证明的 PHP 脚本路径时保持默认配置档。
+
+- KPanel：桌面窗口路径、快捷命令/链接、文件路径及操作、Compose/环境变量、终端历史、交互输入和联合通信按明确方法、端点和字段兼容。Base64 终端输入及 Noise 消息仅排除 SQLi 字段目标，不把元数据一并放行。JSON 例外拒绝同名 `json.*` 查询参数和方法覆盖头；其他字段、Cookie、头和请求解析检查保留。
+- 二进制上传：仅已知文件上传/分片接口的 `application/octet-stream` 及快捷图标接口的 PNG/JPEG/WebP，调整 `920420` 与注入规则的 `REQUEST_BODY` 目标。查询参数继续检查；JSON、其他媒体类型、其他路径及其他站点不借用例外。`SecRequestBodyAccess` 保持 On；ModSecurity 3.0.17 在 Off 时会跳过 phase 2，不能用它实现“只跳过文件内容”。应用仍负责会话、CSRF、文件类型、目录权限和大小校验；WAF 不是病毒扫描器。
+- WordPress：仅 GET/HEAD 的标准分类/标签/作者路径、受限含连字符的文章路径移除 `932260` 的 `REQUEST_FILENAME` 目标。其他 RCE 规则、查询和正文继续检查；不接受 shell 分隔符或编码绕过作为路径语法。
+- Flarum：JSON/JSON:API 的指定发帖/编辑字段可包含代码示例，标题和其他字段继续扫描。应用鉴权、CSRF 和内容渲染安全仍由论坛负责；不将这类源码字段例外推广到所有 REST API。
+
+KPanel 站点解析上限为 8192，默认请求达到 2048 参数仍拒绝；仅 PUT 桌面 workspace 的 JSON 正文允许至 8192 的专用预算（达到上限拒绝，防止解析截断后遗漏尾部字段）。其他站点解析上限保持 2048。该余量覆盖桌面 512 位置、512 标签及 512 隐藏项等合法结构；不提高全局正文容量或攻击评分阈值。
+
+隔离验证使用实际 ARM64 Nginx 1.31.8 / ModSecurity 3.0.17 / CRS 4.30.0，固定本地镜像，不连接生产应用数据、Agent 或 Docker socket：77 项 Linux 单测、123 项公共应用请求形状、21 项真实 KPanel 鉴权/保存读回及 147 项原有真实引擎集成通过。覆盖查询与元数据攻击反例、畸形/超深 JSON、多站点、2048/8192 参数边界及超限尾部字段、9 MiB 原始文件正文、multipart、WebSocket/SSE、CDN 信任、Off/Detect/On 和重载恢复。Windows 单测 73 通过、4 项平台跳过；Linux 须使用受信私有 `TMPDIR`，不能以全局 `/tmp` 作为管理配置根目录。
+
+失败尝试保留在隔离证据中：初版遇到 Java 原始 JSON 重复扫描、桌面参数不足、为不存在的数组项添加大量动态例外导致超时，均先复现后调整；新增例外仅对实际存在字段添加，规则列表按配置档共享编译。单 CPU ARM64 隔离样本的 32 帧输入约 246 ms，最大桌面元数据约 1 s、64 个代码快捷方式约 3.6 s、8191 个普通叶子约 6.4 s；这些是边界单次样本，不代表所有用户性能或长时间稳定性。512 MiB 旧式单体上传、所有扩展/第三方应用及真实用户终端执行未全部验证；实际应用测试只做到保存、鉴权和 Agent 边界。生产试点、公共固定摘要更新及消费者回读仍待完成，不把本地候选称为生态已交付。
+
+依据：[CRS 精确排除](https://coreruleset.org/docs/2-how-crs-works/2-3-false-positives-and-tuning/)、[CRS 4.30 路径检查变更](https://coreruleset.org/20261002/crs-versions-4.30.0-and-4.25.2-lts-released/)、[ModSecurity v3 指令及 ctl 限制](https://github.com/owasp-modsecurity/ModSecurity/wiki/Reference-Manual-%28v3.x%29)、[3.0.17 正文处理实现](https://github.com/owasp-modsecurity/ModSecurity/blob/v3.0.17/src/transaction.cc)、[Flarum JSON:API](https://docs.flarum.org/extend/api/)。本轮仍沿用六文件固定配置包，直连/CDN 信任和现有 WAF 开关独立保留。

@@ -9,6 +9,17 @@ import policy
 
 
 class PolicyTests(unittest.TestCase):
+    def test_kpanel_typed_rules_are_shared_without_cross_site_activation(self):
+        self.config['sites']={f'panel{i}.example':{'profile':'kpanel'} for i in range(200)}
+        text=policy.render_profile_rules(self.config)
+        self.assertEqual(text.count('setvar:tx.waf_kpanel_profile=1'),200)
+        self.assertLess(len(text.encode()),512*1024)
+        self.assertEqual(text.count('ruleRemoveTargetByTag=attack-rce;ARGS:json.desktop.windows.array_0.path'),1)
+        self.assertLess(text.rfind('setvar:tx.waf_kpanel_profile=1'),text.index('SecRule TX:waf_kpanel_profile'))
+        self.assertIn('ARGS:json.frames.array_31.data',text)
+        self.assertNotIn('ruleEngine=Off',text)
+        self.assertNotIn('ctl:requestBodyAccess=Off',text)
+
     def test_full_off_keeps_the_native_global_switch_authoritative(self):
         config={'mode':'off','sites':{'wp.example':{'profile':'wordpress'}}}
         self.assertFalse(policy.engine_enabled(config))

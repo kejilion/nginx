@@ -11,7 +11,7 @@ MAX_SITES = 200
 MAX_BANS = 10000
 MAX_STATE_BYTES = 4 * 1024 * 1024
 SCOPE = re.compile(r"(?:\*\.)?[A-Za-z0-9_][A-Za-z0-9_.-]{0,252}\Z")
-PROFILES = {"generic", "wordpress", "api", "upload", "streaming", "artifact-proxy", "kpanel"}
+PROFILES = {"generic", "wordpress", "flarum", "api", "upload", "streaming", "artifact-proxy", "kpanel"}
 MODES = {"on", "detect", "off"}
 BASE = "/etc/nginx/conf.d/waf"
 
@@ -180,14 +180,166 @@ modsecurity_transaction_id "$server_name|$remote_addr|$request_id";
     return rendered
 
 
-def render_server(realip: str = "realip.conf", existing_bans=True) -> str:
+def render_server(realip: str = "realip.conf", existing_bans=True, argument_limit=None) -> str:
     return ("# Managed per-server configuration; existing ban backend is opt-in.\n"+
             ("if ($waf_blocked) { return 403; }\n" if existing_bans else '')+
-            "include " + BASE + "/" + realip + ";\n")
+            "include " + BASE + "/" + realip + ";\n"+
+            ("modsecurity_rules 'SecArgumentsLimit 8192';\n" if argument_limit==8192 else ''))
 
 
 def engine_enabled(config: dict) -> bool:
     return config['mode']!='off' or any(site.get('mode','off')!='off' for site in config.get('sites',{}).values())
+
+
+
+CODE_TAGS = ('attack-sqli', 'attack-xss', 'attack-rce', 'attack-lfi', 'attack-rfi', 'attack-injection-php', 'attack-ssti')
+PATH_TAGS = ('attack-rce', 'attack-lfi', 'attack-rfi')
+
+
+def _kpanel_rules(sites, first_id):
+    lines = []
+    rid = first_id
+    names = sorted(name for name, site in sites.items() if site.get('profile') == 'kpanel')
+    if not names:
+        return lines, rid
+    # Emit every trusted server selector before shared rules. Compiling the
+    # bounded field lists once avoids multiplying them by the number of sites.
+    for name in names:
+        lines.append(f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,setvar:tx.waf_kpanel_profile=1"')
+        rid += 1
+
+    def route(methods, path, controls, json_body=False, media=None):
+        nonlocal rid
+        lines.extend([
+            f'SecRule TX:waf_kpanel_profile "@eq 1" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+            '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+            '    SecRule REQUEST_METHOD "@rx ^(?:' + '|'.join(methods) + ')$" "t:none,chain"',
+        ])
+        if json_body:
+            # JSON selectors share ARGS with URL parameters. Do not let an
+            # attacker borrow a body exception using ?json.command=... .
+            lines.append('    SecRule &ARGS_GET:/^json[.]/ "@eq 0" "t:none,chain"')
+            lines.append('    SecRule REQUEST_HEADERS:Content-Type "@rx ^application/(?:[a-z0-9.+-]+\\+)?json(?:;|$)" "t:none,t:lowercase,chain"')
+        if media:
+            lines.append('    SecRule REQUEST_HEADERS:Content-Type "@rx ^(?:'+media+')(?:;|$)" "t:none,t:lowercase,chain"')
+        lines.append('    SecRule REQUEST_FILENAME "@rx ^(?:/[A-Za-z0-9_-]+)?' + path + '$" "t:none,' + ','.join(controls) + '"')
+        rid += 1
+
+    def fields(methods, path, targets, tags=CODE_TAGS):
+        nonlocal rid
+        flag='waf_kpanel_fields_'+str(rid)
+        route(methods, path, ['setvar:tx.'+flag+'=1'], json_body=True)
+        # Body fields only exist in phase 2. Add literal ctl targets only for
+        # fields actually present, not hundreds of absent array slots. This
+        # keeps large metadata-only desktop updates from paying a quadratic
+        # variable/exclusion matching cost. ctl itself has no regex support.
+        for target in targets:
+            controls=','.join('ctl:ruleRemoveTargetByTag='+tag+';ARGS:json.'+target for tag in tags)
+            if tags==CODE_TAGS:controls+=',setvar:tx.'+flag+'_present=1'
+            lines.extend([
+                f'SecRule TX:{flag} "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,chain"',
+                '    SecRule &ARGS:json.'+target+' "@gt 0" "t:none,'+controls+'"',
+            ])
+            rid+=1
+        # Raw-body Java/SSTI checks duplicate parsed JSON inspection. Retain
+        # their ARGS/header/cookie targets, including non-exempt metadata.
+        if tags==CODE_TAGS:
+            controls=','.join('ctl:ruleRemoveTargetByTag='+tag+';REQUEST_BODY' for tag in tags)
+            lines.append(f'SecRule TX:{flag}_present "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,'+controls+'"')
+            rid+=1
+
+    for method, path, targets in [
+        ('POST', '/api/v1/auth/bootstrap', ['password']),
+        ('POST', '/api/v1/auth/login', ['password']),
+        ('PUT', '/api/v1/settings/password', ['currentPassword', 'newPassword']),
+        ('PUT', '/api/v1/settings/username', ['currentPassword']),
+        ('PUT', '/api/v1/files/content', ['content']),
+        ('PUT', '/api/v1/terminal-commands', [f'items.array_{i}.command' for i in range(64)]),
+        ('POST', '/api/v1/terminal-batches', ['command']),
+        ('POST', '/api/v1/terminal-history', [f'items.array_{i}.command' for i in range(64)]),
+        ('POST', '/api/v1/terminal-history/remove', ['command']),
+        ('POST', r'/api/v1/docker/containers/[a-fA-F0-9]{12,64}/exec', ['command']),
+        ('POST', '/api/v1/docker/tasks', ['compose', 'composeEnvironment'] + [f'command.array_{i}' for i in range(64)] + [f'environment.array_{i}.value' for i in range(128)]),
+        ('PUT', '/api/v1/settings/preferences', [f'desktop.windows.array_{i}.path' for i in range(8)] + [f'desktop.windowSizes.array_{i}.path' for i in range(32)]),
+        ('PUT', '/api/v1/desktop/workspace', [f'shortcuts.array_{i}.{field}' for i in range(64) for field in ['command', 'url']]),
+    ]:
+        fields([method], path, targets)
+    fields(['PUT'], '/api/v1/desktop/workspace', [f'shortcuts.array_{i}.path' for i in range(64)], PATH_TAGS)
+    fields(['POST'], '/api/v1/files/entries', [f'paths.array_{i}' for i in range(64)], PATH_TAGS)
+    fields(['POST'], r'/api/v1/files/(?:actions|archive-jobs)',
+           ['target','name']+[f'sources.array_{i}' for i in range(100)], PATH_TAGS)
+    route(['PUT'], '/api/v1/desktop/workspace', ['setvar:tx.waf_argument_limit=8192'], json_body=True)
+
+    session = r'/api/v1/(?:terminal-sessions/[a-f0-9]{64}|job-terminals/(?:app|site|diagnostic|environment)/[a-f0-9]{32})'
+    fields(['POST'], session + r'/(?:input|input-batch)', ['data'] + [f'frames.array_{i}.data' for i in range(32)], ('attack-sqli',))
+    for prefix in ['/api/v1/app-jobs', '/api/v1/site-installations', '/api/v1/diagnostic-jobs', '/api/v1/web-environment/jobs']:
+        fields(['POST'], prefix + r'/[a-fA-F0-9]{32}/input', ['data'], ('attack-sqli',))
+
+    # These v2 envelopes carry authenticated Noise ciphertext, not SQL, HTML or
+    # shell input. Metadata and the application cryptographic checks remain on.
+    federation = r'/api/v2/federation/(?:pair|commit|revoke|terminal/(?:open|close|capabilities|output|input|resize|relay)|files/(?:open|open-linked|link|relay))'
+    fields(['POST'], federation, ['message'], ('attack-sqli',))
+
+    # Authenticated upload handlers consume opaque bytes, not source for an
+    # interpreter. Exclude only raw-byte injection targets; phase-2 protocol,
+    # headers, cookies and URL parameters still run (body access stays On).
+    binary_controls=['ctl:ruleRemoveById=920420']+['ctl:ruleRemoveTargetByTag='+tag+';REQUEST_BODY' for tag in CODE_TAGS]
+    route(['POST'], '/api/v1/files/upload', binary_controls+['ctl:ruleRemoveTargetByTag='+tag+';ARGS:'+field for tag in PATH_TAGS for field in ['path','name']], media='application/octet-stream')
+    route(['PUT'], '/api/v1/files/transfer/sessions', binary_controls, media='application/octet-stream')
+    route(['PUT'], r'/api/v1/desktop/shortcuts/[a-f0-9]{32}/icon', binary_controls, media='image/(?:png|jpeg|webp)')
+
+    # The fixed manage action is a word in the Unix command dictionary. Do not
+    # exempt arbitrary app suffixes or any query/body target from this rule.
+    route(['POST'], r'/api/v1/apps/(?:builtin|thirdparty|local)-[A-Za-z0-9][A-Za-z0-9_-]{0,63}/manage',
+          ['ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME'])
+    route(['GET', 'PUT'], r'/api/v1/files(?:/(?:entry|content|archive))?',
+          ['ctl:ruleRemoveTargetByTag=' + tag + ';ARGS:path' for tag in PATH_TAGS])
+    return lines, rid
+
+
+def _content_application_rules(sites, first_id):
+    """Known CMS URL grammar and forum source text, not arbitrary API bypasses."""
+    lines=[]
+    rid=first_id
+    for profile in ['wordpress','flarum']:
+        names=sorted(name for name,site in sites.items() if site.get('profile')==profile)
+        if not names:continue
+        for name in names:
+            lines.append(f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,setvar:tx.waf_{profile}_profile=1"')
+            rid+=1
+        if profile=='wordpress':
+            # Canonical taxonomy URLs and standard hyphenated post slugs are
+            # WordPress route identifiers. Shell syntax and other RCE targets
+            # retain inspection, as do plugin/administrative URI families.
+            char=r'[\p{L}\p{M}\p{N}_-]'
+            slug=char+'{1,200}'
+            taxonomy='/(?:category|tag|author)/(?:'+slug+'/){0,8}'+slug+'/?'
+            post='/(?:[12][0-9]{3}/(?:0[1-9]|1[0-2])/(?:(?:0[1-9]|[12][0-9]|3[01])/)?)?(?='+char+'{0,199}-)'+slug+'/?'
+            lines.extend([
+                f'SecRule TX:waf_wordpress_profile "@eq 1" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+                '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
+                '    SecRule REQUEST_FILENAME "@rx (*UTF)(*UCP)^(?:'+taxonomy+'|'+post+')$" "t:none,ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME"',
+            ])
+            rid+=1
+            continue
+        for methods,path,target in [
+            ('POST',r'/api/(?:posts|discussions)','data.attributes.content'),
+            ('PATCH',r'/api/posts/[0-9]{1,20}','data.attributes.content'),
+            ('POST',r'/(?:api/token|login)','password'),
+        ]:
+            controls=','.join(['ctl:ruleRemoveTargetByTag='+tag+';ARGS:json.'+target for tag in CODE_TAGS]+
+                              ['ctl:ruleRemoveTargetByTag='+tag+';REQUEST_BODY' for tag in CODE_TAGS])
+            lines.extend([
+                f'SecRule TX:waf_flarum_profile "@eq 1" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+                '    SecRule &ARGS_GET:/^json[.]/ "@eq 0" "t:none,chain"',
+                f'    SecRule REQUEST_METHOD "@streq {methods}" "t:none,chain"',
+                '    SecRule REQUEST_HEADERS:Content-Type "@rx ^application/(?:[a-z0-9.+-]+\\+)?json(?:;|$)" "t:none,t:lowercase,chain"',
+                '    SecRule REQUEST_FILENAME "@rx ^(?:/[A-Za-z0-9_-]+)?'+path+'$" "t:none,'+controls+'"',
+            ])
+            rid+=1
+    return lines,rid
 
 
 def render_profile_rules(config: dict, method_controls=None) -> str:
@@ -203,6 +355,7 @@ def render_profile_rules(config: dict, method_controls=None) -> str:
         # DetectionOnly still runs every phase, preserving false-positive tuning.
         'SecAction "id:1102,phase:1,pass,nolog,t:none,setvar:tx.early_blocking=1"',
         'SecAction "id:1103,phase:1,pass,nolog,t:none,setvar:tx.waf_method_override_guarded='+str(int(guarded))+'"',
+        'SecAction "id:1104,phase:1,pass,nolog,t:none,setvar:tx.waf_argument_limit=2048"',
     ]
     global_mode = config["mode"]
     # Explicit site settings precede the fallback. Every transaction starts fresh.
@@ -238,29 +391,11 @@ def render_profile_rules(config: dict, method_controls=None) -> str:
             rid += 1
     if global_mode != "on" and engine_enabled(config):
         lines.append('SecRule &TX:waf_mode_override "@eq 0" "id:1190,phase:1,pass,nolog,ctl:ruleEngine=' + {"off":"Off", "detect":"DetectionOnly"}[global_mode] + '"')
+    kpanel_lines,rid=_kpanel_rules(config['sites'],rid)
+    lines+=kpanel_lines
+    content_lines,rid=_content_application_rules(config['sites'],rid)
+    lines+=content_lines
     for name,site in sorted(config['sites'].items()):
-        if site.get('profile')=='kpanel':
-            # KPanel intentionally accepts passwords and file/code content. Keep
-            # exclusions at the exact application endpoint and JSON argument.
-            routes=[('POST','/api/v1/auth/bootstrap',['password']),
-                    ('POST','/api/v1/auth/login',['password']),
-                    ('PUT','/api/v1/settings/password',['currentPassword','newPassword']),
-                    ('PUT','/api/v1/settings/username',['currentPassword']),
-                    ('PUT','/api/v1/files/content',['content']),
-                    ('PUT','/api/v1/terminal-commands',['items.array_'+str(i)+'.command' for i in range(64)])]
-            for method,path,targets in routes:
-                controls=','.join('ctl:ruleRemoveTargetByTag='+tag+';ARGS:json.'+target
-                                  for target in targets for tag in ['attack-sqli','attack-xss','attack-rce','attack-lfi','attack-rfi'])
-                lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
-                          '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
-                          f'    SecRule REQUEST_METHOD "@streq {method}" "t:none,chain"',
-                          '    SecRule REQUEST_FILENAME "@rx ^(?:/[A-Za-z0-9_-]+)?'+path+'$" "t:none,'+controls+'"']
-                rid+=1
-            lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
-                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
-                      '    SecRule REQUEST_METHOD "@rx ^(?:GET|PUT)$" "t:none,chain"',
-                      '    SecRule REQUEST_FILENAME "@rx ^(?:/[A-Za-z0-9_-]+)?/api/v1/files(?:/(?:entry|content|archive))?$" "t:none,ctl:ruleRemoveTargetById=930120;ARGS:path,ctl:ruleRemoveTargetById=930130;ARGS:path"']
-            rid+=1
         if site.get('profile')=='artifact-proxy':
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                       '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
@@ -296,7 +431,7 @@ SecRule REQUEST_HEADERS:Content-Type "^application/(?:[a-z0-9.+-]+\\+)?json(?:;|
 SecRule REQUEST_HEADERS:Content-Type "^(?:application/(?:soap\\+)?xml|text/xml)(?:;|$)" "id:200000,phase:1,pass,nolog,t:none,t:lowercase,ctl:requestBodyProcessor=XML"
 SecRule REQBODY_ERROR "!@eq 0" "id:200002,phase:2,deny,status:400,nolog,msg:'WAF request body parsing failed'"
 SecRule INBOUND_DATA_ERROR "@eq 1" "id:200006,phase:2,deny,status:413,log,msg:'WAF request body limit exceeded'"
-SecRule &ARGS "@ge 2048" "id:200007,phase:2,deny,status:400,log,msg:'WAF argument budget exceeded'"
+SecRule &ARGS "@ge %{{tx.waf_argument_limit}}" "id:200007,phase:2,deny,status:400,log,msg:'WAF argument budget exceeded'"
 SecResponseBodyAccess Off
 SecTmpDir /tmp/
 SecDataDir /tmp/
@@ -382,12 +517,16 @@ def bundle_files(config: dict, cloudflare: list[str], method_controls=None) -> d
     }
     import hashlib
     for name, site in config["sites"].items():
-        if "cdn" in site:
+        if "cdn" in site or site.get('profile')=='kpanel':
             ident = hashlib.sha256(name.encode()).hexdigest()[:16]
-            settings = dict(config, cdn=site["cdn"], trustedProxies=site.get("trustedProxies", []),
-                            proxyHeader=site.get("proxyHeader", "X-Forwarded-For"))
-            result[f"realip-{ident}.conf"] = render_realip(settings, cloudflare)
-            result[f"server-{ident}.inc"] = render_server(f"realip-{ident}.conf",config.get('banBackend','existing')=='existing')
+            realip='realip.conf'
+            if 'cdn' in site:
+                settings = dict(config, cdn=site["cdn"], trustedProxies=site.get("trustedProxies", []),
+                                proxyHeader=site.get("proxyHeader", "X-Forwarded-For"))
+                realip=f'realip-{ident}.conf'
+                result[realip] = render_realip(settings, cloudflare)
+            result[f"server-{ident}.inc"] = render_server(realip,config.get('banBackend','existing')=='existing',
+                                                        8192 if site.get('profile')=='kpanel' else None)
     return result
 
 
