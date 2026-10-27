@@ -43,6 +43,8 @@ python3 -B configure.py status
 
 `--profile` 必须同时指定 `--site`。`wordpress` 使用已有官方排除插件及受限文章路径兼容；`flarum` 仅对 JSON:API 发帖正文和登录密码作精确例外；`artifact-proxy` 限定下载路径与 Git 协议；`kpanel` 限定方法、API 路径和已知业务参数，其他查询及用户名仍接受检查。WebSocket/SSE、上传等配置档不替代应用鉴权、代理超时或上传容量配置。
 
+`artifact-proxy` 对 GitHub 原始文件及 OCI manifest 的规范只读路径兼容 CRS 932260：仅 GET/HEAD、无方法覆盖头、路径为有界的字面安全字符且没有百分号或双点时，排除该规则的 `REQUEST_FILENAME` 目标；查询参数及其他规则仍检查。支持常规 tag 和 `sha256:<64位小写十六进制>` manifest 引用。这个配置档要求代理后端将路径作为数据处理而非交给 shell；其他源、编码路径和不符合格式的请求仍按原规则检查。仅有某条记录被拦截并不代表该请求一定正常，需结合后端行为判断。
+
 站点 `exclusions` 支持 Unicode 字面路径，例如 `{"ruleId":932260,"path":"/category/docker-项目/","target":"REQUEST_FILENAME"}`。路径填写解码后的文字，不接受百分号编码、通配符或正则表达式。`REQUEST_FILENAME` 例外只适用于 GET/HEAD 且无方法覆盖头的精确路径；仅移除指定规则的路径目标，查询、正文和其他规则保持检查。既有 `ARGS:参数名` 例外行为不变。部署域名及具体业务路径留在用户策略内，不进入公共默认值。这遵循 [CRS 精确排除建议](https://coreruleset.org/docs/2-how-crs-works/2-3-false-positives-and-tuning/)；CRS 4.30 加入路径命令注入检查后，[官方要求关注路径误报](https://coreruleset.org/20261002/crs-versions-4.30.0-and-4.25.2-lts-released/)，不能为兼容而整体关闭 RCE 路径检测。
 
 ## 通用请求语义兼容

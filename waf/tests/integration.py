@@ -67,7 +67,7 @@ class Backend(http.server.BaseHTTPRequestHandler):
             header=self.path.rsplit('/',1)[-1]
             value=json.dumps(dict(method=self.command,path=self.path,header=header,headers={k.lower():v for k,v in self.headers.items()}))
             framework=json.loads(subprocess.check_output(['node',str(Path(__file__).with_name('method-framework-probe.cjs')),str(FRAMEWORK_MODULE),value],timeout=5))
-        data = json.dumps({'method': self.command, 'frameworkMethod':framework, 'bytes': len(body), 'client': self.headers.get('X-Real-IP'),
+        data = json.dumps({'method': self.command, 'path':self.path, 'frameworkMethod':framework, 'bytes': len(body), 'client': self.headers.get('X-Real-IP'),
                            'forwarded': self.headers.get('X-Forwarded-For'),'forwardedAll':self.headers.get_all('X-Forwarded-For'),'host':self.headers.get('Host'),'proto':self.headers.get('X-Forwarded-Proto'),'authorization':self.headers.get('Authorization'),
                            'methodOverride':self.headers.get('X-HTTP-Method-Override') or self.headers.get('X-HTTP-Method') or self.headers.get('X-Method-Override')}).encode()
         self.send_response(status)
@@ -302,6 +302,18 @@ upstream fixture_backend { server unix:/test/backend.sock; }
             check('artifact-proxy-legitimate-route-'+path,host='artifact.example',path=path)
         check('artifact-Git-clone-packet',host='artifact.example',path='/https://github.com/kejilion/sh.git/git-upload-pack',method='POST',body=b'0032want 0123456789012345678901234567890123456789\n0000',headers={'Content-Type':'application/x-git-upload-pack-request'})
         check('artifact-schemeless-Git-packet',host='artifact.example',path='/github.com/kejilion/apps.git/git-upload-pack',method='POST',body=b'0032want 0123456789012345678901234567890123456789\n0000',headers={'Content-Type':'application/x-git-upload-pack-request'})
+        artifact_download='/raw.githubusercontent.com/example/docker-app/main/CloudDrive2.yml'
+        artifact_manifest='/v2/library/docker-example/manifests/latest'
+        for path in [artifact_download, '/https://raw.githubusercontent.com/example/docker-app/main/config.yml', artifact_manifest, '/v2/library/docker-example/manifests/sha256:'+'a'*64]:
+            for method in ['GET','HEAD']:
+                _,data=check('artifact-literal-'+method+path,host='artifact.example',path=path,method=method)
+                if method=='GET': assert json.loads(data)['path']==path
+        for path in [artifact_download+'?q=1%27%20UNION%20SELECT%20password%20FROM%20users--',artifact_download+'?q=%3Cscript%3Ealert(1)%3C/script%3E',artifact_download+'?cmd=%3Bcat%20%2Fetc%2Fpasswd', '/raw.githubusercontent.com/example/docker-app/%252e%252e/secret.yml', '/raw.githubusercontent.com/example/docker-app/%2e%2e/secret.yml', '/raw.githubusercontent.com/example/docker-app/%2fsecret.yml', '/raw.githubusercontent.com/example/docker-app/%5csecret.yml', '/raw.githubusercontent.com/example/docker-app/;id.yml', '/raw.githubusercontent.com/example/docker-app/../secret.yml']:
+            check('artifact-literal-attack-'+path,host='artifact.example',path=path,expected=(400,403))
+        check('artifact-literal-post-denied',host='artifact.example',path=artifact_download,method='POST',expected=403)
+        check('artifact-literal-override-denied',host='artifact.example',path=artifact_download,headers={'X-HTTP-Method-Override':'PATCH'},expected=403)
+        check('artifact-literal-other-profile-denied',host='api.example',path=artifact_download,expected=403)
+        check('artifact-literal-other-origin-denied',host='artifact.example',path='/other.example/example/docker-app/main/config.yml',expected=403)
         git_path='/github.com/kejilion/apps.git/git-upload-pack'
         compressed_git_packet=gzip.compress(b'0032want 0123456789012345678901234567890123456789\n0000')
         for header in ['Content-Encoding', 'content-encoding', 'CONTENT-ENCODING']:

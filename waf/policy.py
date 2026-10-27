@@ -406,6 +406,21 @@ def render_profile_rules(config: dict, method_controls=None) -> str:
     lines+=content_lines
     for name,site in sorted(config['sites'].items()):
         if site.get('profile')=='artifact-proxy':
+            # Download identifiers may contain command names (e.g. docker-).
+            # Only literal, bounded segments are eligible; encoded paths and
+            # shell syntax retain the original filename inspection.
+            artifact_segment = r'(?![.])[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}'
+            artifact_path = (r'^/(?:' +
+                r'(?:https?://)?raw[.]githubusercontent[.]com/' +
+                artifact_segment + r'(?:/' + artifact_segment + r'){1,15}' +
+                r'|v2/' + artifact_segment + r'(?:/' + artifact_segment + r'){0,5}/manifests/(?:' + artifact_segment + r'|sha256:[a-f0-9]{64}))$')
+            lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+                      '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
+                      '    SecRule REQUEST_URI_RAW "@rx ^/[^%?]*(?:[?].*)?$" "t:none,chain"',
+                      '    SecRule REQUEST_FILENAME "@rx ^(?!.*[.][.])" "t:none,chain"',
+                      '    SecRule REQUEST_FILENAME "@rx '+artifact_path+'" "t:none,ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME"']
+            rid+=1
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                       '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
                       '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
