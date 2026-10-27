@@ -3,6 +3,7 @@
 import argparse
 import base64
 import hashlib
+import gzip
 import http.client
 import http.server
 import json
@@ -301,6 +302,20 @@ upstream fixture_backend { server unix:/test/backend.sock; }
             check('artifact-proxy-legitimate-route-'+path,host='artifact.example',path=path)
         check('artifact-Git-clone-packet',host='artifact.example',path='/https://github.com/kejilion/sh.git/git-upload-pack',method='POST',body=b'0032want 0123456789012345678901234567890123456789\n0000',headers={'Content-Type':'application/x-git-upload-pack-request'})
         check('artifact-schemeless-Git-packet',host='artifact.example',path='/github.com/kejilion/apps.git/git-upload-pack',method='POST',body=b'0032want 0123456789012345678901234567890123456789\n0000',headers={'Content-Type':'application/x-git-upload-pack-request'})
+        git_path='/github.com/kejilion/apps.git/git-upload-pack'
+        compressed_git_packet=gzip.compress(b'0032want 0123456789012345678901234567890123456789\n0000')
+        for header in ['Content-Encoding', 'content-encoding', 'CONTENT-ENCODING']:
+            check('artifact-git-compressed-'+header,host='artifact.example',path=git_path,method='POST',body=compressed_git_packet,headers={'Content-Type':'application/x-git-upload-pack-request',header:'gzip'})
+        check('artifact-git-gzip-query-sqli',host='artifact.example',path=git_path+'?q=1%27%20UNION%20SELECT%20password%20FROM%20users--',method='POST',body=compressed_git_packet,headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip'},expected=403)
+        check('artifact-git-gzip-query-xss',host='artifact.example',path=git_path+'?q=%3Cscript%3Ealert(1)%3C/script%3E',method='POST',body=compressed_git_packet,headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip'},expected=403)
+        check('artifact-git-gzip-wrong-type',host='artifact.example',path=git_path,method='POST',body=compressed_git_packet,headers={'Content-Type':'application/json','Content-Encoding':'gzip'},expected=403)
+        check('artifact-git-duplicate-encoding',host='artifact.example',path=git_path,method='POST',body=compressed_git_packet,headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip','content-encoding':'gzip'},expected=403)
+        check('artifact-git-duplicate-type',host='artifact.example',path=git_path,method='POST',body=compressed_git_packet,headers={'Content-Type':'application/x-git-upload-pack-request','content-type':'application/json','Content-Encoding':'gzip'},expected=(400,403))
+        check('artifact-git-other-restricted-header',host='artifact.example',path=git_path,method='POST',body=b'0000',headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip','Proxy':'test'},expected=403)
+        check('artifact-git-other-content-encoding',host='artifact.example',path=git_path,method='POST',body=b'0000',headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'br'},expected=403)
+        check('artifact-git-gzip-with-method-override',host='artifact.example',path=git_path,method='POST',body=b'0000',headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip','X-HTTP-Method-Override':'PATCH'},expected=403)
+        check('artifact-non-git-content-encoding',host='artifact.example',path='/ordinary',method='POST',body=b'0000',headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip'},expected=403)
+        check('other-site-git-content-encoding',host='api.example',path=git_path,method='POST',body=b'0000',headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip'},expected=403)
         check('artifact-schemeless-query-SQLi-still-denied',host='artifact.example',path='/raw.githubusercontent.com/org/repo/main/test.sh?q=1%27%20UNION%20SELECT%20password%20FROM%20users--',expected=403)
         check('artifact-extension-check-kept-outside-proxy-route',host='artifact.example',path='/local.sh',expected=403)
         check('artifact-query-file-traversal-still-denied',host='artifact.example',path='/?file=../../etc/passwd',expected=403)

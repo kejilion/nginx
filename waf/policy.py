@@ -422,6 +422,15 @@ def render_profile_rules(config: dict, method_controls=None) -> str:
                       '    SecRule REQUEST_FILENAME "@rx ^/(?:https?://)?[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+(?::[0-9]{1,5})?/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git/git-upload-pack$" "t:none,chain"',
                       '    SecRule REQUEST_HEADERS:Content-Type "@streq application/x-git-upload-pack-request" "t:none,t:lowercase,ctl:ruleRemoveById=920420"']
             rid+=1
+            lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+                      '    SecRule REQUEST_METHOD "@streq POST" "t:none,chain"',
+                      '    SecRule REQUEST_FILENAME "@rx ^/(?:https?://)?[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+(?::[0-9]{1,5})?/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git/git-upload-pack$" "t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:content-type)$/ "@eq 1" "t:none,chain"',
+                      '    SecRule REQUEST_HEADERS:Content-Type "@streq application/x-git-upload-pack-request" "t:none,t:lowercase,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:content-encoding)$/ "@eq 1" "t:none,chain"',
+                      '    SecRule REQUEST_HEADERS:Content-Encoding "@streq gzip" "t:none,t:lowercase,ctl:ruleRemoveTargetById=920450;REQUEST_HEADERS_NAMES:Content-Encoding,ctl:ruleRemoveTargetById=920450;REQUEST_HEADERS_NAMES:content-encoding,ctl:ruleRemoveTargetById=920450;REQUEST_HEADERS_NAMES:CONTENT-ENCODING"']
+            rid+=1
     return "\n".join(lines + exceptions) + "\n"
 
 
