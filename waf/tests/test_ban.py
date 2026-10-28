@@ -472,6 +472,36 @@ enabled = false
         self.assertIn('action = waf-unified[source=attack]\r\n',content)
         self.assertIn('action = waf-unified[source=rate]\r\n',content)
 
+    def test_historical_shared_waf_header_variants_accept_only_known_legacy_actions(self):
+        headers=(
+            '# Managed shared WAF; existing integration\n',
+            '# Managed shared WAF. Includes only generated, validated data.\n',
+            '# Managed shared WAF; an older product-owned revision\n',
+            '# Managed shared WAF: older compatible release\n',
+            '# Managed shared WAF - translated release\n',
+            '# Managed Shared WAF\n',
+        )
+        for header in headers:
+            with self.subTest(header=header):
+                previous=header+'[waf-attack]\nenabled = true\nfindtime = 120\nmaxretry = 20\nbantime = 600\naction = waf-local[reason=attack]\n'
+                previous+='[waf-rate]\nenabled = true\nfindtime = 120\nmaxretry = 120\nbantime = 600\naction = waf-local[reason=rate]\n'
+                self.assertEqual(ban.managed_jail_marker(previous),'legacy')
+                migrated=ban.managed_jail_content(previous,None)
+                self.assertIn('action = waf-unified[source=attack]',migrated)
+                self.assertIn('action = waf-unified[source=rate]',migrated)
+
+    def test_historical_shared_waf_header_does_not_authorize_custom_actions(self):
+        for header in ('# Managed shared WAF; an older product-owned revision\n',
+                       '# Managed shared WAF: historical header\n',
+                       '# Managed shared WAF - translated header\n',
+                       '# Managed Shared WAF\n'):
+            with self.subTest(header=header):
+                previous=header
+                previous+='[waf-attack]\nenabled = true\nfindtime = 120\nmaxretry = 20\nbantime = 600\naction = custom-ban\n'
+                previous+='[waf-rate]\nenabled = true\nfindtime = 120\nmaxretry = 120\nbantime = 600\naction = custom-ban\n'
+                with self.assertRaisesRegex(ValueError,'Custom ban action requires explicit migration'):
+                    ban.validate_managed_jail(previous)
+
     def test_legacy_api_jail_embedded_in_managed_file_migrates_known_action(self):
         jail_dir=self.f2b/'jail.d';action_dir=self.f2b/'action.d'
         jail_dir.mkdir(parents=True);action_dir.mkdir(parents=True)
