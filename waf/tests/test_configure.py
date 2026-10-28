@@ -11,6 +11,7 @@ import subprocess
 
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
 import configure as manage
+import ban
 import nginx_edit
 import policy
 
@@ -259,6 +260,40 @@ class ConfigurationLifecycleTests(unittest.TestCase):
         text+='# Managed shared WAF; too late\n'
         with self.assertRaisesRegex(ValueError,'explicit migration'):
             manage.migrate_existing_jail(self.root,text)
+
+    def test_unmarked_legacy_waf_jail_can_move_from_error_log_on_first_enable(self):
+        old=str(self.root/'log/nginx/error.log')
+        rate=str(self.root/'log/nginx/waf-rate.log')
+        text='''[DEFAULT]
+action = waf-local[reason=attack]
+logpath = '''+old+''' tail
+[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 600
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+logpath = '''+rate+'''
+action = waf-local[reason=rate]
+'''
+        action_dir=self.root/'f2b/action.d';action_dir.mkdir(parents=True)
+        (action_dir/'waf-local.conf').write_text('''[Definition]
+actionban = <python> <runtime> --root <root> ban --key "<ip>" --ttl <bantime> --reason <reason>
+actionunban = <python> <runtime> --root <root> unban --key "<ip>" --reason <reason>
+[Init]
+python = /usr/bin/python3
+runtime = /home/web/conf.d/waf/wafctl.py
+root = /home/web
+reason = attack
+''')
+        with patch.object(ban,'F2B',self.root/'f2b'):
+            changed=manage.migrate_existing_jail(self.root,text)
+        self.assertIn('[DEFAULT]\naction = waf-local[reason=attack]\nlogpath = '+old+' tail\n',changed)
+        self.assertIn('[waf-attack]\nlogpath = '+str(self.root/'log/nginx/waf-audit.json')+' tail\n',changed)
 
     def test_policy_concurrency_conflict_does_not_write_any_configuration(self):
         state=self.root/'config/waf/policy.json';self.atomic(state,b'newer policy')

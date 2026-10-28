@@ -167,7 +167,15 @@ def fail2ban_update(root,legacy=False):
 
 
 def migrate_existing_jail(root,text):
-    if not has_managed_shared_waf_header(text):raise ValueError('Existing jail requires explicit migration')
+    if not has_managed_shared_waf_header(text):
+        # A small number of older script installs created the exact WAF jails
+        # without a managed header. Reuse the ban migration classifier so this
+        # path accepts only the known filters/actions/logs, never arbitrary
+        # Fail2Ban configurations.
+        import ban
+        ban.validate_managed_jail(text,allow_unmarked_legacy=True,root=root)
+        if ban.has_legacy_waf_actions(text):
+            ban.validate_legacy_wafctl_action('waf-local')
     parsed=configparser.ConfigParser(interpolation=None)
     parsed.read_string(text.removeprefix('\ufeff'))
     if not parsed.has_section('waf-attack'):raise ValueError('Existing attack log path must be explicit in its jail')

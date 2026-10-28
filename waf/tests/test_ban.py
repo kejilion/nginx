@@ -487,7 +487,8 @@ action = waf-local[reason=rate]
 
         jail_dir=self.f2b/'jail.d';action_dir=self.f2b/'action.d'
         jail_dir.mkdir(parents=True);action_dir.mkdir(parents=True)
-        (jail_dir/'zz-waf-managed.local').write_text(previous,encoding='utf-8')
+        previous_at_root=previous.replace('/home/web/log/nginx/',str(self.root).replace('\\','/')+'/log/nginx/')
+        (jail_dir/'zz-waf-managed.local').write_text(previous_at_root,encoding='utf-8')
         (action_dir/'waf-local.conf').write_text('''[Definition]
 actionban = <python> <runtime> --root <root> ban --key "<ip>" --ttl <bantime> --reason <reason>
 actionunban = <python> <runtime> --root <root> unban --key "<ip>" --reason <reason>
@@ -501,7 +502,7 @@ reason = attack
               patch.object(ban,'LEGACY_RECONCILER',self.root/'missing.service')):
             plan=ban.migration_plan(self.root)
         self.assertTrue(plan['requiresMigration'])
-        self.assertEqual(plan['managedJail'],previous)
+        self.assertEqual(plan['managedJail'],previous_at_root)
 
     def test_unmarked_legacy_jail_with_custom_action_or_log_is_not_claimed(self):
         previous='''[waf-attack]
@@ -549,6 +550,37 @@ action = waf-local[reason = waf-rate]
         self.assertIn('action = waf-unified[source=attack]',migrated)
         self.assertIn('action = waf-unified[source=rate]',migrated)
         self.assertIn('waf-audit*.json /home/web/log/nginx/waf-audit-2026-10-29.json tail',migrated)
+
+    def test_unmarked_legacy_error_log_and_default_inheritance_migrate(self):
+        previous='''# Operator note
+[DEFAULT]
+action = waf-local[reason=attack]
+logpath = /home/web/log/nginx/error.log /home/web/log/nginx/error.log.1.gz tail
+[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 600
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log
+action = waf-local[reason=rate]
+'''
+        self.assertTrue(ban.is_unmarked_legacy_managed_jail(previous))
+        migrated=ban.managed_jail_content(previous,None)
+        parsed=ban.parse_jail(migrated)
+        self.assertEqual(parsed.get('waf-attack','action'),'waf-unified[source=attack]')
+        self.assertEqual(parsed.get('waf-rate','action'),'waf-unified[source=rate]')
+        self.assertEqual(parsed.get('waf-attack','logpath'),
+                         '/home/web/log/nginx/waf-audit.json /home/web/log/nginx/waf-audit.json.1.gz tail')
+        # Keep shared defaults unchanged for any non-WAF jails in this file.
+        self.assertIn('action = waf-local[reason=attack]\n',migrated)
+        self.assertIn('logpath = /home/web/log/nginx/error.log /home/web/log/nginx/error.log.1.gz tail\n',migrated)
+        self.assertFalse(ban.is_unmarked_legacy_managed_jail(
+            previous.replace('/home/web/log/nginx/error.log','/home/web/log/nginx/custom.log')))
 
     def test_current_header_with_legacy_action_is_detected_and_migrated(self):
         previous=ban.MARKER+'''[waf-attack]

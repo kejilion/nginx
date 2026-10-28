@@ -163,7 +163,7 @@ def managed_jail_marker(text):
     return None
 
 
-def is_unmarked_legacy_managed_jail(text):
+def is_unmarked_legacy_managed_jail(text,root=Path('/home/web')):
     """Recognize old WAF jails without a header by their action and log contract."""
     try:
         parsed=parse_jail(text)
@@ -179,7 +179,7 @@ def is_unmarked_legacy_managed_jail(text):
         paths=parsed.get(section,'logpath',fallback='').split()
         if paths and paths[-1].lower()=='tail':
             paths.pop()
-        if not paths or not all(legacy_waf_logpath_matches(section,path) for path in paths):
+        if not paths or not all(legacy_waf_logpath_matches(section,path,root) for path in paths):
             return False
     return True
 
@@ -198,13 +198,16 @@ def has_legacy_waf_actions(text):
                for source in ('attack','rate') if parsed.has_section('waf-'+source))
 
 
-def legacy_waf_logpath_matches(section,path):
-    directory='/home/web/log/nginx/'
+def legacy_waf_logpath_matches(section,path,root=Path('/home/web')):
+    directory=str(root).replace('\\','/').rstrip('/')+'/log/nginx/'
     filename=path.removeprefix(directory)
     if filename==path or '/' in filename or '\\' in filename:
         return False
     patterns={
-        'waf-attack':('waf-audit.json','waf-audit.json.*','waf-audit-*.json','waf-audit*.json'),
+        # Older WAF releases wrote ModSecurity audit events to error.log.
+        # Only the attack jail may claim that product-owned legacy path.
+        'waf-attack':('waf-audit.json','waf-audit.json.*','waf-audit-*.json','waf-audit*.json',
+                      'error.log','error.log.*','error.log-*'),
         'waf-rate':('waf-rate.log','waf-rate.log.*','waf-rate-*.log','waf-rate*.log'),
     }
     return any(fnmatch.fnmatchcase(filename,pattern) for pattern in patterns.get(section,()))
@@ -265,9 +268,9 @@ def validate_legacy_wafctl_action(name):
             raise ValueError('Unknown legacy WAF action settings; previous backend retained')
 
 
-def validate_managed_jail(text,allow_unmarked_legacy=False):
+def validate_managed_jail(text,allow_unmarked_legacy=False,root=Path('/home/web')):
     marker=managed_jail_marker(text)
-    if marker is None and allow_unmarked_legacy and is_unmarked_legacy_managed_jail(text):
+    if marker is None and allow_unmarked_legacy and is_unmarked_legacy_managed_jail(text,root):
         marker='legacy'
     if marker is None:
         raise ValueError('Custom/previous ban backend requires explicit migration')
@@ -424,7 +427,7 @@ def migration_plan(root):
     previous=manage.read_config(jail_path) if jail_path.exists() else ''
     managed=None
     if previous and previous!=DISABLED:
-        validate_managed_jail(previous,allow_unmarked_legacy=True)
+        validate_managed_jail(previous,allow_unmarked_legacy=True,root=root)
         managed=previous
         if has_legacy_waf_actions(previous):
             validate_legacy_wafctl_action('waf-local')
@@ -434,7 +437,7 @@ def migration_plan(root):
     imported=old is not None
     legacy_marker=bool(previous and (managed_jail_marker(previous)=='legacy' or
                                      managed_jail_marker(previous) is None and
-                                     is_unmarked_legacy_managed_jail(previous) or
+                                     is_unmarked_legacy_managed_jail(previous,root) or
                                      has_legacy_waf_actions(previous)))
     managed_api=False
     if previous:
@@ -461,9 +464,9 @@ def public_preflight(plan):
         'legacyReconcilerDetected':plan['reconciler']['recognized']}}
 
 
-def managed_jail_content(previous,api):
+def managed_jail_content(previous,api,root=Path('/home/web')):
     if previous and previous!=DISABLED:
-        validate_managed_jail(previous,allow_unmarked_legacy=True)
+        validate_managed_jail(previous,allow_unmarked_legacy=True,root=root)
         marker=managed_jail_marker(previous)
         if marker is None:
             bom='\ufeff' if previous.startswith('\ufeff') else ''
@@ -473,23 +476,74 @@ def managed_jail_content(previous,api):
             content=replace_managed_jail_marker(previous)
         else:
             content=previous
-        lines=content.splitlines(keepends=True)
         parsed=parse_jail(content)
+        action_overrides={}
+        for section,source in [('waf-attack','attack'),('waf-rate','rate'),('waf-api-invalid','api')]:
+            if not parsed.has_section(section):
+                continue
+            action=parsed.get(section,'action',fallback='').strip()
+            if (legacy_waf_action_matches(action,source) or
+                action=='waf-api-invalid' and source=='api' or
+                action=='waf-unified[source='+source+']'):
+                # DEFAULT action values are inherited by all sections. Add a
+                # local WAF action instead of changing the administrator's
+                # shared default for unrelated jails.
+                action_overrides[section]='waf-unified[source='+source+']'
+
+        attack_logpath=None
+        if parsed.has_section('waf-attack'):
+            value=parsed.get('waf-attack','logpath',fallback=None)
+            if value is not None:
+                tokens=value.split()
+                tail=bool(tokens and tokens[-1].lower()=='tail')
+                if tail:
+                    tokens.pop()
+                root_path=str(root).replace('\\','/').rstrip('/')
+                old=root_path+'/log/nginx/error.log'
+                new=root_path+'/log/nginx/waf-audit.json'
+                migrated=[]
+                changed=False
+                for token in tokens:
+                    suffix=token[len(old):] if token.startswith(old) else None
+                    if (suffix is not None and
+                        (suffix=='' or suffix[0] in '.*?-' and re.fullmatch(r'[.A-Za-z0-9*?_-]+',suffix))):
+                        migrated.append(new+suffix)
+                        changed=True
+                    else:
+                        migrated.append(token)
+                if changed:
+                    attack_logpath=' '.join(migrated+(['tail'] if tail else []))
+
+        lines=content.splitlines(keepends=True)
+        output=[]
         section=''
-        for index,line in enumerate(lines):
+        for line in lines:
             header=re.match(r'^\s*\[([^\]]+)\]',line)
-            if header:section=header[1]
-            source={'waf-attack':'attack','waf-rate':'rate','waf-api-invalid':'api'}.get(section)
-            if source and re.match(r'^\s*action\s*[=:]',line,re.I):
-                action=parsed.get(section,'action',fallback='').strip()
-                if not (legacy_waf_action_matches(action,source) or
-                        action=='waf-api-invalid' and source=='api' or
-                        action=='waf-unified[source='+source+']'):
-                    continue
+            if header:
+                section=header[1]
+                output.append(line)
+                local_options={key for key in parsed._sections.get(section,{}) if key!='__name__'}
+                additions=[]
+                if section in action_overrides and 'action' not in local_options:
+                    additions.append('action = '+action_overrides[section])
+                if section=='waf-attack' and attack_logpath is not None and 'logpath' not in local_options:
+                    additions.append('logpath = '+attack_logpath)
                 ending='\r\n' if line.endswith('\r\n') else '\n' if line.endswith('\n') else ''
-                indent=re.match(r'^\s*',line)[0]
-                lines[index]=indent+'action = waf-unified[source='+source+']'+ending
-        content=''.join(lines)
+                if additions and not ending:
+                    output[-1]=line+'\n'
+                    ending='\n'
+                output.extend(value+ending for value in additions)
+                continue
+            if section in action_overrides:
+                option=re.match(r'(?i)^([ \t]*action[ \t]*[=:][ \t]*)(.*?)([ \t]*)(\r?\n)?$',line)
+                if option:
+                    line=option[1]+action_overrides[section]+option[3]+(option[4] or '')
+            if section=='waf-attack' and attack_logpath is not None:
+                option=re.match(r'(?i)^([ \t]*logpath[ \t]*[=:][ \t]*)(.*?)([ \t]*)(\r?\n)?$',line)
+                if option:
+                    line=option[1]+attack_logpath+option[3]+(option[4] or '')
+            output.append(line)
+        content=''.join(output)
     else:
         content=''
     if api and not re.search(r'(?m)^\s*\[waf-api-invalid\]\s*$',content):
@@ -1092,7 +1146,7 @@ def _install(root):
                     f'bantime = {config.get("banSeconds", 600)}\nbantime.increment = false\n'
                     f'logtimezone = {config["logTimezone"]}\n'
                     f'action = waf-unified[source={name}]\n')
-    content=managed_jail_content(content if not previous or previous==DISABLED else previous,plan['apiJail'])
+    content=managed_jail_content(content if not previous or previous==DISABLED else previous,plan['apiJail'],root)
     files = {jail: content.encode(), F2B/'action.d/waf-unified.conf': action.encode(),
              F2B/'jail.d/zz-kejilion-web-baseline.local': (manage.BUNDLE/'legacy-jails.local').read_bytes()}
     for name, text in policy.render_filters().items():
