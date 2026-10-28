@@ -134,9 +134,30 @@ def legacy_state(root):
     return {'records':imported,'importedRecords':len(imported),'mapDigest':value['appliedDigest']}
 
 
+def canonicalize_waf_section_names(text):
+    """Normalize case variants of product-owned jail names without touching others."""
+    names={'waf-attack','waf-rate','waf-api-invalid'}
+    lines=text.splitlines(keepends=True)
+    seen=set()
+    for index,line in enumerate(lines):
+        match=re.match(r'^([ \t]*\[)([^\]]+)(\][ \t]*)(\r?\n)?$',line)
+        if not match:
+            continue
+        original=match[2].strip()
+        canonical=original.lower()
+        if canonical not in names:
+            continue
+        if canonical in seen:
+            raise ValueError('Duplicate WAF jail section after case normalization')
+        seen.add(canonical)
+        if original!=canonical:
+            lines[index]=match[1]+canonical+match[3]+(match[4] or '')
+    return ''.join(lines)
+
+
 def parse_jail(text):
     parser=configparser.ConfigParser(interpolation=None,strict=True)
-    parser.read_string(text.removeprefix('\ufeff'))
+    parser.read_string(canonicalize_waf_section_names(text.removeprefix('\ufeff')))
     return parser
 
 
@@ -169,9 +190,15 @@ def is_unmarked_legacy_managed_jail(text,root=Path('/home/web')):
         parsed=parse_jail(text)
     except (ValueError,configparser.Error):
         return False
-    for section,source in [('waf-attack','attack'),('waf-rate','rate')]:
-        if not parsed.has_section(section):
-            return False
+    known={'waf-attack','waf-rate','waf-api-invalid'}
+    if any(section.lower().startswith('waf-') and section.lower() not in known
+           for section in parsed.sections()):
+        return False
+    sections=[(section,source) for section,source in [('waf-attack','attack'),('waf-rate','rate')]
+              if parsed.has_section(section)]
+    if not sections:
+        return False
+    for section,source in sections:
         if parsed.get(section,'filter',fallback=section).strip()!=section:
             return False
         if not legacy_waf_action_matches(parsed.get(section,'action',fallback=''),source):
@@ -275,10 +302,14 @@ def validate_managed_jail(text,allow_unmarked_legacy=False,root=Path('/home/web'
     if marker is None:
         raise ValueError('Custom/previous ban backend requires explicit migration')
     parsed=parse_jail(text)
+    present=0
     for source in ['attack','rate']:
         section='waf-'+source
         if not parsed.has_section(section):
+            if marker=='legacy':
+                continue
             raise ValueError('Managed jail is incomplete; previous backend retained')
+        present+=1
         action=parsed.get(section,'action',fallback='').strip()
         accepted={'waf-unified[source='+source+']'}
         if marker=='legacy':
@@ -294,6 +325,8 @@ def validate_managed_jail(text,allow_unmarked_legacy=False,root=Path('/home/web'
                 raise ValueError('Unsupported jail threshold: '+field)
         if parsed.getboolean(section,'bantime.increment',fallback=False):
             raise ValueError('Incremental bans are outside the bounded unified policy')
+    if not present:
+        raise ValueError('Managed jail is incomplete; previous backend retained')
     return parsed
 
 
@@ -308,7 +341,7 @@ def api_jail():
     matches=[]
     for path in files:
         text=manage.read_config(path)
-        if not re.search(r'(?m)^\s*\[waf-api-invalid\]\s*$',text):
+        if not re.search(r'(?m)^\s*\[waf-api-invalid\]\s*$',text,re.I):
             continue
         parsed=parse_jail(text)
         if parsed.has_section('waf-api-invalid'):
@@ -464,7 +497,7 @@ def public_preflight(plan):
         'legacyReconcilerDetected':plan['reconciler']['recognized']}}
 
 
-def managed_jail_content(previous,api,root=Path('/home/web')):
+def managed_jail_content(previous,api,root=Path('/home/web'),defaults=None):
     if previous and previous!=DISABLED:
         validate_managed_jail(previous,allow_unmarked_legacy=True,root=root)
         marker=managed_jail_marker(previous)
@@ -476,6 +509,7 @@ def managed_jail_content(previous,api,root=Path('/home/web')):
             content=replace_managed_jail_marker(previous)
         else:
             content=previous
+        content=canonicalize_waf_section_names(content)
         parsed=parse_jail(content)
         action_overrides={}
         for section,source in [('waf-attack','attack'),('waf-rate','rate'),('waf-api-invalid','api')]:
@@ -544,6 +578,32 @@ def managed_jail_content(previous,api,root=Path('/home/web')):
                     line=option[1]+attack_logpath+option[3]+(option[4] or '')
             output.append(line)
         content=''.join(output)
+        parsed=parse_jail(content)
+        missing=[section for section in ('waf-attack','waf-rate') if not parsed.has_section(section)]
+        if missing:
+            if not defaults:
+                raise ValueError('Partial legacy WAF configuration requires install defaults')
+            default_blocks={}
+            current=''
+            block=[]
+            for line in canonicalize_waf_section_names(defaults).splitlines(keepends=True):
+                header=re.match(r'^\s*\[([^\]]+)\]',line)
+                if header:
+                    if current:
+                        default_blocks[current]=''.join(block)
+                    current=header[1].lower()
+                    block=[line]
+                elif current:
+                    block.append(line)
+            if current:
+                default_blocks[current]=''.join(block)
+            for section in missing:
+                if section not in default_blocks:
+                    raise ValueError('Install defaults are missing a required WAF jail')
+                if content and not content.endswith(('\n','\r')):
+                    content+='\n'
+                content+=default_blocks[section]
+            content=canonicalize_waf_section_names(content)
     else:
         content=''
     if api and not re.search(r'(?m)^\s*\[waf-api-invalid\]\s*$',content):
@@ -1146,7 +1206,8 @@ def _install(root):
                     f'bantime = {config.get("banSeconds", 600)}\nbantime.increment = false\n'
                     f'logtimezone = {config["logTimezone"]}\n'
                     f'action = waf-unified[source={name}]\n')
-    content=managed_jail_content(content if not previous or previous==DISABLED else previous,plan['apiJail'],root)
+    content=managed_jail_content(content if not previous or previous==DISABLED else previous,
+                                 plan['apiJail'],root,defaults=content)
     files = {jail: content.encode(), F2B/'action.d/waf-unified.conf': action.encode(),
              F2B/'jail.d/zz-kejilion-web-baseline.local': (manage.BUNDLE/'legacy-jails.local').read_bytes()}
     for name, text in policy.render_filters().items():

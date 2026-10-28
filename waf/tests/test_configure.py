@@ -255,6 +255,16 @@ class ConfigurationLifecycleTests(unittest.TestCase):
         self.assertIn('[waf-attack]\r\nlogpath = '+new+'.* '+new+'.1.gz tail\r\n',changed)
         self.assertEqual(manage.migrate_existing_jail(self.root,changed),changed)
 
+    def test_existing_fail2ban_refresh_accepts_rate_only_case_variant(self):
+        text='# Managed shared WAF; historical config\n[WAF-RATE]\nenabled = true\n'
+        text+='findtime = 120\nmaxretry = 120\nbantime = 600\n'
+        text+='logpath = '+str(self.root/'log/nginx/waf-rate.log')+'\n'
+        text+='action = waf-local[reason=rate]\n'
+        changed=manage.migrate_existing_jail(self.root,text)
+        self.assertIn('[waf-rate]\n',changed)
+        self.assertNotIn('[WAF-RATE]',changed)
+        self.assertNotIn('[waf-attack]',changed)
+
     def test_existing_fail2ban_migration_rejects_marker_after_jail_data(self):
         text='[waf-attack]\nlogpath = '+str(self.root/'log/nginx/error.log')+'\n'
         text+='# Managed shared WAF; too late\n'

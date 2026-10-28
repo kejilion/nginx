@@ -167,18 +167,22 @@ def fail2ban_update(root,legacy=False):
 
 
 def migrate_existing_jail(root,text):
+    import ban
     if not has_managed_shared_waf_header(text):
         # A small number of older script installs created the exact WAF jails
         # without a managed header. Reuse the ban migration classifier so this
         # path accepts only the known filters/actions/logs, never arbitrary
         # Fail2Ban configurations.
-        import ban
         ban.validate_managed_jail(text,allow_unmarked_legacy=True,root=root)
         if ban.has_legacy_waf_actions(text):
             ban.validate_legacy_wafctl_action('waf-local')
-    parsed=configparser.ConfigParser(interpolation=None)
-    parsed.read_string(text.removeprefix('\ufeff'))
-    if not parsed.has_section('waf-attack'):raise ValueError('Existing attack log path must be explicit in its jail')
+    text=ban.canonicalize_waf_section_names(text)
+    parsed=ban.parse_jail(text)
+    # Earlier installations could enable only rate defense (or only attack
+    # auditing). The normal ban-install path fills the missing product jail;
+    # a filter refresh must not invent it or reject the existing one.
+    if not parsed.has_section('waf-attack'):
+        return text
     old=str(root/'log/nginx/error.log');new=str(root/'log/nginx/waf-audit.json')
     value=parsed.get('waf-attack','logpath',fallback=None)
     if value is None:raise ValueError('Existing attack log path must be explicit in its jail')

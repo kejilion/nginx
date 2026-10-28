@@ -582,6 +582,77 @@ action = waf-local[reason=rate]
         self.assertFalse(ban.is_unmarked_legacy_managed_jail(
             previous.replace('/home/web/log/nginx/error.log','/home/web/log/nginx/custom.log')))
 
+    def test_partial_legacy_waf_jail_with_case_variants_is_completed_from_install_defaults(self):
+        previous='''[DEFAULT]
+action = waf-local[reason=attack]
+logpath = /home/web/log/nginx/error.log
+maxretry = 24
+findtime = 240
+bantime = 720
+[WAF-ATTACK]
+enabled = true
+'''
+        defaults=ban.MARKER+'''[waf-attack]
+enabled = true
+findtime = 300
+maxretry = 20
+bantime = 600
+logpath = /home/web/log/nginx/waf-audit.json
+action = waf-unified[source=attack]
+[waf-rate]
+enabled = true
+findtime = 300
+maxretry = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log
+action = waf-unified[source=rate]
+'''
+        self.assertTrue(ban.is_unmarked_legacy_managed_jail(previous))
+        migrated=ban.managed_jail_content(previous,None,defaults=defaults)
+        parsed=ban.parse_jail(migrated)
+        self.assertEqual(parsed.get('waf-attack','action'),'waf-unified[source=attack]')
+        self.assertEqual(parsed.get('waf-attack','logpath'),'/home/web/log/nginx/waf-audit.json')
+        self.assertEqual(parsed.getint('waf-attack','maxretry'),24)
+        self.assertEqual(parsed.get('waf-rate','action'),'waf-unified[source=rate]')
+        self.assertEqual(parsed.get('waf-rate','logpath'),'/home/web/log/nginx/waf-rate.log')
+        self.assertIn('[waf-attack]\n',migrated)
+        self.assertNotIn('[WAF-ATTACK]',migrated)
+        self.assertIn('action = waf-local[reason=attack]\n',migrated)
+
+    def test_partial_rate_only_legacy_jail_is_recognized_but_custom_log_is_not(self):
+        previous='''[WAF-RATE]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log tail
+action = waf-local [ reason = waf-rate ]
+'''
+        defaults=ban.MARKER+'''[waf-attack]
+enabled = true
+findtime = 300
+maxretry = 20
+bantime = 600
+logpath = /home/web/log/nginx/waf-audit.json
+action = waf-unified[source=attack]
+[waf-rate]
+enabled = true
+findtime = 300
+maxretry = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log
+action = waf-unified[source=rate]
+'''
+        self.assertTrue(ban.is_unmarked_legacy_managed_jail(previous))
+        migrated=ban.managed_jail_content(previous,None,defaults=defaults)
+        parsed=ban.parse_jail(migrated)
+        self.assertEqual(parsed.get('waf-rate','action'),'waf-unified[source=rate]')
+        self.assertEqual(parsed.get('waf-attack','action'),'waf-unified[source=attack]')
+        self.assertFalse(ban.is_unmarked_legacy_managed_jail(
+            previous.replace('/home/web/log/nginx/waf-rate.log','/home/web/log/nginx/site.log')))
+        with self.assertRaisesRegex(ValueError,'incomplete'):
+            ban.validate_managed_jail(ban.MARKER+previous.replace('[WAF-RATE]','[waf-rate]'))
+
     def test_current_header_with_legacy_action_is_detected_and_migrated(self):
         previous=ban.MARKER+'''[waf-attack]
 enabled = true
@@ -717,7 +788,7 @@ reason = attack
     def test_api_jail_action_migrates_only_known_wafctl_action(self):
         jail_dir=self.f2b/'jail.d';action_dir=self.f2b/'action.d'
         jail_dir.mkdir(parents=True);action_dir.mkdir(parents=True)
-        (jail_dir/'zz-waf-api-invalid.local').write_text('[waf-api-invalid]\nenabled = true\nfilter = waf-api-invalid\nlogpath = /home/web/log/nginx/waf-protocol.log tail\nmaxretry = 120\nfindtime = 120\nbantime = 600\naction = waf-api-invalid\n')
+        (jail_dir/'zz-waf-api-invalid.local').write_text('[WAF-API-INVALID]\nenabled = true\nfilter = waf-api-invalid\nlogpath = /home/web/log/nginx/waf-protocol.log tail\nmaxretry = 120\nfindtime = 120\nbantime = 600\naction = waf-api-invalid\n')
         action='[Definition]\nactionstart =\nactionstop =\nactioncheck =\nactionban = <python> <runtime> --root <root> ban --key "<ip>" --ttl <bantime> --reason api\nactionunban = <python> <runtime> --root <root> unban --key "<ip>" --reason api\n[Init]\npython = /usr/bin/python3\nruntime = /home/web/conf.d/waf/wafctl.py\nroot = /home/web\nreason = api\n'
         (action_dir/'waf-api-invalid.conf').write_text(action)
         result=ban.api_jail()
