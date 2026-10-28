@@ -619,7 +619,7 @@ def configured_status(root,config):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--root',type=Path,default=Path('/home/web'))
-    parser.add_argument('action',choices=['plan','apply','configure','doctor','status','rollback','refresh-ips','retire-jails','existing-filters','rotation','trust-cloudflare','ban-install','ban-remove','ban-status','ban-clear','cf-on','cf-off'])
+    parser.add_argument('action',choices=['plan','apply','configure','doctor','status','rollback','refresh-ips','retire-jails','existing-filters','rotation','trust-cloudflare','ban-preflight','ban-install','ban-remove','ban-status','ban-clear','cf-on','cf-off'])
     parser.add_argument('--policy',type=Path)
     parser.add_argument('--backup',type=Path)
     parser.add_argument('--mode',choices=sorted(policy.MODES))
@@ -636,7 +636,7 @@ def main():
     if root.resolve()!=root or str(root)=='/':raise ValueError('Unsafe root')
     default=root/'config/waf/policy.json'
     expected=hashlib.sha256(default.read_bytes()).hexdigest() if default.exists() else None
-    if args.action in {'configure','retire-jails','trust-cloudflare'} and not default.exists():default=BUNDLE/'example-policy.json'
+    if args.action in {'configure','retire-jails','trust-cloudflare','ban-preflight','ban-install'} and not default.exists():default=BUNDLE/'example-policy.json'
     config=policy.validate(load_json(args.policy or default))
     if args.action=='rollback':
         if not args.backup:parser.error('--backup required')
@@ -660,9 +660,10 @@ def main():
                 if args.cdn:config['cdn']=args.cdn
                 if args.method_override:config['methodOverride']=args.method_override
             config['logTimezone']='UTC'+execute('docker','exec',config['container'],'date','+%z').strip()
-        if args.action in {'ban-install','ban-remove','ban-status','ban-clear','cf-on','cf-off'}:
+        if args.action in {'ban-preflight','ban-install','ban-remove','ban-status','ban-clear','cf-on','cf-off'}:
             import ban
-            if args.action=='ban-install':result=ban.install(root)
+            if args.action=='ban-preflight':result=ban.ban_preflight(root)
+            elif args.action=='ban-install':result=ban.install(root)
             elif args.action=='ban-remove':result=ban.remove(root)
             elif args.action=='ban-status':result=ban.status(root)
             elif args.action=='ban-clear':
