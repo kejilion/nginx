@@ -140,11 +140,13 @@ def parse_jail(text):
 
 
 def managed_jail_marker(text):
-    """Recognize current and historical managed headers before the first jail.
+    """Recognize current and historical shared-WAF headers before the first jail.
 
     Older script releases wrote the legacy header, sometimes with a BOM,
-    whitespace, or operator comments ahead of it. Keep unknown/unmarked files
-    fail-closed; only the exact known headers qualify for automatic migration.
+    whitespace, or operator comments ahead of it. Earlier shared-WAF releases
+    used several product-owned header suffixes, so accept that namespace only
+    before any jail/data. The jail names, actions, and action implementation are
+    validated separately; unknown/unmarked files remain fail-closed.
     """
     current=MARKER.rstrip('\r\n')
     legacy=LEGACY_MARKER.rstrip('\r\n')
@@ -152,11 +154,16 @@ def managed_jail_marker(text):
         candidate=line.strip().removeprefix('\ufeff').strip()
         if candidate==current:return 'current'
         if candidate==legacy:return 'legacy'
+        if is_legacy_managed_jail_marker(candidate):return 'legacy'
         if not candidate or candidate.startswith('#'):
             continue
         # Do not accept a marker hidden after any jail section or data line.
         break
     return None
+
+
+def is_legacy_managed_jail_marker(candidate):
+    return candidate.startswith('# Managed shared WAF;') or candidate.startswith('# Managed shared WAF.')
 
 
 def replace_managed_jail_marker(text):
@@ -165,7 +172,7 @@ def replace_managed_jail_marker(text):
     legacy=LEGACY_MARKER.rstrip('\r\n')
     for index,line in enumerate(lines):
         candidate=line.strip().removeprefix('\ufeff').strip()
-        if candidate not in {current,legacy}:
+        if candidate not in {current,legacy} and not is_legacy_managed_jail_marker(candidate):
             if candidate and not candidate.startswith('#'):
                 break
             continue
