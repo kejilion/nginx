@@ -163,7 +163,7 @@ def managed_jail_marker(text):
 
 
 def is_legacy_managed_jail_marker(candidate):
-    return candidate.startswith('# Managed shared WAF;') or candidate.startswith('# Managed shared WAF.')
+    return re.fullmatch(r'#\s*Managed shared WAF(?:\s*(?:[;.:—-])\s*.*|\s+.*)?', candidate, re.I) is not None
 
 
 def replace_managed_jail_marker(text):
