@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 
-VERSION = "1.0.5"
+VERSION = "1.1.0"
 MAX_SITES = 200
 MAX_BANS = 10000
 MAX_STATE_BYTES = 4 * 1024 * 1024
@@ -45,13 +45,18 @@ def networks(data: dict) -> list[str]:
 
 def validate(config: dict) -> dict:
     allowed = {"schemaVersion", "mode", "cdn", "container", "sites", "trustedProxies", "proxyHeader",
-               "rate", "burst", "connections", "attackRetries", "rateRetries", "banSeconds", "logTimezone", "banBackend", "methodOverride"}
+               "rate", "burst", "connections", "attackRetries", "rateRetries", "banSeconds", "banIgnore", "logTimezone", "banBackend", "methodOverride"}
     if set(config) - allowed:
         raise ValueError("Unknown policy fields: " + ", ".join(sorted(set(config) - allowed)))
     if config.get("schemaVersion") != 1:
         raise ValueError("Unsupported WAF policy schema")
     if config.get('banBackend','existing') not in {'none','existing'}:
         raise ValueError('Unsupported existing ban integration')
+    ignored=config.get('banIgnore',[])
+    if not isinstance(ignored,list) or len(ignored)>128:
+        raise ValueError('Invalid ban protection list')
+    for entry in ignored:
+        ipaddress.ip_network(entry,strict=False)
     if config.get('methodOverride','guarded') not in {'guarded','strict'}:
         raise ValueError('Invalid method override policy')
     if not re.fullmatch(r'UTC(?:[+-](?:0[0-9]|1[0-4])[0-5][0-9])?', config.get('logTimezone','UTC')):
@@ -571,6 +576,7 @@ def render_filters() -> dict[str, str]:
     # F-ID is intentionally site|IP, so Fail2Ban counters do not cross vhosts.
     identity = r"[A-Za-z0-9_.*-]+\|[0-9a-fA-F:.]+"
     rate = ('[Definition]\n'
+            'datepattern = ^%%Y-%%m-%%dT%%H:%%M:%%S%%z\n'
             'failregex = ^\\s*key="<F-ID>' + identity + '</F-ID>" event=rate '
             'request_limit="(?:REJECTED|[A-Z_]*)" connection_limit="(?:REJECTED|[A-Z_]*)"$\n'
             'ignoreregex = request_limit="(?:PASSED|DELAYED|REJECTED_DRY_RUN|DELAYED_DRY_RUN)?" connection_limit="(?:PASSED|REJECTED_DRY_RUN)?"$\n')
@@ -586,5 +592,5 @@ def render_filters() -> dict[str, str]:
                 r'"response": \{"http_code": 403\}, "producer": \{.*?\}, "messages": \[.*'
                 r'(?<!\\)"ruleId": "(?:949110|949111|1110|1111)".*\}\s*$')
     structured=structured.replace(': ',r':\s*').replace(', ',r',\s*')
-    attack='[Definition]\nfailregex = '+structured+'\nignoreregex =\n'
+    attack='[Definition]\ndatepattern = %%a %%b %%d %%H:%%M:%%S %%Y\nfailregex = '+structured+'\nignoreregex =\n'
     return {"waf-rate.conf": rate, "waf-attack.conf": attack}

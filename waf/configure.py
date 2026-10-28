@@ -70,7 +70,7 @@ def load_json(path: Path, default=None):
 
 
 @contextlib.contextmanager
-def locked(path: Path):
+def locked(path: Path, timeout=None):
     import fcntl
     safe_parent(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,7 +80,17 @@ def locked(path: Path):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise ValueError('Unsafe lock file')
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            deadline=time.monotonic()+timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic()>=deadline:raise RuntimeError('Configuration is busy; retry later')
+                    time.sleep(0.1)
         yield
     finally:
         os.close(fd)
@@ -436,7 +446,7 @@ def make_plan(root, config, cfdata=None):
     changes[directory / 'cloudflare-ips.json'] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()
     changes[current] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()
     # The package is managed as a unit; no code or credentials are downloaded at run time.
-    for name in ['policy.py', 'nginx_edit.py', 'configure.py', 'example-policy.json', 'legacy-jails.local']:
+    for name in ['policy.py', 'nginx_edit.py', 'configure.py', 'ban.py', 'example-policy.json', 'legacy-jails.local']:
         changes[directory / name] = (BUNDLE / name).read_bytes()
     changes[root / 'config/waf/policy.json'] = (json.dumps(config, indent=2, sort_keys=True)+'\n').encode()
     blocked=directory/'blocked.map'
@@ -545,8 +555,8 @@ def reconcile_native_switch(root,config):
     return config
 
 
-def apply(root, config, cfdata=None, expected=UNSET, respect_native=False):
-    with locked(root / 'config/waf/install.lock'):
+def apply(root, config, cfdata=None, expected=UNSET, respect_native=False, lock_held=False):
+    with contextlib.nullcontext() if lock_held else locked(root / 'config/waf/install.lock'):
         current=root/'config/waf/policy.json'
         actual=hashlib.sha256(current.read_bytes()).hexdigest() if current.exists() else None
         if expected is not UNSET and actual!=expected:
@@ -609,7 +619,7 @@ def configured_status(root,config):
 def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--root',type=Path,default=Path('/home/web'))
-    parser.add_argument('action',choices=['plan','apply','configure','doctor','status','rollback','refresh-ips','retire-jails','existing-filters','rotation','trust-cloudflare'])
+    parser.add_argument('action',choices=['plan','apply','configure','doctor','status','rollback','refresh-ips','retire-jails','existing-filters','rotation','trust-cloudflare','ban-install','ban-remove','ban-status','ban-clear','cf-on','cf-off'])
     parser.add_argument('--policy',type=Path)
     parser.add_argument('--backup',type=Path)
     parser.add_argument('--mode',choices=sorted(policy.MODES))
@@ -650,7 +660,19 @@ def main():
                 if args.cdn:config['cdn']=args.cdn
                 if args.method_override:config['methodOverride']=args.method_override
             config['logTimezone']='UTC'+execute('docker','exec',config['container'],'date','+%z').strip()
-        if args.action=='trust-cloudflare':result=trust_cloudflare(root,config,expected)
+        if args.action in {'ban-install','ban-remove','ban-status','ban-clear','cf-on','cf-off'}:
+            import ban
+            if args.action=='ban-install':result=ban.install(root)
+            elif args.action=='ban-remove':result=ban.remove(root)
+            elif args.action=='ban-status':result=ban.status(root)
+            elif args.action=='ban-clear':
+                ban.clear(root);result=ban.status(root)
+            elif args.action=='cf-off':result=ban.configure_cf(root,disable=True)
+            else:
+                raw=__import__('sys').stdin.read(4097)
+                if len(raw)>4096:raise ValueError('Credential input exceeds budget')
+                result=ban.configure_cf(root,json.loads(raw))
+        elif args.action=='trust-cloudflare':result=trust_cloudflare(root,config,expected)
         elif args.action=='retire-jails':result=fail2ban_update(root,legacy=True)
         elif args.action=='existing-filters':result=fail2ban_update(root)
         elif args.action=='rotation':result=rotation(root,config)

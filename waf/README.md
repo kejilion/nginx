@@ -1,6 +1,6 @@
 # 共享 WAF 配置
 
-本目录管理现有 Docker Nginx + ModSecurity v3 + OWASP CRS 的配置。1.0.5 包含通用 Nginx 响应缓冲和 CRS 提前阻断调优，已在正式服 20 个站点完成分步试点。既有 KPanel 同源适配分支已通过完整 L2，面板版本发行另行进行。
+本目录管理现有 Docker Nginx + ModSecurity v3 + OWASP CRS 的配置。1.1.0 新增显式安装的 Fail2Ban 统一事件封禁及可选 CF 同步，延续 1.0.5 的请求检查、限流和性能基线。旧版正式服试点记录保留在下文；新封禁链路的隔离验证与生产边界见“统一事件封禁”。KPanel 镜像发行仍独立进行。
 
 后续性能、安全、官方新特性和依赖迭代统一遵循 [通用 Nginx 性能与安全规范](PRINCIPLES.md)。以官方 Nginx 为共同基线，WAF 按需扩展；按“官方核对→隔离比较→独立复核→正式服试点→同一产物发布→公开与消费回读”推进。已启用、仅版本支持和待评估的特性分别记录，未验证收益不计入完成项。
 
@@ -8,13 +8,13 @@
 
 沿用已有 CDN、Nginx、ModSecurity/CRS 和 Fail2Ban 链路。配置工具使用 Python 3.11+ 标准库，不安装 WAF 常驻服务，不新增 HTTP/Unix Socket 检查服务，不自动替换封禁后端。新增后端须另行评估。
 
-`banBackend: existing` 仅保留试点既有的按站点 IP map 接口；它要求安装环境已具备受信事件消费、到期及解封机制，不会凭空安装这些组件。新部署示例为 `none`：仍执行请求拦截及限流，但不宣称具备累计自动封禁能力。既有未声明此字段的试点策略保持原有 map 语义。公共默认提供请求拦截和限流；累计封禁继续使用管理员已有的受信机制，不自动新增封禁后台服务。
+`banBackend: existing` 使用按站点 IP map 接口，既有未声明此字段的试点策略保持原语义。新部署示例仍为 `none`：只检查、拦截及限流。普通 WAF 开关/刷新不安装封禁组件；用户明确选择防护安装或 CF 模式后，才安装统一 Fail2Ban jail、动作及每分钟到期/CF 同步任务，并接通该 map。自定义封禁集成不自动覆盖。
 
 ## 使用前提与入口
 
 需要 root、Docker 中名为 `nginx` 的现有容器、`/home/web` 原生布局，以及兼容的 ModSecurity/CRS 镜像。当前实测版本为 Nginx 1.31.7 / 1.31.8、ModSecurity 3.0.17、连接器 1.0.4、CRS 4.30.0；其他组合不能直接视为已验证。先备份并在隔离环境验证。
 
-日常仍使用原生环境防护菜单中的 WAF 开关。接入后可使用 `k web waf status`、`k web waf doctor` 诊断。原生脚本固定共享提交及六文件摘要；下列 Python 入口用于已经取得并核验完整配置包后的高级设置：
+日常仍使用原生环境防护菜单中的 WAF 开关。接入后可使用 `k web waf status`、`k web waf doctor` 诊断。原生脚本固定共享提交及七文件摘要（新增 `ban.py`）；下列 Python 入口用于已经取得并核验完整配置包后的高级设置：
 
 原生开关保留一键自动迁移：官方 `nginx` 镜像开启或检测 WAF 时，先检查日志轮转依赖，再备份当前 Compose 和配置、隔离预检兼容镜像、切换并应用共享策略。只修改生效的 Nginx 镜像声明，保留其他服务、端口、挂载、环境变量、CF 模式及自定义项，不重新下载覆盖整份 `nginx.conf`。首次没有策略文件时，轮转预检使用固定包的示例策略。普通镜像执行关闭为幂等操作，不为关闭 WAF 更换镜像。
 
@@ -80,7 +80,37 @@ python3 -B configure.py refresh-ips
 
 ## 日志、Fail2Ban 与恢复
 
-`existing-filters` 仅更新带有共享方案管理标记的既有 Fail2Ban 过滤器，不创建 jail 或动作。`retire-jails` 是显式迁移动作：只停用旧脚本按普通业务状态计数的九个网站 jail，保留 SSH 和自定义 jail；执行前应确认替代的受信事件链路已可用。不要把该动作当作新用户完整安装流程。公共旧网站 jail 模板默认关闭，不自动改变已安装的 jail；原生重装或重新配置 CF/Fail2Ban 会重新下载模板，须回读传统 jail 的启用状态，不能把配置成功等同于累计封禁已经生效。
+### 统一事件封禁（1.1.0）
+
+原生防护菜单 `1` 安装统一链路，`21` 开启 CF 封禁，`23` 关闭 CF 封禁；`6` 查看新 jail 与同步状态，`11` 调整两个受管 jail 的重试次数、计数窗口和封禁秒数，`12` 清空封禁。无共享策略时首次安装从 WAF 检测模式开始；已有 WAF 模式、站点例外、SSH 和自定义 jail 保留。管理员确认业务兼容后再开启 WAF 拦截。
+
+```sh
+k web waf ban-install  # 已安装 Fail2Ban、运行中的 cron 与共享 WAF 策略
+k web waf ban-status
+k web waf cf-off
+k web waf ban-clear
+k web waf ban-remove
+```
+
+调用 `cf-on` 时从标准输入传入 `{"email":"邮箱或空字符串","key":"Global API Key 或 API Token"}`，不要把凭据写到命令参数或共享日志。Token 需能读取目标 Zone 并编辑 Zone WAF 自定义规则；不要求账号级 IP 黑名单权限。凭据、owner 与 TTL 状态均由 root 以 0600 保存；缺少 owner 时拒绝假装完成远端清理，须恢复 `bans.json`。
+
+统一链路只累计真实 WAF 入站阻断（949110/949111、既有秘密路径规则 1110/1111）与 Nginx 明确限流拒绝事件。检测模式命中、业务 403/404/429、解析失败 400 和限流 dry-run 不独立触发封禁。原脚本九个按普通业务状态计数的 jail 在明确安装时停用，避免重复累计；原始文件保留，SSH/自定义 jail 不变。
+
+Fail2Ban 按 `站点|真实IP` 隔离计数。攻击默认 300 秒内 20 次、限流 120 次，封禁 600 秒；支持 60–3600 秒，不启用递增。攻击与限流保留独立到期时间，解掉一个来源不误解另一个来源。数据库重放使用原始 ticket 时间，避免重启延长封禁。IPv4/IPv6、本机接口地址、可信代理和 `banIgnore` CIDR 保护名单在动作端再次核验；管理员共享公网出口或 NAT 外部地址应在策略中明确加入 `banIgnore`。
+
+源站 map 立即执行。CF 模式作为附加边缘同步，每分钟按当前有效记录批量更新；接口故障、配额不足时源站继续拦截，状态报告未就绪。每个 Zone 只管理带有本机唯一 ref/description 的一条 custom rule，表达式同时限定 `lower(http.host)` 和 IP，不创建账号/整 Zone 的 IP Access Rules；保留其他用户规则，使用规则级新增/更新/删除接口。开启时以 `false` 规则预检写权限与额度。最多管理 20 个历史 Zone，表达式上限 4096 字节；超限 Zone 清空本方案边缘投影并报告降级，避免过期记录永远无法清理。
+
+只支持可明确映射到 CF Zone 的字面域名及别名；通配域名、别名冲突、缺失权限明确拒绝，不扩大到整个 Zone。`direct`/其他代理站点只在源站封禁。站点清单变化时先清理旧投影，再提示重新配置 CF；历史 Zone 单独保留用于清理。API 有请求及总同步时间预算，多 Zone 超时按分钟轮转优先次序重试。持续接口故障仍可能延迟远端解封，不能保证 CF 侧严格按秒到期；保留凭据、owner 和健康状态，恢复 API 后补偿。
+
+CF 关闭先清除本方案远端规则，保留源站有效封禁；失败显示清理待重试并保留凭据。卸载、整环境卸载和备份还原在替换资源前清理当前联动，恢复的备份也需清理其中历史状态，随后重新显式安装/开启。自定义/其他机器的 CF 规则及未知旧账号黑名单不擅自删除。重复安装保留受管 jail 参数、其他 cron；定时任务以固定标记去重。配置锁忙时先持久化事件，由配置事务后/下次同步补偿。升级与封禁重载共用锁，避免载入半份候选配置。
+
+隔离验证使用真实 Nginx/ModSecurity 与私有 Fail2Ban 配置、套接字、数据库及 crontab shim，所有攻击只到无网络容器的 Unix socket；身份注入仅用于隔离动作测试，不声称是生产 CF 回源实测。CF 接口生命周期和失败通过模拟客户端验证，未对真实 CF 账号写入，也未在生产执行攻击/失败注入。实际 cron 服务仍须在安装机器运行；`ban-status` 以真实 jail 运行状态和最近成功同步时间核验健康，pending 不会掩盖旧错误。
+
+2026-10-28，本轮 Linux 单测 119 项全部通过，隔离真实 Nginx 1.31.8 / ModSecurity / Fail2Ban 1.0.2 联动 54 项通过，覆盖正常业务 403 不封禁、WAF 日志到封禁、限流事件回放、跨站隔离、手动解封、安装失败恢复、多 ticket 清理、参数保留及卸载重装不恢复已清票据。原有 WAF 真实引擎集成 181 项通过；脚本另通过 10 项下载完整性检查和共享/CF/协议 smoke。发现并补偿 Fail2Ban 首次 actionban 尚未返回就执行 unbanip 时跳过 actionunban 的竞态：定时同步在锁外取得两个 jail 的完整票据快照，仅当 generation 未改变时按来源清除残留；快照失败或过时则不修剪。真实联动实际执行了保存的 cron 命令来验证补偿，不将 crontab shim 宣称为系统 cron 调度实测。
+
+依据：[CF 自定义规则 API](https://developers.cloudflare.com/waf/custom-rules/create-api/)、[规则级新增接口](https://developers.cloudflare.com/ruleset-engine/rulesets-api/add-rule/)、[Fail2Ban 动作及票据生命周期](https://github.com/fail2ban/fail2ban/blob/master/fail2ban/server/actions.py)。
+
+`existing-filters` 仅更新带有共享方案管理标记的既有 Fail2Ban 过滤器，不创建 jail 或动作。`retire-jails` 是显式迁移动作：只停用旧脚本按普通业务状态计数的九个网站 jail，保留 SSH 和自定义 jail；执行前应确认替代的受信事件链路已可用。不要把该动作当作新用户完整安装流程。公共旧网站 jail 模板默认关闭，不自动改变已安装的 jail；旧版原生入口重装或重新配置 CF/Fail2Ban 会重新下载传统模板，升级前须回读其启用状态。本版改走上述统一安装；CF 切换不重置现有参数，配置成功仍须结合运行状态核验。
 
 审计使用 ModSecurity JSON 的 AHZ 部分，省略原始请求头、请求体和响应体；URI 与规则匹配信息仍可能敏感，日志权限为 0640。不要公开原始审计日志。请求体解析失败仍在 WAF 返回 400，由访问日志保留请求与状态，`nolog` 减少重复审计，其他攻击规则继续审计。当前 1.0.4 连接器仍强制写入拦截错误，不能将 `nolog` 宣称为完全抑制错误日志，见[连接器源码](https://github.com/owasp-modsecurity/ModSecurity-nginx/blob/v1.0.4/src/ngx_http_modsecurity_module.c)。
 
