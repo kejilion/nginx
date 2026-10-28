@@ -472,6 +472,54 @@ enabled = false
         self.assertIn('action = waf-unified[source=attack]\r\n',content)
         self.assertIn('action = waf-unified[source=rate]\r\n',content)
 
+    def test_legacy_api_jail_embedded_in_managed_file_migrates_known_action(self):
+        jail_dir=self.f2b/'jail.d';action_dir=self.f2b/'action.d'
+        jail_dir.mkdir(parents=True);action_dir.mkdir(parents=True)
+        previous=ban.LEGACY_MARKER+'''[waf-attack]
+enabled = true
+maxretry = 20
+findtime = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-audit.json
+action = waf-local[reason=attack]
+[waf-rate]
+enabled = true
+maxretry = 120
+findtime = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log
+action = waf-local[reason=rate]
+[waf-api-invalid]
+enabled = true
+filter = waf-api-invalid
+logpath = /home/web/log/nginx/waf-protocol.log
+maxretry = 120
+findtime = 120
+bantime = 600
+action = waf-local[reason=api]
+'''
+        managed_path=jail_dir/'zz-waf-managed.local'
+        managed_path.write_text(previous)
+        action='''[Definition]
+actionban = <python> <runtime> --root <root> ban --key "<ip>" --ttl <bantime> --reason <reason>
+actionunban = <python> <runtime> --root <root> unban --key "<ip>" --reason <reason>
+[Init]
+python = /usr/bin/python3
+runtime = /home/web/conf.d/waf/wafctl.py
+root = /home/web
+reason = attack
+'''
+        (action_dir/'waf-local.conf').write_text(action)
+        api=ban.api_jail()
+        self.assertTrue(api['managed'])
+        self.assertTrue(api['enabled'])
+        self.assertEqual(api['action'],'waf-local[reason=api]')
+        content=ban.managed_jail_content(previous,api)
+        self.assertIn('action = waf-unified[source=attack]',content)
+        self.assertIn('action = waf-unified[source=rate]',content)
+        self.assertIn('action = waf-unified[source=api]',content)
+        self.assertIn('logpath = /home/web/log/nginx/waf-protocol.log',content)
+
     def test_unmarked_custom_jail_still_requires_explicit_migration(self):
         previous='[waf-attack]\nenabled = true\naction = custom-ban\n[waf-rate]\nenabled = true\naction = custom-ban\n'
         with self.assertRaisesRegex(ValueError,'requires explicit migration'):
