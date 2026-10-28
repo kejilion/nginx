@@ -487,7 +487,7 @@ action = waf-local[reason=rate]
 
         jail_dir=self.f2b/'jail.d';action_dir=self.f2b/'action.d'
         jail_dir.mkdir(parents=True);action_dir.mkdir(parents=True)
-        (jail_dir/'zz-waf-managed.local').write_text(previous)
+        (jail_dir/'zz-waf-managed.local').write_text(previous,encoding='utf-8')
         (action_dir/'waf-local.conf').write_text('''[Definition]
 actionban = <python> <runtime> --root <root> ban --key "<ip>" --ttl <bantime> --reason <reason>
 actionunban = <python> <runtime> --root <root> unban --key "<ip>" --reason <reason>
@@ -496,7 +496,7 @@ python = /usr/bin/python3
 runtime = /home/web/conf.d/waf/wafctl.py
 root = /home/web
 reason = attack
-''')
+''',encoding='utf-8')
         with (patch.object(ban,'LEGACY_CF_ACTION',self.f2b/'action.d/cloudflare-docker.conf'),
               patch.object(ban,'LEGACY_RECONCILER',self.root/'missing.service')):
             plan=ban.migration_plan(self.root)
@@ -524,6 +524,69 @@ action = waf-local[reason=rate]
         changed=previous.replace('action = custom-ban','action = waf-local[reason=attack]').replace('waf-audit.json','custom.log')
         with self.assertRaisesRegex(ValueError,'requires explicit migration'):
             ban.validate_managed_jail(changed,allow_unmarked_legacy=True)
+        custom_filter=previous.replace('[waf-attack]','[waf-attack]\nfilter = custom-nginx-filter')
+        self.assertFalse(ban.is_unmarked_legacy_managed_jail(custom_filter))
+
+    def test_unmarked_legacy_jails_accept_reason_aliases_and_known_rotated_logs(self):
+        previous='''# Operator note
+[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 600
+logpath = /home/web/log/nginx/waf-audit*.json /home/web/log/nginx/waf-audit-2026-10-29.json tail
+action = waf-local [ reason = waf-attack ]
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log.* /home/web/log/nginx/waf-rate-2026-10-29.log
+action = waf-local[reason = waf-rate]
+'''
+        self.assertTrue(ban.is_unmarked_legacy_managed_jail(previous))
+        migrated=ban.managed_jail_content(previous,None)
+        self.assertIn('action = waf-unified[source=attack]',migrated)
+        self.assertIn('action = waf-unified[source=rate]',migrated)
+        self.assertIn('waf-audit*.json /home/web/log/nginx/waf-audit-2026-10-29.json tail',migrated)
+
+    def test_current_header_with_legacy_action_is_detected_and_migrated(self):
+        previous=ban.MARKER+'''[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 600
+logpath = /home/web/log/nginx/waf-audit.json
+action = waf-local[reason=attack]
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log
+action = waf-local[reason=rate]
+'''
+        jail_dir=self.f2b/'jail.d';action_dir=self.f2b/'action.d'
+        jail_dir.mkdir(parents=True);action_dir.mkdir(parents=True)
+        (jail_dir/'zz-waf-managed.local').write_text(previous,encoding='utf-8')
+        (action_dir/'waf-local.conf').write_text('''[Definition]
+actionban = <python> <runtime> --root <root> ban --key "<ip>" --ttl <bantime> --reason <reason>
+actionunban = <python> <runtime> --root <root> unban --key "<ip>" --reason <reason>
+[Init]
+python = /usr/bin/python3
+runtime = /home/web/conf.d/waf/wafctl.py
+root = /home/web
+reason = attack
+''',encoding='utf-8')
+        with (patch.object(ban,'LEGACY_CF_ACTION',action_dir/'cloudflare-docker.conf'),
+              patch.object(ban,'LEGACY_RECONCILER',self.root/'missing.service'),
+              patch.object(ban,'legacy_state',return_value=None)):
+            plan=ban.migration_plan(self.root)
+        self.assertTrue(plan['requiresMigration'])
+        migrated=ban.managed_jail_content(previous,None)
+        self.assertEqual(ban.managed_jail_marker(migrated),'current')
+        self.assertIn('action = waf-unified[source=attack]',migrated)
+        self.assertIn('action = waf-unified[source=rate]',migrated)
 
     def test_legacy_marker_survives_bom_comments_whitespace_and_crlf(self):
         previous='\ufeff# Operator note\r\n\r\n  '+ban.LEGACY_MARKER.rstrip('\n')+'  \r\n'

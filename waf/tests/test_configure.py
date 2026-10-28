@@ -241,6 +241,25 @@ class ConfigurationLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'explicit migration'):
             manage.migrate_existing_jail(self.root,text.replace('error.log','custom.log'))
 
+    def test_existing_fail2ban_migration_accepts_old_headers_inherited_rotated_logs_and_tail(self):
+        old=str(self.root/'log/nginx/error.log');new=str(self.root/'log/nginx/waf-audit.json')
+        text='\ufeff# Operator note\r\n# Managed Shared WAF: historical config\r\n'
+        text+='[DEFAULT]\r\nlogpath = '+old+'.* '+old+'.1.gz tail\r\n'
+        text+='[waf-attack]\r\naction = existing-ban[notify='+old+']\r\nmaxretry = 20\r\n'
+        changed=manage.migrate_existing_jail(self.root,text)
+        expected='logpath = '+new+'.* '+new+'.1.gz tail\r\n'
+        self.assertIn(expected,changed)
+        self.assertIn('logpath = '+old+'.* '+old+'.1.gz tail\r\n',changed)
+        self.assertIn('action = existing-ban[notify='+old+']\r\n',changed)
+        self.assertIn('[waf-attack]\r\nlogpath = '+new+'.* '+new+'.1.gz tail\r\n',changed)
+        self.assertEqual(manage.migrate_existing_jail(self.root,changed),changed)
+
+    def test_existing_fail2ban_migration_rejects_marker_after_jail_data(self):
+        text='[waf-attack]\nlogpath = '+str(self.root/'log/nginx/error.log')+'\n'
+        text+='# Managed shared WAF; too late\n'
+        with self.assertRaisesRegex(ValueError,'explicit migration'):
+            manage.migrate_existing_jail(self.root,text)
+
     def test_policy_concurrency_conflict_does_not_write_any_configuration(self):
         state=self.root/'config/waf/policy.json';self.atomic(state,b'newer policy')
         with patch.object(manage,'make_plan') as plan,self.assertRaisesRegex(ValueError,'concurrently'):

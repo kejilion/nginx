@@ -167,28 +167,52 @@ def fail2ban_update(root,legacy=False):
 
 
 def migrate_existing_jail(root,text):
-    if not text.startswith('# Managed shared WAF;'):raise ValueError('Existing jail requires explicit migration')
+    if not has_managed_shared_waf_header(text):raise ValueError('Existing jail requires explicit migration')
     parsed=configparser.ConfigParser(interpolation=None)
-    parsed.read_string(text)
+    parsed.read_string(text.removeprefix('\ufeff'))
+    if not parsed.has_section('waf-attack'):raise ValueError('Existing attack log path must be explicit in its jail')
     old=str(root/'log/nginx/error.log');new=str(root/'log/nginx/waf-audit.json')
-    if 'logpath' not in parsed._sections.get('waf-attack',{}):
-        raise ValueError('Existing attack log path must be explicit in its jail')
-    if parsed.get('waf-attack','logpath',fallback=None) not in {old,new}:
-        raise ValueError('Existing attack log path requires explicit migration')
-    # Only the explicit attack logpath changes, including when another action
-    # independently references the old error log. Preserve formatting and actions.
-    section=None;changed=0;lines=text.splitlines(keepends=True)
+    value=parsed.get('waf-attack','logpath',fallback=None)
+    if value is None:raise ValueError('Existing attack log path must be explicit in its jail')
+    tokens=value.split();tail=bool(tokens and tokens[-1].lower()=='tail')
+    if tail:tokens.pop()
+    if not tokens:raise ValueError('Existing attack log path requires explicit migration')
+    migrated=[]
+    for token in tokens:
+        base=next((candidate for candidate in (old,new)
+                   if token==candidate or token.startswith(candidate) and
+                   token[len(candidate):][:1] in {'.','*','?'} and
+                   re.fullmatch(r'[.A-Za-z0-9*?_-]+',token[len(candidate):])),None)
+        if base is None:raise ValueError('Existing attack log path requires explicit migration')
+        migrated.append(new+token[len(base):])
+    new_value=' '.join(migrated+(['tail'] if tail else []))
+    # Only the attack logpath changes, including inherited DEFAULT values;
+    # preserve formatting, other options and action arguments.
+    section=None;changed=0;insert=None;newline='\r\n' if '\r\n' in text else '\n';lines=text.splitlines(keepends=True)
     for index,line in enumerate(lines):
         header=re.match(r'^\s*\[([^\]]+)\]',line)
-        if header:section=header[1]
+        if header:
+            section=header[1]
+            if section=='waf-attack' and insert is None:insert=index+1
         if section!='waf-attack':continue
         value=re.match(r'(?i)^([ \t]*logpath[ \t]*[=:][ \t]*)(.*?)([ \t]*)(\r?\n)?$',line)
         if not value:continue
-        if value[2] not in {old,new}:raise ValueError('Existing attack log path requires explicit migration')
-        lines[index]=value[1]+new+value[3]+(value[4] or '')
+        if changed:raise ValueError('Existing attack log path is ambiguous')
+        lines[index]=value[1]+new_value+value[3]+(value[4] or '')
         changed+=1
-    if changed!=1:raise ValueError('Existing attack log path must be explicit in its jail')
+    if changed==0:
+        if insert is None:raise ValueError('Existing attack log path must be explicit in its jail')
+        lines.insert(insert,'logpath = '+new_value+newline)
     return ''.join(lines)
+
+
+def has_managed_shared_waf_header(text):
+    marker=re.compile(r'#\s*Managed shared WAF(?:\s*(?:[;.:—-])\s*.*|\s+.*)?',re.I)
+    for line in text.splitlines():
+        candidate=line.strip().removeprefix('\ufeff').strip()
+        if marker.fullmatch(candidate):return True
+        if candidate and not candidate.startswith('#'):break
+    return False
 
 
 def rotation(root,config):
