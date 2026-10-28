@@ -162,6 +162,27 @@ def managed_jail_marker(text):
     return None
 
 
+def is_unmarked_legacy_managed_jail(text):
+    """Recognize old WAF-only jails without a product header by their exact contract."""
+    try:
+        parsed=parse_jail(text)
+    except (ValueError,configparser.Error):
+        return False
+    logpaths={
+        'waf-attack':{'/home/web/log/nginx/waf-audit.json'},
+        'waf-rate':{'/home/web/log/nginx/waf-rate.log'},
+    }
+    for section,source in [('waf-attack','attack'),('waf-rate','rate')]:
+        if not parsed.has_section(section):
+            return False
+        if parsed.get(section,'action',fallback='').strip()!='waf-local[reason='+source+']':
+            return False
+        paths=parsed.get(section,'logpath',fallback='').split()
+        if not paths or paths[0] not in logpaths[section] or paths[1:] not in ([],['tail']):
+            return False
+    return True
+
+
 def is_legacy_managed_jail_marker(candidate):
     return re.fullmatch(r'#\s*Managed shared WAF(?:\s*(?:[;.:—-])\s*.*|\s+.*)?', candidate, re.I) is not None
 
@@ -217,8 +238,10 @@ def validate_legacy_wafctl_action(name):
             raise ValueError('Unknown legacy WAF action settings; previous backend retained')
 
 
-def validate_managed_jail(text):
+def validate_managed_jail(text,allow_unmarked_legacy=False):
     marker=managed_jail_marker(text)
+    if marker is None and allow_unmarked_legacy and is_unmarked_legacy_managed_jail(text):
+        marker='legacy'
     if marker is None:
         raise ValueError('Custom/previous ban backend requires explicit migration')
     parsed=parse_jail(text)
@@ -268,6 +291,8 @@ def api_jail():
     if managed:
         managed_text=managed[0][1]
         marker=managed_jail_marker(managed_text)
+        if marker is None and is_unmarked_legacy_managed_jail(managed_text):
+            marker='legacy'
         if marker not in {'current','legacy'}:
             raise ValueError('Unexpected managed API jail override; previous backend retained')
         override=parse_jail(managed_text)
@@ -371,15 +396,17 @@ def migration_plan(root):
     previous=manage.read_config(jail_path) if jail_path.exists() else ''
     managed=None
     if previous and previous!=DISABLED:
-        validate_managed_jail(previous)
+        validate_managed_jail(previous,allow_unmarked_legacy=True)
         managed=previous
-        if managed_jail_marker(previous)=='legacy':
+        if managed_jail_marker(previous)=='legacy' or managed_jail_marker(previous) is None:
             validate_legacy_wafctl_action('waf-local')
     api=api_jail()
     reconciler=legacy_reconciler_state()
     old_cf=LEGACY_CF_ACTION.exists()
     imported=old is not None
-    legacy_marker=bool(previous and managed_jail_marker(previous)=='legacy')
+    legacy_marker=bool(previous and (managed_jail_marker(previous)=='legacy' or
+                                     managed_jail_marker(previous) is None and
+                                     is_unmarked_legacy_managed_jail(previous)))
     managed_api=False
     if previous:
         parsed_previous=parse_jail(previous)
@@ -407,9 +434,15 @@ def public_preflight(plan):
 
 def managed_jail_content(previous,api):
     if previous and previous!=DISABLED:
-        validate_managed_jail(previous)
-        if managed_jail_marker(previous)=='legacy':
-            content=replace_managed_jail_marker(previous)
+        validate_managed_jail(previous,allow_unmarked_legacy=True)
+        marker=managed_jail_marker(previous)
+        if marker=='legacy' or marker is None:
+            if marker is None:
+                bom='\ufeff' if previous.startswith('\ufeff') else ''
+                source=previous[1:] if bom else previous
+                content=bom+MARKER+source
+            else:
+                content=replace_managed_jail_marker(previous)
             lines=content.splitlines(keepends=True)
             parsed=parse_jail(content)
             section=''

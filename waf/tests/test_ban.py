@@ -461,6 +461,70 @@ enabled = false
         self.assertIn('[nginx-418]\nenabled = false',content)
         self.assertIn('[php-url-fopen]\nenabled = false',content)
 
+    def test_unmarked_legacy_jail_migrates_only_when_actions_and_logs_match(self):
+        previous='''\ufeff# Operator note
+[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 600
+logpath = /home/web/log/nginx/waf-audit.json tail
+action = waf-local[reason=attack]
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log
+action = waf-local[reason=rate]
+'''
+        content=ban.managed_jail_content(previous,None)
+        self.assertEqual(ban.managed_jail_marker(content),'current')
+        self.assertIn('# Operator note\n',content)
+        self.assertIn('logpath = /home/web/log/nginx/waf-audit.json tail',content)
+        self.assertIn('action = waf-unified[source=attack]',content)
+        self.assertIn('action = waf-unified[source=rate]',content)
+
+        jail_dir=self.f2b/'jail.d';action_dir=self.f2b/'action.d'
+        jail_dir.mkdir(parents=True);action_dir.mkdir(parents=True)
+        (jail_dir/'zz-waf-managed.local').write_text(previous)
+        (action_dir/'waf-local.conf').write_text('''[Definition]
+actionban = <python> <runtime> --root <root> ban --key "<ip>" --ttl <bantime> --reason <reason>
+actionunban = <python> <runtime> --root <root> unban --key "<ip>" --reason <reason>
+[Init]
+python = /usr/bin/python3
+runtime = /home/web/conf.d/waf/wafctl.py
+root = /home/web
+reason = attack
+''')
+        with (patch.object(ban,'LEGACY_CF_ACTION',self.f2b/'action.d/cloudflare-docker.conf'),
+              patch.object(ban,'LEGACY_RECONCILER',self.root/'missing.service')):
+            plan=ban.migration_plan(self.root)
+        self.assertTrue(plan['requiresMigration'])
+        self.assertEqual(plan['managedJail'],previous)
+
+    def test_unmarked_legacy_jail_with_custom_action_or_log_is_not_claimed(self):
+        previous='''[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 600
+logpath = /home/web/log/nginx/waf-audit.json
+action = custom-ban
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log
+action = waf-local[reason=rate]
+'''
+        with self.assertRaisesRegex(ValueError,'requires explicit migration'):
+            ban.validate_managed_jail(previous,allow_unmarked_legacy=True)
+        changed=previous.replace('action = custom-ban','action = waf-local[reason=attack]').replace('waf-audit.json','custom.log')
+        with self.assertRaisesRegex(ValueError,'requires explicit migration'):
+            ban.validate_managed_jail(changed,allow_unmarked_legacy=True)
+
     def test_legacy_marker_survives_bom_comments_whitespace_and_crlf(self):
         previous='\ufeff# Operator note\r\n\r\n  '+ban.LEGACY_MARKER.rstrip('\n')+'  \r\n'
         previous+='[waf-attack]\r\nenabled = true\r\nmaxretry = 20\r\nfindtime = 120\r\nbantime = 600\r\naction = waf-local[reason=attack]\r\n'
