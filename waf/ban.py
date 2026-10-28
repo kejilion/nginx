@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse
 import copy
 import contextlib
+import configparser
+import hashlib
 import ipaddress
 import json
 import os
@@ -25,9 +27,15 @@ import policy
 
 PHASE = 'http_request_firewall_custom'
 MARKER = '# Managed shared WAF; unified event bans v1\n'
-DISABLED = MARKER+'[waf-attack]\nenabled = false\n[waf-rate]\nenabled = false\n'
+LEGACY_MARKER = '# Managed shared WAF; only trusted defence events, isolated by canonical site and client.\n'
+DISABLED = MARKER+'[waf-attack]\nenabled = false\n[waf-rate]\nenabled = false\n[waf-api-invalid]\nenabled = false\n'
 MAX_EXPRESSION = 4096
+MAX_LEGACY_EXPIRY = 24 * 60 * 60
 F2B = Path('/etc/fail2ban')
+LEGACY_RECONCILER = Path('/etc/systemd/system/kejilion-waf.service')
+LEGACY_CF_ACTION = F2B/'action.d/cloudflare-docker.conf'
+LEGACY_SOURCES = {'attack':'attack','waf-attack':'attack','rate':'rate','waf-rate':'rate',
+                  'api':'api','waf-api-invalid':'api','manual':'legacy','migration':'legacy'}
 
 
 def read(root, name, default):
@@ -49,22 +57,444 @@ def state(root):
     if not (root/'config/waf/bans.json').exists() and read(root,'ban-cf.json',{}).get('auth'):
         raise ValueError('CF owner state is missing; restore bans.json before cleanup')
     value = read(root, 'bans.json', {'owner': uuid.uuid4().hex, 'records': {}})
-    if not re.fullmatch('[a-f0-9]{32}', value.get('owner', '')):
+    if not isinstance(value,dict) or not re.fullmatch('[a-f0-9]{32}', value.get('owner', '')):
         raise ValueError('Invalid ban state owner')
-    if len(value['records']) > policy.MAX_BANS:
+    if not isinstance(value.get('records'),dict) or len(value['records']) > policy.MAX_BANS:
         raise ValueError('Ban state budget exceeded')
     for key, sources in value['records'].items():
         policy.key(key)
-        if set(sources) - {'attack', 'rate'}:
+        if not isinstance(sources,dict) or set(sources) - {'attack', 'rate', 'api', 'legacy'}:
             raise ValueError('Invalid ban source')
         if any(type(expiry) is not int for expiry in sources.values()):
             raise ValueError('Invalid ban expiry')
     return value
 
 
+def legacy_state(root):
+    """Validate the exact site-scoped WAFCTL state before importing it."""
+    path=root/'config/waf/state.json'
+    mapped=root/'conf.d/waf/blocked.map'
+    if not path.exists():
+        if not mapped.exists():
+            return None
+        text=manage.read_config(mapped)
+        if any(line.strip() and not line.lstrip().startswith('#') for line in text.splitlines()):
+            raise ValueError('Existing bans require expiry-aware migration')
+        return None
+    if path.stat().st_mode & 0o077:
+        raise ValueError('Legacy WAF state permissions required')
+    value=manage.load_json(path)
+    if not isinstance(value,dict) or set(value)!={'schemaVersion','bans','appliedDigest','lastReload'}:
+        raise ValueError('Unknown legacy WAF state schema; previous backend retained')
+    if value.get('schemaVersion')!=1 or not isinstance(value.get('bans'),dict) or len(value['bans'])>policy.MAX_BANS:
+        raise ValueError('Invalid legacy WAF state; previous backend retained')
+    if type(value.get('lastReload')) is not int or not re.fullmatch('[a-f0-9]{64}',str(value.get('appliedDigest',''))):
+        raise ValueError('Invalid legacy WAF state digest; previous backend retained')
+    text=manage.read_config(mapped)
+    raw=mapped.read_bytes()
+    if hashlib.sha256(raw).hexdigest()!=value['appliedDigest']:
+        raise ValueError('Legacy ban map changed since WAFCTL state; previous backend retained')
+    expected=set()
+    imported={}
+    now=int(time.time())
+    for identity,record in value['bans'].items():
+        site,address=policy.key(identity)
+        canonical=site+'|'+address
+        if identity!=canonical or not isinstance(record,dict) or set(record)!={'expires','sources'}:
+            raise ValueError('Invalid legacy ban record; previous backend retained')
+        expiry=record['expires'];sources=record['sources']
+        if (type(expiry) is not int or expiry<0 or expiry>now+MAX_LEGACY_EXPIRY or
+            not isinstance(sources,dict) or len(sources)>8):
+            raise ValueError('Invalid legacy ban expiry; previous backend retained')
+        if expiry>now:expected.add(canonical)
+        for source,source_expiry in sources.items():
+            if (source not in LEGACY_SOURCES or type(source_expiry) is not int or source_expiry<0 or
+                source_expiry>now+MAX_LEGACY_EXPIRY):
+                raise ValueError('Unknown legacy ban source; previous backend retained')
+            if source_expiry>expiry:
+                raise ValueError('Legacy ban source expiry exceeds its applied record; previous backend retained')
+        if expiry>now:
+            imported[canonical]={'legacy':expiry}
+    found=set()
+    for line in text.splitlines():
+        stripped=line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        match=re.fullmatch(r'"([^"\r\n]+)"[ \t]+1;',stripped)
+        if not match:
+            raise ValueError('Unrecognized legacy ban map; previous backend retained')
+        site,address=policy.key(match.group(1))
+        identity=site+'|'+address
+        if identity!=match.group(1) or identity in found:
+            raise ValueError('Non-canonical legacy ban map; previous backend retained')
+        found.add(identity)
+    if found!=expected:
+        raise ValueError('Legacy ban map does not match its expiry state; previous backend retained')
+    return {'records':imported,'importedRecords':len(imported),'mapDigest':value['appliedDigest']}
+
+
+def parse_jail(text):
+    parser=configparser.ConfigParser(interpolation=None,strict=True)
+    parser.read_string(text.removeprefix('\ufeff'))
+    return parser
+
+
+def managed_jail_marker(text):
+    """Recognize current and historical managed headers before the first jail.
+
+    Older script releases wrote the legacy header, sometimes with a BOM,
+    whitespace, or operator comments ahead of it. Keep unknown/unmarked files
+    fail-closed; only the exact known headers qualify for automatic migration.
+    """
+    current=MARKER.rstrip('\r\n')
+    legacy=LEGACY_MARKER.rstrip('\r\n')
+    for line in text.splitlines():
+        candidate=line.strip().removeprefix('\ufeff').strip()
+        if candidate==current:return 'current'
+        if candidate==legacy:return 'legacy'
+        if not candidate or candidate.startswith('#'):
+            continue
+        # Do not accept a marker hidden after any jail section or data line.
+        break
+    return None
+
+
+def replace_managed_jail_marker(text):
+    lines=text.splitlines(keepends=True)
+    current=MARKER.rstrip('\r\n')
+    legacy=LEGACY_MARKER.rstrip('\r\n')
+    for index,line in enumerate(lines):
+        candidate=line.strip().removeprefix('\ufeff').strip()
+        if candidate not in {current,legacy}:
+            if candidate and not candidate.startswith('#'):
+                break
+            continue
+        ending='\r\n' if line.endswith('\r\n') else '\n' if line.endswith('\n') else ''
+        lines[index]=current+ending
+        return ''.join(lines)
+    raise ValueError('Managed WAF marker disappeared during migration')
+
+
+def validate_legacy_wafctl_action(name):
+    action_file=F2B/'action.d'/(name+'.conf')
+    parser=parse_jail(manage.read_config(action_file))
+    if set(parser.sections()) not in ({'Definition'},{'Definition','Init'}):
+        raise ValueError('Unknown legacy WAF action implementation; previous backend retained')
+    definition=parser['Definition']
+    if (not {'actionban','actionunban'}<=set(definition) or
+        set(definition)-{'actionstart','actionstop','actioncheck','actionban','actionunban'}):
+        raise ValueError('Unknown legacy WAF action implementation; previous backend retained')
+    has_init=parser.has_section('Init')
+    python=r'(?:<python>|/(?:usr/bin|usr/local/bin)/python3(?:\.[0-9]+)?)' if has_init else r'/(?:usr/bin|usr/local/bin)/python3(?:\.[0-9]+)?'
+    runtime=r'(?:<runtime>|/home/web/conf\.d/waf/wafctl\.py)' if has_init else r'/home/web/conf\.d/waf/wafctl\.py'
+    root=r'(?:<root>|/home/web)' if has_init else r'/home/web'
+    ip=r'"?<ip>"?'
+    reason=r'(?:<reason>|attack|rate|api|manual|migration)'
+    root_arg=rf'(?:--root\s+{root}\s+)?'
+    ban_pattern=re.compile(rf'{python}\s+{runtime}\s+{root_arg}ban\s+--key\s+{ip}\s+--ttl\s+<bantime>\s+--reason\s+{reason}')
+    unban_pattern=re.compile(rf'{python}\s+{runtime}\s+{root_arg}unban\s+--key\s+{ip}\s+--reason\s+{reason}')
+    if (not ban_pattern.fullmatch(definition.get('actionban','').strip()) or
+        not unban_pattern.fullmatch(definition.get('actionunban','').strip()) or
+        any(definition.get(field,'').strip() for field in ('actionstart','actionstop','actioncheck'))):
+        raise ValueError('Unknown legacy WAF action implementation; previous backend retained')
+    if has_init:
+        init=parser['Init']
+        if not set(init)<= {'python','runtime','root','reason'}:
+            raise ValueError('Unknown legacy WAF action settings; previous backend retained')
+        if (init.get('python') is not None and not re.fullmatch(r'/(?:usr/bin|usr/local/bin)/python3(?:\.[0-9]+)?',init.get('python','')) or
+            init.get('runtime') is not None and init.get('runtime')!='/home/web/conf.d/waf/wafctl.py' or
+            init.get('root') is not None and init.get('root')!='/home/web' or
+            init.get('reason') is not None and init.get('reason') not in {'attack','rate','api','manual','migration'}):
+            raise ValueError('Unknown legacy WAF action settings; previous backend retained')
+        if any('<reason>' in definition.get(field,'') for field in ('actionban','actionunban')) and init.get('reason') is None:
+            raise ValueError('Unknown legacy WAF action settings; previous backend retained')
+
+
+def validate_managed_jail(text):
+    marker=managed_jail_marker(text)
+    if marker is None:
+        raise ValueError('Custom/previous ban backend requires explicit migration')
+    parsed=parse_jail(text)
+    for source in ['attack','rate']:
+        section='waf-'+source
+        if not parsed.has_section(section):
+            raise ValueError('Managed jail is incomplete; previous backend retained')
+        action=parsed.get(section,'action',fallback='').strip()
+        accepted={'waf-unified[source='+source+']'}
+        if marker=='legacy':
+            accepted.add('waf-local[reason='+source+']')
+        if action not in accepted:
+            raise ValueError('Custom ban action requires explicit migration')
+        for field,low,high in [('maxretry',1,10000),('findtime',1,86400),('bantime',60,86400)]:
+            try:value=parsed.getint(section,field)
+            except (ValueError,configparser.Error):
+                raise ValueError('Unsupported jail threshold: '+field) from None
+            if not low<=value<=high:
+                raise ValueError('Unsupported jail threshold: '+field)
+        if parsed.getboolean(section,'bantime.increment',fallback=False):
+            raise ValueError('Incremental bans are outside the bounded unified policy')
+    return parsed
+
+
+def api_jail():
+    directory=F2B/'jail.d'
+    managed_path=directory/'zz-waf-managed.local'
+    files={path for path in directory.glob('*') if path.suffix in {'.local','.conf'}}
+    files.update(path for path in (F2B/'jail.conf',F2B/'jail.local') if path.exists())
+    files=sorted(files)
+    if len(files)>250:
+        raise ValueError('Fail2Ban jail inventory budget exceeded')
+    matches=[]
+    for path in files:
+        text=manage.read_config(path)
+        if not re.search(r'(?m)^\s*\[waf-api-invalid\]\s*$',text):
+            continue
+        parsed=parse_jail(text)
+        if parsed.has_section('waf-api-invalid'):
+            matches.append((path,text,parsed))
+    if not matches:
+        return None
+    managed=[item for item in matches if item[0]==managed_path]
+    sources=[item for item in matches if item[0]!=managed_path]
+    if len(managed)>1 or len(sources)>1:
+        raise ValueError('Ambiguous waf-api-invalid jail; previous backend retained')
+    if managed:
+        managed_text=managed[0][1]
+        marker=managed_jail_marker(managed_text)
+        if marker not in {'current','legacy'}:
+            raise ValueError('Unexpected managed API jail override; previous backend retained')
+        override=parse_jail(managed_text)
+        api_action=override.get('waf-api-invalid','action',fallback='').strip()
+        api_options=set(override.options('waf-api-invalid'))
+        legacy_api_options={'action','enabled','filter','logpath','maxretry','findtime','bantime','bantime.increment'}
+        if (marker=='current' and (api_action!='waf-unified[source=api]' or api_options!={'action'})) or (
+                marker=='legacy' and not api_options<=legacy_api_options):
+            raise ValueError('Unexpected managed API jail override; previous backend retained')
+    if sources:
+        path,text,parsed=sources[0]
+    else:
+        path,text,parsed=managed[0]
+    section='waf-api-invalid'
+    if path!=managed_path and (path.parent!=directory or path.name>=managed_path.name):
+        raise ValueError('API jail cannot be safely overridden without changing load order')
+    action=parsed.get(section,'action',fallback='').strip()
+    if action not in {'waf-api-invalid','waf-local[reason=api]','waf-unified[source=api]'}:
+        raise ValueError('Custom API jail action requires explicit migration')
+    if parsed.get(section,'filter',fallback='').strip()!='waf-api-invalid':
+        raise ValueError('Unknown API jail filter; previous backend retained')
+    logpath=parsed.get(section,'logpath',fallback='').strip().split()[0:1]
+    if not logpath or not re.fullmatch(r'/home/web/log/nginx/[A-Za-z0-9_.-]{1,128}',logpath[0]):
+        raise ValueError('Unknown API jail log path; previous backend retained')
+    if action!='waf-unified[source=api]':
+        validate_legacy_wafctl_action('waf-api-invalid' if action=='waf-api-invalid' else 'waf-local')
+    for field,low,high in [('maxretry',1,10000),('findtime',1,86400),('bantime',60,86400)]:
+        raw=parsed.get(section,field,fallback=None)
+        if raw is None:
+            continue
+        try:value=int(raw.strip())
+        except ValueError:raise ValueError('Invalid API jail threshold: '+field) from None
+        if not low<=value<=high:
+            raise ValueError('Invalid API jail threshold: '+field)
+    try:
+        incremental=parsed.getboolean(section,'bantime.increment',fallback=False)
+    except ValueError:
+        raise ValueError('Invalid API jail bantime.increment setting') from None
+    if incremental:
+        raise ValueError('Incremental API jail bans are outside the bounded unified policy')
+    try:enabled=parsed.getboolean(section,'enabled',fallback=False)
+    except ValueError:raise ValueError('Invalid API jail enabled state') from None
+    if path==managed_path:
+        return {'path':path,'enabled':enabled,'action':action,'text':text,'managed':True}
+    return {'path':path,'enabled':enabled,'action':action,'text':text}
+
+
+def legacy_reconciler_state():
+    path=LEGACY_RECONCILER
+    if path.is_symlink():
+        raise ValueError('Unknown legacy WAF reconciler unit; previous backend retained')
+    if not path.exists():
+        return {'recognized':False,'enabled':False,'active':False}
+    info=path.stat()
+    if not path.is_file() or info.st_uid!=os.geteuid() or info.st_size>16384 or info.st_mode&0o022:
+        raise ValueError('Unknown legacy WAF reconciler unit; previous backend retained')
+    text=path.read_text(encoding='utf-8')
+    lines=[line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith('#')]
+    allowed={'[Unit]','[Service]','[Install]'}
+    if any(line.startswith('[') and line.endswith(']') and line not in allowed for line in lines):
+        raise ValueError('Unknown legacy WAF reconciler unit; previous backend retained')
+    allowed_directives={
+        'Description=Shared site-scoped WAF ban reconciler',
+        'After=docker.service','Requires=docker.service',
+        'Type=simple','User=root','Group=root','Restart=on-failure','RestartSec=5',
+        'UMask=0077','NoNewPrivileges=true','PrivateTmp=true','ProtectHome=read-only',
+        'ProtectSystem=strict','ReadWritePaths=/home/web/config/waf /home/web/conf.d/waf',
+        'WantedBy=multi-user.target',
+    }
+    directives=[line for line in lines if not (line.startswith('[') and line.endswith(']'))]
+    exec_lines=[line for line in directives if line.startswith('ExecStart=')]
+    if (any(line not in allowed_directives for line in directives if not line.startswith('ExecStart=')) or
+        'Description=Shared site-scoped WAF ban reconciler' not in directives or
+        'Restart=on-failure' not in directives or len(exec_lines)!=1 or
+        not re.fullmatch(r'ExecStart=/(?:usr/bin|usr/local/bin)/python3(?:\.[0-9]+)? /home/web/conf\.d/waf/wafctl\.py --root /home/web watch',exec_lines[0])):
+        raise ValueError('Unknown legacy WAF reconciler unit; previous backend retained')
+    dropins=path.with_name(path.name+'.d')
+    if dropins.is_symlink():
+        raise ValueError('Legacy WAF reconciler has custom drop-ins; previous backend retained')
+    if dropins.exists():
+        dropin_info=dropins.stat()
+        if (not dropins.is_dir() or dropin_info.st_uid!=os.geteuid() or dropin_info.st_mode&0o022 or
+            any(dropins.iterdir())):
+            raise ValueError('Legacy WAF reconciler has custom drop-ins; previous backend retained')
+    import subprocess
+    active=subprocess.run(['systemctl','is-active','kejilion-waf.service'],capture_output=True,text=True,timeout=10)
+    enabled=subprocess.run(['systemctl','is-enabled','kejilion-waf.service'],capture_output=True,text=True,timeout=10)
+    if active.returncode not in {0,3,4} or enabled.returncode not in {0,1,3,4}:
+        raise ValueError('Cannot inspect legacy WAF reconciler state; previous backend retained')
+    fragment=subprocess.run(['systemctl','show','-p','FragmentPath','--value','kejilion-waf.service'],capture_output=True,text=True,timeout=10)
+    dropin_state=subprocess.run(['systemctl','show','-p','DropInPaths','--value','kejilion-waf.service'],capture_output=True,text=True,timeout=10)
+    if (fragment.returncode or fragment.stdout.strip()!=str(path) or dropin_state.returncode or dropin_state.stdout.strip()):
+        raise ValueError('Loaded legacy WAF reconciler differs from the verified unit; previous backend retained')
+    return {'recognized':True,'enabled':enabled.returncode==0,'active':active.returncode==0}
+
+
+def migration_plan(root):
+    saved_migration=read(root,'ban-migration.json',{})
+    old=legacy_state(root) if not saved_migration else None
+    jail_path=F2B/'jail.d/zz-waf-managed.local'
+    previous=manage.read_config(jail_path) if jail_path.exists() else ''
+    managed=None
+    if previous and previous!=DISABLED:
+        validate_managed_jail(previous)
+        managed=previous
+        if managed_jail_marker(previous)=='legacy':
+            validate_legacy_wafctl_action('waf-local')
+    api=api_jail()
+    reconciler=legacy_reconciler_state()
+    old_cf=LEGACY_CF_ACTION.exists()
+    imported=old is not None
+    legacy_marker=bool(previous and managed_jail_marker(previous)=='legacy')
+    managed_api=False
+    if previous:
+        parsed_previous=parse_jail(previous)
+        managed_api=parsed_previous.get('waf-api-invalid','action',fallback='').strip()=='waf-unified[source=api]'
+    legacy_api=bool(api and api['action']!='waf-unified[source=api]' and not managed_api)
+    reentry_required=bool(saved_migration.get('cfReentryRequired',old_cf))
+    requires=(imported or legacy_marker or legacy_api or
+              (reconciler['recognized'] and (reconciler['active'] or reconciler['enabled'])) or
+              (old_cf and not saved_migration))
+    return {'legacyState':old if imported else None,'managedJail':managed,'apiJail':api,
+            'reconciler':reconciler,'legacyCFDetected':old_cf,
+            'cfReentryRequired':reentry_required,'imported':imported,
+            'requiresMigration':requires}
+
+
+def public_preflight(plan):
+    return {'safe':True,'migration':{'state':'legacy-ready' if plan['requiresMigration'] else 'current',
+        'importedRecords':plan['legacyState']['importedRecords'] if plan['legacyState'] else 0,
+        'apiJailDetected':plan['apiJail'] is not None,
+        'apiJailEnabled':bool(plan['apiJail'] and plan['apiJail']['enabled']),
+        'legacyCFDetected':plan['legacyCFDetected'],
+        'cfReentryRequired':plan['cfReentryRequired'],
+        'legacyReconcilerDetected':plan['reconciler']['recognized']}}
+
+
+def managed_jail_content(previous,api):
+    if previous and previous!=DISABLED:
+        validate_managed_jail(previous)
+        if managed_jail_marker(previous)=='legacy':
+            content=replace_managed_jail_marker(previous)
+            lines=content.splitlines(keepends=True)
+            parsed=parse_jail(content)
+            section=''
+            for index,line in enumerate(lines):
+                header=re.match(r'^\s*\[([^\]]+)\]',line)
+                if header:section=header[1]
+                source={'waf-attack':'attack','waf-rate':'rate','waf-api-invalid':'api'}.get(section)
+                if source and re.match(r'^\s*action\s*[=:]',line,re.I):
+                    action=parsed.get(section,'action',fallback='').strip()
+                    if action not in {'waf-local[reason='+source+']','waf-api-invalid' if source=='api' else '',
+                                      'waf-unified[source='+source+']'}:
+                        continue
+                    ending='\r\n' if line.endswith('\r\n') else '\n' if line.endswith('\n') else ''
+                    indent=re.match(r'^\s*',line)[0]
+                    lines[index]=indent+'action = waf-unified[source='+source+']'+ending
+            content=''.join(lines)
+        else:
+            content=previous
+    else:
+        content=''
+    if api and not re.search(r'(?m)^\s*\[waf-api-invalid\]\s*$',content):
+        if content and not content.endswith('\n'):content+='\n'
+        content+='\n[waf-api-invalid]\naction = waf-unified[source=api]\n'
+    return content
+
+
+def private_snapshot(paths):
+    result={}
+    for path in paths:
+        if path.is_symlink():
+            raise ValueError('Refusing symlink: '+str(path))
+        result[path]=(path.read_bytes(),path.stat().st_mode&0o777) if path.exists() else None
+    return result
+
+
+def restore_private(snapshot):
+    for path,value in snapshot.items():
+        if value is None:
+            if path.exists():path.unlink()
+        else:
+            manage.atomic(path,value[0],value[1])
+
+
+def set_legacy_reconciler(plan,enabled):
+    before=plan['reconciler']
+    if not before['recognized']:
+        return
+    import subprocess
+    if not enabled:
+        try:
+            if before['active'] or before['enabled']:
+                result=subprocess.run(['systemctl','disable','--now','kejilion-waf.service'],capture_output=True,text=True,timeout=20)
+                if result.returncode:
+                    raise RuntimeError('Failed to stop the exact legacy WAF reconciler')
+            after=legacy_reconciler_state()
+            if after['active'] or after['enabled']:
+                raise RuntimeError('Legacy WAF reconciler is still active')
+        except Exception:
+            if before['active'] or before['enabled']:
+                set_legacy_reconciler(plan,True)
+            raise
+        return
+    if before['enabled'] and before['active']:
+        command=['systemctl','enable','--now','kejilion-waf.service']
+    elif before['enabled']:
+        command=['systemctl','enable','kejilion-waf.service']
+    elif before['active']:
+        command=['systemctl','start','kejilion-waf.service']
+    else:
+        return
+    result=subprocess.run(command,capture_output=True,text=True,timeout=20)
+    if result.returncode:
+        raise RuntimeError('Failed to restore the previous WAF reconciler state')
+
+
+def ban_preflight(root):
+    plan=migration_plan(root)
+    return public_preflight(plan)
+
+
 def live_records(value, now):
     return {key: {source: expiry for source, expiry in sources.items() if expiry > now}
             for key, sources in value['records'].items() if any(x > now for x in sources.values())}
+
+
+def merge_legacy_records(value, records):
+    if len(set(value['records'])|set(records))>policy.MAX_BANS:
+        raise ValueError('Combined legacy ban state exceeds the safe migration budget')
+    for identity,sources in records.items():
+        value['records'].setdefault(identity,{})['legacy']=sources['legacy']
+    value['generation']=value.get('generation',0)+1
+    return value
 
 
 def inventory(root):
@@ -300,7 +730,7 @@ def stage(root, operation, identity, source, seconds, started):
         value['records']=live_records(value,int(time.time()))
         site,address=policy.key(identity)
         identity=site+'|'+address
-        if source not in {'attack','rate'}:
+        if source not in {'attack','rate','api'}:
             raise ValueError('Invalid event source')
         if operation=='ban':
             proxies=policy.networks(manage.load_json(root/'config/waf/cloudflare-ips.json'))
@@ -329,8 +759,51 @@ def stage(root, operation, identity, source, seconds, started):
         save(root,'bans.json',value)
 
 
+def source_jail(source):
+    if source not in {'attack','rate','api'}:
+        raise ValueError('Invalid ban source')
+    return 'waf-api-invalid' if source=='api' else 'waf-'+source
+
+
+def configured_sources(root):
+    result=['attack','rate']
+    migration=read(root,'ban-migration.json',{})
+    if isinstance(migration,dict) and migration.get('apiJailEnabled') is True:
+        result.append('api')
+    return result
+
+
+def migration_status(root):
+    migration=read(root,'ban-migration.json',{})
+    if migration:
+        if not isinstance(migration,dict) or migration.get('state') not in {'current','legacy-imported','legacy-compatible'}:
+            return {'state':'unknown','importedRecords':0,'apiJailEnabled':False,
+                    'legacyCFDetected':False,'cfReentryRequired':False,
+                    'legacyReconcilerStopped':False}
+        imported=migration.get('importedRecords',0)
+        if type(imported) is not int or not 0<=imported<=policy.MAX_BANS:
+            imported=0
+        return {key:migration.get(key,default) for key,default in {
+            'state':'unknown','importedRecords':imported,'apiJailEnabled':False,
+            'legacyCFDetected':False,'cfReentryRequired':False,
+            'legacyReconcilerStopped':False}.items()}
+    try:
+        plan=migration_plan(root)
+        result=public_preflight(plan)['migration']
+        return {'state':'legacy-pending' if result['state']=='legacy-ready' else 'current',
+                'importedRecords':result['importedRecords'],
+                'apiJailEnabled':result['apiJailEnabled'],
+                'legacyCFDetected':result['legacyCFDetected'],
+                'cfReentryRequired':result['cfReentryRequired'],
+                'legacyReconcilerStopped':False}
+    except Exception:
+        return {'state':'unknown','importedRecords':0,'apiJailEnabled':False,
+                'legacyCFDetected':False,'cfReentryRequired':False,
+                'legacyReconcilerStopped':False}
+
+
 def query_tickets(source):
-    process=__import__('subprocess').run(['fail2ban-client','get','waf-'+source,'banip'],capture_output=True,text=True,timeout=5)
+    process=__import__('subprocess').run(['fail2ban-client','get',source_jail(source),'banip'],capture_output=True,text=True,timeout=5)
     if process.returncode or len(process.stdout)>policy.MAX_STATE_BYTES:
         raise ValueError('Cannot read complete Fail2Ban tickets')
     tickets=set(process.stdout.split())
@@ -344,7 +817,7 @@ def ticket_snapshot(root):
     # wait for its action process, which itself needs those locks.
     generation=state(root).get('generation',0)
     try:
-        return {'generation':generation,'sources':{source:query_tickets(source) for source in ['attack','rate']}}
+        return {'generation':generation,'sources':{source:query_tickets(source) for source in configured_sources(root)}}
     except Exception:
         return None  # Unavailable/restarting jail is not proof of a removal.
 
@@ -354,7 +827,7 @@ def reconcile_tickets(value,snapshot):
         return
     for identity,sources in value['records'].items():
         for source in list(sources):
-            if identity not in snapshot['sources'][source]:
+            if source!='legacy' and source in snapshot['sources'] and identity not in snapshot['sources'][source]:
                 sources.pop(source)
                 value['generation']=value.get('generation',0)+1
 
@@ -418,6 +891,11 @@ def configure_cf(root, auth=None, disable=False):
         # Keep desired configuration and credentials on failure so the scheduled
         # retry can repair partial remote writes; never falsely report healthy.
         save(root, 'ban-cf.json', cf)
+        if not disable:
+            migration=read(root,'ban-migration.json',{})
+            if migration.get('cfReentryRequired'):
+                migration['cfReentryRequired']=False
+                save(root,'ban-migration.json',migration)
         config = policy.validate(manage.load_json(root/'config/waf/policy.json'))
         reconcile(root, config, value, cf)
         if disable:
@@ -429,11 +907,15 @@ def status(root):
     cf = read(root, 'ban-cf.json', {'mode': 'local'})
     health = read(root, 'ban-health.json', {'ok': False, 'checked': 0})
     jail = F2B/'jail.d/zz-waf-managed.local'
-    configured = jail.exists() and manage.read_config(jail).startswith(MARKER)
+    configured = jail.exists() and managed_jail_marker(manage.read_config(jail))=='current'
     running = False
     if configured:
         try:
-            for name in ['waf-attack', 'waf-rate']:
+            migration=read(root,'ban-migration.json',{})
+            required=['waf-attack','waf-rate']
+            if migration.get('apiJailEnabled'):
+                required.append('waf-api-invalid')
+            for name in required:
                 manage.execute('fail2ban-client', 'status', name)
             running = True
         except Exception:
@@ -442,10 +924,12 @@ def status(root):
     value=state(root)
     healthy=healthy and health.get('originGeneration')==value.get('generation',0)
     pending=health.get('syncedGeneration')!=value.get('generation',0)
+    migration=migration_status(root)
     return {'mode': cf['mode'], 'cleanupPending':cf['mode']=='local' and bool(cf.get('auth')),
             'configured': configured, 'running': running,
             'healthy': healthy and running, 'pending': pending,
-            'activeBans': len(live_records(value, int(time.time())))}
+            'activeBans': len(live_records(value, int(time.time()))),
+            'migration': migration}
 
 
 def install(root):
@@ -466,10 +950,10 @@ def clear(root):
     # Callbacks persist their source removal and immediately defer a busy
     # configuration lock. Thus one final reload replaces per-ticket reloads.
     with manage.locked(root/'config/waf/install.lock',timeout=10):
-        for source in ['attack','rate']:
+        for source in configured_sources(root):
             tickets=sorted(query_tickets(source))
             for offset in range(0,len(tickets),100):
-                manage.execute('fail2ban-client','set','waf-'+source,'unbanip',*tickets[offset:offset+100])
+                manage.execute('fail2ban-client','set',source_jail(source),'unbanip',*tickets[offset:offset+100])
         change(root,'clear',lock_held=True)
 
 
@@ -482,7 +966,7 @@ def remove(root):
     clear(root)
     with manage.locked(root/'config/waf/install.lock',timeout=10):
         jail=F2B/'jail.d/zz-waf-managed.local'
-        if not jail.exists() or not manage.read_config(jail).startswith(MARKER):
+        if not jail.exists() or managed_jail_marker(manage.read_config(jail))!='current':
             raise ValueError('Only the unified managed integration can be removed')
         config=policy.validate(manage.load_json(root/'config/waf/policy.json'))
         cron=__import__('subprocess').run(['crontab','-l'],capture_output=True,text=True,timeout=10)
@@ -504,6 +988,7 @@ def remove(root):
 
 
 def _install(root):
+    plan=migration_plan(root)
     config = policy.validate(manage.load_json(root/'config/waf/policy.json'))
     if not __import__('shutil').which('fail2ban-client') or not __import__('shutil').which('crontab'):
         raise ValueError('Install Fail2Ban and enable the existing cron service first')
@@ -513,11 +998,7 @@ def _install(root):
     if not re.fullmatch(r'/[A-Za-z0-9_./-]+', str(root)):
         raise ValueError('Unsupported integration path')
     jail = F2B/'jail.d/zz-waf-managed.local'
-    if jail.exists() and not manage.read_config(jail).startswith(MARKER):
-        raise ValueError('Custom/previous ban backend requires explicit migration')
-    existing_map = manage.read_config(directory/'blocked.map')
-    if not (root/'config/waf/bans.json').exists() and any(line.strip() and not line.lstrip().startswith('#') for line in existing_map.splitlines()):
-        raise ValueError('Existing bans require expiry-aware migration')
+    previous=manage.read_config(jail) if jail.exists() else ''
     cron = __import__('subprocess').run(['crontab', '-l'], capture_output=True, text=True, timeout=10)
     if cron.returncode and 'no crontab' not in cron.stderr.lower():
         raise ValueError('Unable to preserve existing crontab')
@@ -542,20 +1023,7 @@ def _install(root):
                     f'bantime = {config.get("banSeconds", 600)}\nbantime.increment = false\n'
                     f'logtimezone = {config["logTimezone"]}\n'
                     f'action = waf-unified[source={name}]\n')
-    if jail.exists() and manage.read_config(jail)!=DISABLED:
-        previous=manage.read_config(jail)
-        parsed=__import__('configparser').ConfigParser(interpolation=None)
-        parsed.read_string(previous)
-        for source in ['attack','rate']:
-            section='waf-'+source
-            if parsed.get(section,'action',fallback='')!='waf-unified[source='+source+']':
-                raise ValueError('Custom ban action requires explicit migration')
-            for field,low,high in [('maxretry',1,10000),('findtime',1,86400),('bantime',60,3600)]:
-                if not low<=parsed.getint(section,field)<=high:
-                    raise ValueError('Unsupported jail threshold: '+field)
-            if parsed.getboolean(section,'bantime.increment',fallback=False):
-                raise ValueError('Incremental bans are outside the bounded unified policy')
-        content=previous
+    content=managed_jail_content(content if not previous or previous==DISABLED else previous,plan['apiJail'])
     files = {jail: content.encode(), F2B/'action.d/waf-unified.conf': action.encode(),
              F2B/'jail.d/zz-kejilion-web-baseline.local': (manage.BUNDLE/'legacy-jails.local').read_bytes()}
     for name, text in policy.render_filters().items():
@@ -565,24 +1033,71 @@ def _install(root):
         manage.safe_parent(path)
         if path.is_symlink():
             raise ValueError('Unsafe event log')
-        path.touch(exist_ok=True)
-        path.chmod(0o640)
+    state_path=root/'config/waf/bans.json'
+    migration_path=root/'config/waf/ban-migration.json'
+    private_before=private_snapshot([state_path,migration_path,root/'conf.d/waf/blocked.map'])
+    files_before=private_snapshot(files.keys())
+    reconciler_stopped=False
+    policy_result=None
+    result=None
+    migration=read(root,'ban-migration.json',{})
+    if plan['requiresMigration'] and not migration:
+        migration={'state':'legacy-imported' if plan['imported'] else 'legacy-compatible',
+                   'importedRecords':plan['legacyState']['importedRecords'] if plan['legacyState'] else 0,
+                   'apiJailEnabled':bool(plan['apiJail'] and plan['apiJail']['enabled']),
+                   'legacyCFDetected':plan['legacyCFDetected'],
+                   'cfReentryRequired':plan['cfReentryRequired'],
+                   'legacyReconcilerStopped':False}
+    elif not migration:
+        migration={'state':'current','importedRecords':0,
+                   'apiJailEnabled':bool(plan['apiJail'] and plan['apiJail']['enabled']),
+                   'legacyCFDetected':plan['legacyCFDetected'],
+                   'cfReentryRequired':plan['cfReentryRequired'],
+                   'legacyReconcilerStopped':False}
+    else:
+        migration=dict(migration)
+        migration['apiJailEnabled']=bool(plan['apiJail'] and plan['apiJail']['enabled']) or migration.get('apiJailEnabled',False)
+        migration['legacyCFDetected']=plan['legacyCFDetected'] or migration.get('legacyCFDetected',False)
+        migration['cfReentryRequired']=plan['cfReentryRequired'] or migration.get('cfReentryRequired',False)
     def activate():
+        for name in ['waf-rate.log','waf-audit.json']:
+            path=root/'log/nginx'/name
+            path.touch(exist_ok=True);path.chmod(0o640)
         manage.execute('fail2ban-client', '-t')
         change(root, 'sync',lock_held=True)
         manage.execute('fail2ban-client', 'reload')
         change(root,'sync',lock_held=True)
-        for name in ['waf-attack', 'waf-rate']:
+        for name in ['waf-attack', 'waf-rate']+(['waf-api-invalid'] if migration['apiJailEnabled'] else []):
             manage.execute('fail2ban-client', 'status', name)
         set_cron(cron_text)
-    policy_result = manage.apply(root, config,lock_held=True)
     try:
+        if plan['requiresMigration'] and plan['reconciler']['recognized']:
+            set_legacy_reconciler(plan,False)
+            reconciler_stopped=True
+            after=legacy_state(root) if plan['imported'] else None
+            before_digest=plan['legacyState']['mapDigest'] if plan['legacyState'] else None
+            if after and after['mapDigest']!=before_digest:
+                raise ValueError('Legacy ban state changed during migration; previous backend retained')
+        if plan['imported']:
+            if state_path.exists():
+                current=merge_legacy_records(state(root),plan['legacyState']['records'])
+            else:
+                current={'owner':uuid.uuid4().hex,'records':plan['legacyState']['records'],'generation':0}
+            save(root,'bans.json',current)
+        migration['legacyReconcilerStopped']=reconciler_stopped or migration.get('legacyReconcilerStopped',False)
+        save(root,'ban-migration.json',migration)
+        policy_result = manage.apply(root, config,lock_held=True)
         result = manage._external_update(root, files, 'unified-bans', activate)
+        result['migration']=status(root)['migration']
     except Exception:
         errors=[]
-        for restore in [lambda:set_cron(cron.stdout),lambda:manage.execute('fail2ban-client','reload'),
-                        lambda:manage.restore(root,Path(policy_result['backup'])) if policy_result.get('backup') else None,
-                        lambda:manage.reload_nginx(config_before['container'])]:
+        for restore in [lambda:restore_private(files_before),
+                        lambda:restore_private(private_before),
+                        lambda:set_cron(cron.stdout),
+                        lambda:manage.restore(root,Path(policy_result['backup'])) if policy_result and policy_result.get('backup') else None,
+                        lambda:manage.reload_nginx(config_before['container']) if policy_result else None,
+                        lambda:manage.execute('fail2ban-client','reload'),
+                        lambda:set_legacy_reconciler(plan,True) if reconciler_stopped else None]:
             try:restore()
             except Exception as error:errors.append(type(error).__name__)
         if errors:
@@ -596,7 +1111,7 @@ def main():
     parser.add_argument('--root', type=Path, default=Path('/home/web'))
     parser.add_argument('operation', choices=['ban', 'unban', 'sync', 'clear'])
     parser.add_argument('--identity')
-    parser.add_argument('--source', choices=['attack', 'rate'])
+    parser.add_argument('--source', choices=['attack', 'rate', 'api'])
     parser.add_argument('--seconds', type=int)
     parser.add_argument('--started', type=float)
     args = parser.parse_args()

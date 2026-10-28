@@ -1,5 +1,6 @@
 import contextlib
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -336,6 +337,283 @@ class BanTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'zone budget'):
                 ban.configure_cf(self.root,self.cf['auth'])
         self.assertEqual((self.root/'config/waf/ban-cf.json').read_bytes(),before)
+
+    def test_legacy_state_import_keeps_unexpired_bans_until_original_expiry(self):
+        expiry=int(time.time())+420
+        identity='one.example.com|8.8.8.8'
+        mapped=policy.render_bans({identity:{'expires':expiry}},int(time.time()))
+        (self.root/'conf.d/waf/blocked.map').write_text(mapped)
+        state={'schemaVersion':1,'bans':{identity:{'expires':expiry,'sources':{'rate':expiry-30}}},
+               'appliedDigest':hashlib.sha256(mapped.encode()).hexdigest(),'lastReload':int(time.time())}
+        self.write(self.root/'config/waf/state.json',state)
+        result=ban.legacy_state(self.root)
+        self.assertEqual(result['records'],{identity:{'legacy':expiry}})
+        self.assertEqual(result['importedRecords'],1)
+
+    def test_read_only_status_reports_legacy_migration_pending(self):
+        expiry=int(time.time())+420
+        identity='one.example.com|8.8.8.8'
+        mapped=policy.render_bans({identity:{'expires':expiry}},int(time.time()))
+        (self.root/'conf.d/waf/blocked.map').write_text(mapped)
+        state={'schemaVersion':1,'bans':{identity:{'expires':expiry,'sources':{'manual':expiry}}},
+               'appliedDigest':hashlib.sha256(mapped.encode()).hexdigest(),'lastReload':int(time.time())}
+        self.write(self.root/'config/waf/state.json',state)
+        self.assertEqual(ban.status(self.root)['migration']['state'],'legacy-pending')
+        self.assertEqual(ban.status(self.root)['migration']['importedRecords'],1)
+
+    def test_legacy_state_digest_mismatch_refuses_migration(self):
+        expiry=int(time.time())+420
+        identity='one.example.com|8.8.8.8'
+        mapped=policy.render_bans({identity:{'expires':expiry}},int(time.time()))
+        (self.root/'conf.d/waf/blocked.map').write_text(mapped)
+        state={'schemaVersion':1,'bans':{identity:{'expires':expiry,'sources':{'rate':expiry}}},
+               'appliedDigest':'0'*64,'lastReload':int(time.time())}
+        self.write(self.root/'config/waf/state.json',state)
+        with self.assertRaisesRegex(ValueError,'map changed'):
+            ban.legacy_state(self.root)
+
+    def test_unknown_legacy_source_refuses_migration(self):
+        expiry=int(time.time())+420
+        identity='one.example.com|8.8.8.8'
+        mapped=policy.render_bans({identity:{'expires':expiry}},int(time.time()))
+        (self.root/'conf.d/waf/blocked.map').write_text(mapped)
+        state={'schemaVersion':1,'bans':{identity:{'expires':expiry,'sources':{'custom':expiry}}},
+               'appliedDigest':hashlib.sha256(mapped.encode()).hexdigest(),'lastReload':int(time.time())}
+        self.write(self.root/'config/waf/state.json',state)
+        with self.assertRaisesRegex(ValueError,'Unknown legacy ban source'):
+            ban.legacy_state(self.root)
+
+    def test_legacy_expiry_beyond_supported_day_is_rejected(self):
+        now=int(time.time());expiry=now+ban.MAX_LEGACY_EXPIRY+1
+        identity='one.example.com|8.8.8.8'
+        mapped=policy.render_bans({identity:{'expires':expiry}},now)
+        (self.root/'conf.d/waf/blocked.map').write_text(mapped)
+        state={'schemaVersion':1,'bans':{identity:{'expires':expiry,'sources':{'rate':expiry}}},
+               'appliedDigest':hashlib.sha256(mapped.encode()).hexdigest(),'lastReload':now}
+        self.write(self.root/'config/waf/state.json',state)
+        with self.assertRaisesRegex(ValueError,'Invalid legacy ban expiry'):
+            ban.legacy_state(self.root)
+
+    def test_legacy_import_merges_without_replacing_current_sources(self):
+        expiry=int(time.time())+420
+        value={'owner':OWNER,'generation':4,'records':{
+            'one.example.com|8.8.8.8':{'attack':expiry+30},
+            'two.example.com|9.9.9.9':{'rate':expiry+60},}}
+        legacy={'one.example.com|8.8.8.8':{'legacy':expiry}}
+        self.assertEqual(ban.merge_legacy_records(value,legacy),{
+            'owner':OWNER,'generation':5,'records':{
+                'one.example.com|8.8.8.8':{'attack':expiry+30,'legacy':expiry},
+                'two.example.com|9.9.9.9':{'rate':expiry+60},}})
+
+    def test_legacy_jail_actions_migrate_and_keep_thresholds(self):
+        previous=ban.LEGACY_MARKER+'[waf-attack]\nenabled = true\nmaxretry = 23\nfindtime = 300\nbantime = 700\naction = waf-local[reason=attack]\n[waf-rate]\nenabled = true\nmaxretry = 140\nfindtime = 300\nbantime = 800\naction = waf-local[reason=rate]\n'
+        content=ban.managed_jail_content(previous,{'enabled':True})
+        self.assertTrue(content.startswith(ban.MARKER))
+        self.assertIn('maxretry = 23',content)
+        self.assertIn('bantime = 800',content)
+        self.assertIn('action = waf-unified[source=attack]',content)
+        self.assertIn('action = waf-unified[source=rate]',content)
+        self.assertIn('[waf-api-invalid]\naction = waf-unified[source=api]',content)
+
+    def test_108_legacy_jail_and_disabled_nginx_jails_migrate_without_losing_policy(self):
+        previous='''# Managed shared WAF; only trusted defence events, isolated by canonical site and client.
+[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 600
+logpath = /home/web/log/nginx/waf-audit.json
+action = waf-local[reason=attack]
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log
+action = waf-local[reason=rate]
+[fail2ban-nginx-cc]
+enabled = false
+[nginx-418]
+enabled = false
+[nginx-bad-request]
+enabled = false
+[nginx-badbots]
+enabled = false
+[nginx-botsearch]
+enabled = false
+[nginx-deny]
+enabled = false
+[nginx-http-auth]
+enabled = false
+[nginx-unauthorized]
+enabled = false
+[php-url-fopen]
+enabled = false
+'''
+        content=ban.managed_jail_content(previous,None)
+        self.assertEqual(ban.managed_jail_marker(content),'current')
+        self.assertIn('maxretry = 20',content)
+        self.assertIn('maxretry = 120',content)
+        self.assertIn('logpath = /home/web/log/nginx/waf-audit.json',content)
+        self.assertIn('logpath = /home/web/log/nginx/waf-rate.log',content)
+        self.assertIn('action = waf-unified[source=attack]',content)
+        self.assertIn('action = waf-unified[source=rate]',content)
+        self.assertIn('[nginx-418]\nenabled = false',content)
+        self.assertIn('[php-url-fopen]\nenabled = false',content)
+
+    def test_legacy_marker_survives_bom_comments_whitespace_and_crlf(self):
+        previous='\ufeff# Operator note\r\n\r\n  '+ban.LEGACY_MARKER.rstrip('\n')+'  \r\n'
+        previous+='[waf-attack]\r\nenabled = true\r\nmaxretry = 20\r\nfindtime = 120\r\nbantime = 600\r\naction = waf-local[reason=attack]\r\n'
+        previous+='[waf-rate]\r\nenabled = true\r\nmaxretry = 120\r\nfindtime = 120\r\nbantime = 600\r\naction = waf-local[reason=rate]\r\n'
+        self.assertEqual(ban.managed_jail_marker(previous),'legacy')
+        content=ban.managed_jail_content(previous,None)
+        self.assertEqual(ban.managed_jail_marker(content),'current')
+        self.assertIn('# Operator note\r\n',content)
+        self.assertIn('action = waf-unified[source=attack]\r\n',content)
+        self.assertIn('action = waf-unified[source=rate]\r\n',content)
+
+    def test_legacy_api_jail_embedded_in_managed_file_migrates_known_action(self):
+        jail_dir=self.f2b/'jail.d';action_dir=self.f2b/'action.d'
+        jail_dir.mkdir(parents=True);action_dir.mkdir(parents=True)
+        previous=ban.LEGACY_MARKER+'''[waf-attack]
+enabled = true
+maxretry = 20
+findtime = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-audit.json
+action = waf-local[reason=attack]
+[waf-rate]
+enabled = true
+maxretry = 120
+findtime = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log
+action = waf-local[reason=rate]
+[waf-api-invalid]
+enabled = true
+filter = waf-api-invalid
+logpath = /home/web/log/nginx/waf-protocol.log
+maxretry = 120
+findtime = 120
+bantime = 600
+action = waf-local[reason=api]
+'''
+        managed_path=jail_dir/'zz-waf-managed.local'
+        managed_path.write_text(previous)
+        action='''[Definition]
+actionban = <python> <runtime> --root <root> ban --key "<ip>" --ttl <bantime> --reason <reason>
+actionunban = <python> <runtime> --root <root> unban --key "<ip>" --reason <reason>
+[Init]
+python = /usr/bin/python3
+runtime = /home/web/conf.d/waf/wafctl.py
+root = /home/web
+reason = attack
+'''
+        (action_dir/'waf-local.conf').write_text(action)
+        api=ban.api_jail()
+        self.assertTrue(api['managed'])
+        self.assertTrue(api['enabled'])
+        self.assertEqual(api['action'],'waf-local[reason=api]')
+        content=ban.managed_jail_content(previous,api)
+        self.assertIn('action = waf-unified[source=attack]',content)
+        self.assertIn('action = waf-unified[source=rate]',content)
+        self.assertIn('action = waf-unified[source=api]',content)
+        self.assertIn('logpath = /home/web/log/nginx/waf-protocol.log',content)
+
+    def test_unmarked_custom_jail_still_requires_explicit_migration(self):
+        previous='[waf-attack]\nenabled = true\naction = custom-ban\n[waf-rate]\nenabled = true\naction = custom-ban\n'
+        with self.assertRaisesRegex(ValueError,'requires explicit migration'):
+            ban.validate_managed_jail(previous)
+
+    def test_api_jail_action_migrates_only_known_wafctl_action(self):
+        jail_dir=self.f2b/'jail.d';action_dir=self.f2b/'action.d'
+        jail_dir.mkdir(parents=True);action_dir.mkdir(parents=True)
+        (jail_dir/'zz-waf-api-invalid.local').write_text('[waf-api-invalid]\nenabled = true\nfilter = waf-api-invalid\nlogpath = /home/web/log/nginx/waf-protocol.log tail\nmaxretry = 120\nfindtime = 120\nbantime = 600\naction = waf-api-invalid\n')
+        action='[Definition]\nactionstart =\nactionstop =\nactioncheck =\nactionban = <python> <runtime> --root <root> ban --key "<ip>" --ttl <bantime> --reason api\nactionunban = <python> <runtime> --root <root> unban --key "<ip>" --reason api\n[Init]\npython = /usr/bin/python3\nruntime = /home/web/conf.d/waf/wafctl.py\nroot = /home/web\nreason = api\n'
+        (action_dir/'waf-api-invalid.conf').write_text(action)
+        result=ban.api_jail()
+        self.assertTrue(result['enabled'])
+        self.assertEqual(result['action'],'waf-api-invalid')
+        self.assertIn('action = waf-unified[source=api]',ban.managed_jail_content('',result))
+
+    def test_api_jail_unknown_action_is_not_overwritten(self):
+        jail_dir=self.f2b/'jail.d';jail_dir.mkdir(parents=True)
+        (jail_dir/'custom.local').write_text('[waf-api-invalid]\nenabled = true\nfilter = waf-api-invalid\nlogpath = /home/web/log/nginx/waf-protocol.log\naction = custom-ban\n')
+        with self.assertRaisesRegex(ValueError,'Custom API jail action'):
+            ban.api_jail()
+
+    def test_direct_legacy_wafctl_action_without_init_is_recognized(self):
+        directory=self.f2b/'action.d';directory.mkdir(parents=True)
+        path=directory/'waf-api-invalid.conf'
+        path.write_text('[Definition]\nactionban = /usr/bin/python3 /home/web/conf.d/waf/wafctl.py --root /home/web ban --key <ip> --ttl <bantime> --reason api\nactionunban = /usr/bin/python3 /home/web/conf.d/waf/wafctl.py --root /home/web unban --key <ip> --reason api\n')
+        ban.validate_legacy_wafctl_action('waf-api-invalid')
+
+    def test_known_legacy_reconciler_unit_is_recognized(self):
+        unit=self.root/'kejilion-waf.service'
+        unit.write_text('''[Unit]
+Description=Shared site-scoped WAF ban reconciler
+After=docker.service
+Requires=docker.service
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/web/conf.d/waf/wafctl.py --root /home/web watch
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/home/web/config/waf /home/web/conf.d/waf
+[Install]
+WantedBy=multi-user.target
+''')
+        unit.chmod(0o600)
+        patch.object(ban,'LEGACY_RECONCILER',unit).start()
+        active=type('Result',(),{'returncode':0,'stdout':'active'})()
+        enabled=type('Result',(),{'returncode':0,'stdout':'enabled'})()
+        fragment=type('Result',(),{'returncode':0,'stdout':str(unit)})()
+        dropins=type('Result',(),{'returncode':0,'stdout':''})()
+        with patch('subprocess.run',side_effect=[active,enabled,fragment,dropins]) as run:
+            self.assertEqual(ban.legacy_reconciler_state(),{'recognized':True,'enabled':True,'active':True})
+        self.assertEqual(run.call_count,4)
+
+    def test_custom_legacy_reconciler_unit_is_not_stopped(self):
+        unit=self.root/'kejilion-waf.service'
+        unit.write_text('''[Unit]
+Description=Shared site-scoped WAF ban reconciler
+[Service]
+ExecStart=/usr/bin/python3 /home/web/conf.d/waf/wafctl.py --root /home/web watch
+ExecStartPre=/bin/touch /tmp/custom
+Restart=on-failure
+''')
+        unit.chmod(0o600)
+        patch.object(ban,'LEGACY_RECONCILER',unit).start()
+        with patch('subprocess.run') as run, self.assertRaisesRegex(ValueError,'Unknown legacy WAF reconciler'):
+            ban.legacy_reconciler_state()
+        run.assert_not_called()
+
+    def test_api_tickets_use_existing_api_jail_name(self):
+        result=type('Result',(),{'returncode':0,'stdout':'one.example.com|8.8.8.8'})()
+        with patch('subprocess.run',return_value=result) as run:
+            self.assertEqual(ban.query_tickets('api'),{'one.example.com|8.8.8.8'})
+        self.assertEqual(run.call_args.args[0],['fail2ban-client','get','waf-api-invalid','banip'])
+
+    def test_api_source_is_accepted_by_runtime_action_cli(self):
+        started=time.time()
+        args=['ban.py','--root',str(self.root),'ban','--identity','one.example.com|8.8.8.8',
+              '--source','api','--seconds','600','--started',str(started)]
+        with patch.object(sys,'argv',args),patch('os.geteuid',return_value=0),patch.object(ban,'change') as change:
+            ban.main()
+        self.assertEqual(change.call_args.args[:5],
+                         (self.root,'ban','one.example.com|8.8.8.8','api',600))
+
+    def test_legacy_record_survives_ticket_snapshot_until_clear(self):
+        expiry=int(time.time())+600
+        value={'owner':OWNER,'records':{'one.example.com|8.8.8.8':{'legacy':expiry}}}
+        before=copy.deepcopy(value)
+        ban.reconcile_tickets(value,{'generation':0,'sources':{'attack':set(),'rate':set()}})
+        self.assertEqual(value,before)
 
 
 if __name__=='__main__':unittest.main()
