@@ -135,8 +135,44 @@ def legacy_state(root):
 
 def parse_jail(text):
     parser=configparser.ConfigParser(interpolation=None,strict=True)
-    parser.read_string(text)
+    parser.read_string(text.removeprefix('\ufeff'))
     return parser
+
+
+def managed_jail_marker(text):
+    """Recognize current and historical managed headers before the first jail.
+
+    Older script releases wrote the legacy header, sometimes with a BOM,
+    whitespace, or operator comments ahead of it. Keep unknown/unmarked files
+    fail-closed; only the exact known headers qualify for automatic migration.
+    """
+    current=MARKER.rstrip('\r\n')
+    legacy=LEGACY_MARKER.rstrip('\r\n')
+    for line in text.splitlines():
+        candidate=line.strip().removeprefix('\ufeff').strip()
+        if candidate==current:return 'current'
+        if candidate==legacy:return 'legacy'
+        if not candidate or candidate.startswith('#'):
+            continue
+        # Do not accept a marker hidden after any jail section or data line.
+        break
+    return None
+
+
+def replace_managed_jail_marker(text):
+    lines=text.splitlines(keepends=True)
+    current=MARKER.rstrip('\r\n')
+    legacy=LEGACY_MARKER.rstrip('\r\n')
+    for index,line in enumerate(lines):
+        candidate=line.strip().removeprefix('\ufeff').strip()
+        if candidate not in {current,legacy}:
+            if candidate and not candidate.startswith('#'):
+                break
+            continue
+        ending='\r\n' if line.endswith('\r\n') else '\n' if line.endswith('\n') else ''
+        lines[index]=current+ending
+        return ''.join(lines)
+    raise ValueError('Managed WAF marker disappeared during migration')
 
 
 def validate_legacy_wafctl_action(name):
@@ -175,7 +211,8 @@ def validate_legacy_wafctl_action(name):
 
 
 def validate_managed_jail(text):
-    if not (text.startswith(MARKER) or text.startswith(LEGACY_MARKER)):
+    marker=managed_jail_marker(text)
+    if marker is None:
         raise ValueError('Custom/previous ban backend requires explicit migration')
     parsed=parse_jail(text)
     for source in ['attack','rate']:
@@ -184,7 +221,7 @@ def validate_managed_jail(text):
             raise ValueError('Managed jail is incomplete; previous backend retained')
         action=parsed.get(section,'action',fallback='').strip()
         accepted={'waf-unified[source='+source+']'}
-        if text.startswith(LEGACY_MARKER):
+        if marker=='legacy':
             accepted.add('waf-local[reason='+source+']')
         if action not in accepted:
             raise ValueError('Custom ban action requires explicit migration')
@@ -223,11 +260,15 @@ def api_jail():
         raise ValueError('Ambiguous waf-api-invalid jail; previous backend retained')
     if managed:
         managed_text=managed[0][1]
-        if not managed_text.startswith(MARKER):
+        marker=managed_jail_marker(managed_text)
+        if marker not in {'current','legacy'}:
             raise ValueError('Unexpected managed API jail override; previous backend retained')
         override=parse_jail(managed_text)
-        if (override.get('waf-api-invalid','action',fallback='').strip()!='waf-unified[source=api]' or
-            set(override.options('waf-api-invalid'))!={'action'}):
+        api_action=override.get('waf-api-invalid','action',fallback='').strip()
+        api_options=set(override.options('waf-api-invalid'))
+        legacy_api_options={'action','enabled','filter','logpath','maxretry','findtime','bantime','bantime.increment'}
+        if (marker=='current' and (api_action!='waf-unified[source=api]' or api_options!={'action'})) or (
+                marker=='legacy' and not api_options<=legacy_api_options):
             raise ValueError('Unexpected managed API jail override; previous backend retained')
     if sources:
         path,text,parsed=sources[0]
@@ -244,8 +285,6 @@ def api_jail():
     logpath=parsed.get(section,'logpath',fallback='').strip().split()[0:1]
     if not logpath or not re.fullmatch(r'/home/web/log/nginx/[A-Za-z0-9_.-]{1,128}',logpath[0]):
         raise ValueError('Unknown API jail log path; previous backend retained')
-    if path==managed_path:
-        return {'path':path,'enabled':False,'action':action,'text':text,'managed':True}
     if action!='waf-unified[source=api]':
         validate_legacy_wafctl_action('waf-api-invalid' if action=='waf-api-invalid' else 'waf-local')
     for field,low,high in [('maxretry',1,10000),('findtime',1,86400),('bantime',60,86400)]:
@@ -264,6 +303,8 @@ def api_jail():
         raise ValueError('Incremental API jail bans are outside the bounded unified policy')
     try:enabled=parsed.getboolean(section,'enabled',fallback=False)
     except ValueError:raise ValueError('Invalid API jail enabled state') from None
+    if path==managed_path:
+        return {'path':path,'enabled':enabled,'action':action,'text':text,'managed':True}
     return {'path':path,'enabled':enabled,'action':action,'text':text}
 
 
@@ -325,13 +366,13 @@ def migration_plan(root):
     if previous and previous!=DISABLED:
         validate_managed_jail(previous)
         managed=previous
-        if previous.startswith(LEGACY_MARKER):
+        if managed_jail_marker(previous)=='legacy':
             validate_legacy_wafctl_action('waf-local')
     api=api_jail()
     reconciler=legacy_reconciler_state()
     old_cf=LEGACY_CF_ACTION.exists()
     imported=old is not None
-    legacy_marker=bool(previous and previous.startswith(LEGACY_MARKER))
+    legacy_marker=bool(previous and managed_jail_marker(previous)=='legacy')
     managed_api=False
     if previous:
         parsed_previous=parse_jail(previous)
@@ -360,15 +401,20 @@ def public_preflight(plan):
 def managed_jail_content(previous,api):
     if previous and previous!=DISABLED:
         validate_managed_jail(previous)
-        if previous.startswith(LEGACY_MARKER):
-            lines=previous.splitlines(keepends=True)
-            lines[0]=MARKER
+        if managed_jail_marker(previous)=='legacy':
+            content=replace_managed_jail_marker(previous)
+            lines=content.splitlines(keepends=True)
+            parsed=parse_jail(content)
             section=''
             for index,line in enumerate(lines):
                 header=re.match(r'^\s*\[([^\]]+)\]',line)
                 if header:section=header[1]
-                if section in {'waf-attack','waf-rate'} and re.match(r'^\s*action\s*[=:]',line,re.I):
-                    source=section.removeprefix('waf-')
+                source={'waf-attack':'attack','waf-rate':'rate','waf-api-invalid':'api'}.get(section)
+                if source and re.match(r'^\s*action\s*[=:]',line,re.I):
+                    action=parsed.get(section,'action',fallback='').strip()
+                    if action not in {'waf-local[reason='+source+']','waf-api-invalid' if source=='api' else '',
+                                      'waf-unified[source='+source+']'}:
+                        continue
                     ending='\r\n' if line.endswith('\r\n') else '\n' if line.endswith('\n') else ''
                     indent=re.match(r'^\s*',line)[0]
                     lines[index]=indent+'action = waf-unified[source='+source+']'+ending
@@ -861,7 +907,7 @@ def status(root):
     cf = read(root, 'ban-cf.json', {'mode': 'local'})
     health = read(root, 'ban-health.json', {'ok': False, 'checked': 0})
     jail = F2B/'jail.d/zz-waf-managed.local'
-    configured = jail.exists() and manage.read_config(jail).startswith(MARKER)
+    configured = jail.exists() and managed_jail_marker(manage.read_config(jail))=='current'
     running = False
     if configured:
         try:
@@ -920,7 +966,7 @@ def remove(root):
     clear(root)
     with manage.locked(root/'config/waf/install.lock',timeout=10):
         jail=F2B/'jail.d/zz-waf-managed.local'
-        if not jail.exists() or not manage.read_config(jail).startswith(MARKER):
+        if not jail.exists() or managed_jail_marker(manage.read_config(jail))!='current':
             raise ValueError('Only the unified managed integration can be removed')
         config=policy.validate(manage.load_json(root/'config/waf/policy.json'))
         cron=__import__('subprocess').run(['crontab','-l'],capture_output=True,text=True,timeout=10)

@@ -415,6 +415,68 @@ class BanTests(unittest.TestCase):
         self.assertIn('action = waf-unified[source=rate]',content)
         self.assertIn('[waf-api-invalid]\naction = waf-unified[source=api]',content)
 
+    def test_108_legacy_jail_and_disabled_nginx_jails_migrate_without_losing_policy(self):
+        previous='''# Managed shared WAF; only trusted defence events, isolated by canonical site and client.
+[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 600
+logpath = /home/web/log/nginx/waf-audit.json
+action = waf-local[reason=attack]
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+logpath = /home/web/log/nginx/waf-rate.log
+action = waf-local[reason=rate]
+[fail2ban-nginx-cc]
+enabled = false
+[nginx-418]
+enabled = false
+[nginx-bad-request]
+enabled = false
+[nginx-badbots]
+enabled = false
+[nginx-botsearch]
+enabled = false
+[nginx-deny]
+enabled = false
+[nginx-http-auth]
+enabled = false
+[nginx-unauthorized]
+enabled = false
+[php-url-fopen]
+enabled = false
+'''
+        content=ban.managed_jail_content(previous,None)
+        self.assertEqual(ban.managed_jail_marker(content),'current')
+        self.assertIn('maxretry = 20',content)
+        self.assertIn('maxretry = 120',content)
+        self.assertIn('logpath = /home/web/log/nginx/waf-audit.json',content)
+        self.assertIn('logpath = /home/web/log/nginx/waf-rate.log',content)
+        self.assertIn('action = waf-unified[source=attack]',content)
+        self.assertIn('action = waf-unified[source=rate]',content)
+        self.assertIn('[nginx-418]\nenabled = false',content)
+        self.assertIn('[php-url-fopen]\nenabled = false',content)
+
+    def test_legacy_marker_survives_bom_comments_whitespace_and_crlf(self):
+        previous='\ufeff# Operator note\r\n\r\n  '+ban.LEGACY_MARKER.rstrip('\n')+'  \r\n'
+        previous+='[waf-attack]\r\nenabled = true\r\nmaxretry = 20\r\nfindtime = 120\r\nbantime = 600\r\naction = waf-local[reason=attack]\r\n'
+        previous+='[waf-rate]\r\nenabled = true\r\nmaxretry = 120\r\nfindtime = 120\r\nbantime = 600\r\naction = waf-local[reason=rate]\r\n'
+        self.assertEqual(ban.managed_jail_marker(previous),'legacy')
+        content=ban.managed_jail_content(previous,None)
+        self.assertEqual(ban.managed_jail_marker(content),'current')
+        self.assertIn('# Operator note\r\n',content)
+        self.assertIn('action = waf-unified[source=attack]\r\n',content)
+        self.assertIn('action = waf-unified[source=rate]\r\n',content)
+
+    def test_unmarked_custom_jail_still_requires_explicit_migration(self):
+        previous='[waf-attack]\nenabled = true\naction = custom-ban\n[waf-rate]\nenabled = true\naction = custom-ban\n'
+        with self.assertRaisesRegex(ValueError,'requires explicit migration'):
+            ban.validate_managed_jail(previous)
+
     def test_api_jail_action_migrates_only_known_wafctl_action(self):
         jail_dir=self.f2b/'jail.d';action_dir=self.f2b/'action.d'
         jail_dir.mkdir(parents=True);action_dir.mkdir(parents=True)
