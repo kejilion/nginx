@@ -174,13 +174,46 @@ include /etc/nginx/conf.d/*.conf;
             wait('stage-'+str(count)+'-'+str(expected),observed)
         wait('all-stage-actions-staged',lambda:all(identity in json.loads((state/'bans.json').read_text())['records'] for _,identity,_ in examples))
         cron_command=(root/'crontab').read_text().split('* * * * * ',1)[1].split('\n',1)[0]
-        run('sh','-c',cron_command)
+        try:
+            run('sh','-c',cron_command)
+        except RuntimeError:
+            print('Fail2Ban live attack tickets:',run('fail2ban-client','get','waf-attack','banip','--with-time'),file=sys.stderr)
+            with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+                print('Fail2Ban database ticket times:',db.execute('SELECT ip,timeofban,bantime FROM bips WHERE jail=?',('waf-attack',)).fetchall(),file=sys.stderr)
+            diagnostic=('import sys;sys.path.insert(0,'+repr(str(bundle))+');import ban;'
+                        'live={s:ban.query_ticket_times(s) for s in ("attack","rate")};'
+                        'print(ban.progressive_expiries({s:set(v) for s,v in live.items()},list(live),live_tickets=live))')
+            run(sys.executable,'-B','-c',diagnostic)
+            raise
         current=json.loads((state/'bans.json').read_text())['records']
         with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
             for _,identity,expected in examples:
                 started,duration=db.execute('SELECT timeofban,bantime FROM bips WHERE jail=? AND ip=?',('waf-attack',identity)).fetchone()
-                check('stage-expiry-projected-'+str(expected)+'-'+identity,current[identity]['attack']==started+duration)
+                check('stage-expiry-projected-'+str(expected)+'-'+identity,0<=current[identity]['attack']-(started+duration)<=2)
         tool('ban-clear')
+        # Reproduce a legacy live ticket whose actual randomised timeout is
+        # longer than the base duration persisted in bips. Test at a simulated
+        # time after the base deadline without waiting or touching production.
+        legacy_ticket='one.example.com|4.2.2.3'
+        run('fail2ban-client','set','waf-attack','bantime','701')
+        run('fail2ban-client','set','waf-attack','banip',legacy_ticket)
+        def legacy_row():
+            with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+                return db.execute('SELECT timeofban,bantime FROM bips WHERE jail=? AND ip=?',('waf-attack',legacy_ticket)).fetchone()
+        wait('legacy-randomised-ticket-created',lambda:legacy_row() is not None and legacy_row()[1]==701)
+        started,_=legacy_row()
+        with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+            db.execute('UPDATE bips SET bantime=600 WHERE jail=? AND ip=?',('waf-attack',legacy_ticket))
+        code=('import sys;sys.path.insert(0,'+repr(str(bundle))+');import ban;from unittest.mock import patch;'
+              'identity='+repr(legacy_ticket)+';'
+              'p=patch.object(ban.time,"time",return_value='+str(started+650)+');p.start();'
+              'x=ban.progressive_expiries({"attack":{identity}},["attack"]);'
+              'assert '+str(started+701)+'<=x["attack"][identity]<='+str(started+703))
+        run(sys.executable,'-B','-c',code)
+        check('legacy-randomised-live-deadline-accepted',True)
+        with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+            db.execute('UPDATE bips SET bantime=701 WHERE jail=? AND ip=?',('waf-attack',legacy_ticket))
+        run('fail2ban-client','set','waf-attack','unbanip',legacy_ticket)
         run('fail2ban-client','set','waf-attack','bantime','60')
         # Reproduce a real Fail2Ban reload that loses a newly named action.
         # Installation must detect it, recover only that jail and keep tickets.
@@ -238,7 +271,7 @@ include /etc/nginx/conf.d/*.conf;
         run('sh','-c',cron_command)
         started,duration=progressive_ticket()
         check('progressive-expiry-projected-to-origin',
-              json.loads((state/'bans.json').read_text())['records'][attack_identity]['attack']==started+duration)
+              0<=json.loads((state/'bans.json').read_text())['records'][attack_identity]['attack']-(started+duration)<=2)
         check('progressive-still-isolates-other-site',request(host='two.example.com')==200)
         check('same-ip-other-site-unaffected',request(host='two.example.com')==200)
         check('other-ip-unaffected',request(ip='9.9.9.9')==200)

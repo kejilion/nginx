@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -165,9 +166,12 @@ action = waf-unified-api[site=one.example.com]
         with sqlite3.connect(dbpath) as db:
             db.execute('create table bips (jail text, ip text, timeofban integer, bantime integer)')
             db.execute('insert into bips values (?,?,?,?)',('waf-attack','one.example.com|8.8.8.8',now-30,3600))
-        with patch.object(ban,'fail2ban_database',return_value=dbpath):
+        live=(time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(now-30)),3600,
+              time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(now-30+3600)))
+        with patch.object(ban,'fail2ban_database',return_value=dbpath), \
+             patch.object(ban,'query_ticket_times',return_value={'one.example.com|8.8.8.8':live}):
             actual=ban.progressive_expiries({'attack':{'one.example.com|8.8.8.8'}},['attack'])
-        self.assertEqual(actual['attack']['one.example.com|8.8.8.8'],now-30+3600)
+        self.assertEqual(actual['attack']['one.example.com|8.8.8.8'],now-30+3601)
 
     def test_progressive_api_ticket_is_scoped_to_site_with_its_expiry(self):
         identity='one.example.com|8.8.8.8';expiry=int(time.time())+3600
@@ -177,6 +181,7 @@ action = waf-unified-api[site=one.example.com]
              patch.object(ban,'read',return_value=migration), \
              patch.object(ban,'configured_sources',return_value=['api']), \
              patch.object(ban,'query_tickets',return_value={'8.8.8.8'}), \
+             patch.object(ban,'query_ticket_times',return_value={'8.8.8.8':('x',1,'y')}), \
              patch.object(ban,'progressive_expiries',return_value={'api':{'8.8.8.8':expiry}}):
             snapshot=ban.ticket_snapshot(self.root)
         self.assertIsNotNone(snapshot)
@@ -190,7 +195,11 @@ action = waf-unified-api[site=one.example.com]
         with sqlite3.connect(dbpath) as db:
             db.execute('create table bips (jail text, ip text, timeofban integer, bantime integer)')
             db.execute('insert into bips values (?,?,?,?)',('waf-attack','one.example.com|8.8.8.8',now,86401))
-        with patch.object(ban,'fail2ban_database',return_value=dbpath):
+        live=(time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(now)),86401,
+              time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(now+86401)))
+        with patch.object(ban,'fail2ban_database',return_value=dbpath), \
+             patch.object(ban,'query_ticket_times',side_effect=[{'one.example.com|8.8.8.8':live},
+                                                                {'two.example.com|8.8.8.8':live}]):
             with self.assertRaisesRegex(ValueError,'Invalid progressive'):
                 ban.progressive_expiries({'attack':{'one.example.com|8.8.8.8'}},['attack'])
             with self.assertRaisesRegex(ValueError,'Incomplete progressive'):
@@ -201,9 +210,61 @@ action = waf-unified-api[site=one.example.com]
         with sqlite3.connect(dbpath) as db:
             db.execute('create table bips (jail text, ip text, timeofban integer, bantime integer)')
             db.execute('insert into bips values (?,?,?,?)',('waf-attack','one.example.com|8.8.8.8',now-601,600))
-        with patch.object(ban,'fail2ban_database',return_value=dbpath):
+        live=(time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(now-601)),600,
+              time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(now-1)))
+        with patch.object(ban,'fail2ban_database',return_value=dbpath), \
+             patch.object(ban,'query_ticket_times',return_value={'one.example.com|8.8.8.8':live}):
             with self.assertRaisesRegex(ValueError,'database is not current'):
                 ban.progressive_expiries({'attack':{'one.example.com|8.8.8.8'}},['attack'])
+
+    def test_progressive_accepts_verified_live_legacy_randomised_duration(self):
+        dbpath=self.root/'fail2ban.sqlite3';now=int(time.time());started=now-650
+        identity='one.example.com|8.8.8.8'
+        with sqlite3.connect(dbpath) as db:
+            db.execute('create table bips (jail text, ip text, timeofban integer, bantime integer)')
+            db.execute('insert into bips values (?,?,?,?)',('waf-attack',identity,started,600))
+        live=(time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started)),701,
+              time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started+701)))
+        with patch.object(ban,'fail2ban_database',return_value=dbpath), \
+             patch.object(ban,'query_ticket_times',return_value={identity:live}):
+            result=ban.progressive_expiries({'attack':{identity}},['attack'])
+        self.assertEqual(result['attack'][identity],started+702)
+        rounded=(time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started-1)),701,
+                 time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started-1+701)))
+        with patch.object(ban,'fail2ban_database',return_value=dbpath), \
+             patch.object(ban,'query_ticket_times',return_value={identity:rounded}):
+            result=ban.progressive_expiries({'attack':{identity}},['attack'])
+        self.assertEqual(result['attack'][identity],started+702)
+        fractional=(live[0],701,time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started+702)))
+        with patch.object(ban,'fail2ban_database',return_value=dbpath), \
+             patch.object(ban,'query_ticket_times',return_value={identity:fractional}):
+            result=ban.progressive_expiries({'attack':{identity}},['attack'])
+        self.assertEqual(result['attack'][identity],started+703)
+        wrong=(time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started+1)),701,live[2])
+        with patch.object(ban,'fail2ban_database',return_value=dbpath), \
+             patch.object(ban,'query_ticket_times',return_value={identity:wrong}):
+            with self.assertRaisesRegex(ValueError,'database is not current'):
+                ban.progressive_expiries({'attack':{identity}},['attack'])
+
+    def test_progressive_uses_live_extension_and_bounds_forward_projection(self):
+        dbpath=self.root/'fail2ban.sqlite3';now=int(time.time());started=now-30
+        identity='one.example.com|8.8.8.8'
+        with sqlite3.connect(dbpath) as db:
+            db.execute('create table bips (jail text, ip text, timeofban integer, bantime integer)')
+            db.execute('insert into bips values (?,?,?,?)',('waf-attack',identity,started,600))
+        for live_duration,expected in ((701,started+702),(90000,now+86400)):
+            live=(time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started)),live_duration,
+                  time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started+live_duration)))
+            with patch.object(ban,'fail2ban_database',return_value=dbpath), \
+                 patch.object(ban,'query_ticket_times',return_value={identity:live}), \
+                 patch.object(ban.time,'time',return_value=now):
+                result=ban.progressive_expiries({'attack':{identity}},['attack'])
+            self.assertEqual(result['attack'][identity],expected)
+
+    def test_progressive_empty_live_ticket_output_is_valid(self):
+        result=subprocess.CompletedProcess([],0,stdout='\n',stderr='')
+        with patch('subprocess.run',return_value=result):
+            self.assertEqual(ban.query_ticket_times('rate'),{})
 
     def test_progressive_older_future_ticket_does_not_shorten_new_ban(self):
         now=int(time.time());identity='one.example.com|8.8.8.8'
@@ -315,11 +376,14 @@ action = waf-unified-api[site=one.example.com]
         with patch.object(ban,'Cloudflare',return_value=edge), \
              patch.object(ban,'status',return_value={'running':True}), \
              patch.object(ban,'fail2ban_database',return_value=dbpath), \
+             patch.object(ban,'query_ticket_times',return_value={identity:(
+                 time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started)),3600,
+                 time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(started+3600)))}), \
              patch.object(ban,'query_tickets',side_effect=lambda source:{identity} if source=='attack' else set()):
             ban.configure_cf(self.root,{'email':'','key':'x'*40})
             self.event(started=started)
             ban.change(self.root,'sync')
-            self.assertEqual(ban.state(self.root)['records'][identity]['attack'],started+3600)
+            self.assertEqual(ban.state(self.root)['records'][identity]['attack'],started+3601)
             self.assertIn('"'+identity+'" 1;', (self.root/'conf.d/waf/blocked.map').read_text())
             self.assertIn('8.8.8.8',edge.sets[ZONE]['rules'][0]['expression'])
             self.assertNotIn('two.example.com',edge.sets[ZONE]['rules'][0]['expression'])

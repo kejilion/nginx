@@ -1132,6 +1132,26 @@ def query_tickets(source):
     return tickets
 
 
+def query_ticket_times(source):
+    """Read Fail2Ban's live start and duration for compatibility checks."""
+    process=__import__('subprocess').run(['fail2ban-client','get',source_jail(source),'banip','--with-time'],
+                                         capture_output=True,text=True,timeout=5)
+    if process.returncode or len(process.stdout)>policy.MAX_STATE_BYTES:
+        raise ValueError('Cannot read complete Fail2Ban ticket times')
+    result={}
+    pattern=r'^(\S+)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+\+\s+(-?\d+)\s+=\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})$'
+    for line in process.stdout.splitlines():
+        if not line.strip():continue
+        match=re.fullmatch(pattern,line.strip())
+        if not match or match[1] in result:
+            raise ValueError('Unsupported Fail2Ban ticket time format')
+        if source=='api' and '|' not in match[1]:ipaddress.ip_address(match[1])
+        else:policy.key(match[1])
+        result[match[1]]=(match[2],int(match[3]),match[4])
+    if len(result)>policy.MAX_BANS:raise ValueError('Ticket budget exceeded')
+    return result
+
+
 def fail2ban_database():
     output=manage.execute('fail2ban-client','get','dbfile').strip().splitlines()
     match=re.fullmatch(r'(?:[`|]-\s*)?(/[^\r\n]+)',output[-1].strip()) if output else None
@@ -1145,7 +1165,7 @@ def fail2ban_database():
     return path
 
 
-def progressive_expiries(raw_sources, progressive_sources, reject_legacy_active=False):
+def progressive_expiries(raw_sources, progressive_sources, reject_legacy_active=False, live_tickets=None):
     """Read actual observer-adjusted ticket expiry; F2B action bantime is the base."""
     if not progressive_sources:
         return {}
@@ -1171,6 +1191,9 @@ def progressive_expiries(raw_sources, progressive_sources, reject_legacy_active=
                                      ' ticket requires explicit migration; previous backend retained')
             tickets=sorted(raw_sources.get(source,set()))
             values={}
+            live_times=(live_tickets[source] if live_tickets is not None else query_ticket_times(source)) if tickets else {}
+            if set(live_times)!=set(tickets):
+                raise ValueError('Fail2Ban tickets changed during verification')
             for offset in range(0,len(tickets),200):
                 chunk=tickets[offset:offset+200]
                 sql='SELECT ip,timeofban,bantime FROM bips WHERE jail=? AND ip IN ('+','.join('?' for _ in chunk)+')'
@@ -1179,9 +1202,22 @@ def progressive_expiries(raw_sources, progressive_sources, reject_legacy_active=
                         raise ValueError('Invalid progressive ticket metadata')
                     if started>time.time()+5:
                         raise ValueError('Invalid progressive ticket time')
-                    if started+duration<=time.time():
+                    # Fail2Ban may extend an already banned ticket in memory
+                    # without updating bips. Match both ends of the live
+                    # ticket to its stored start to reject a stale DB row.
+                    live=live_times.get(key)
+                    # bips rounds fractional timestamps but --with-time
+                    # truncates them, so its start can be one second earlier.
+                    matching=next(((t,extra) for t in (started,started-1) for extra in (0,1) if live and live[1]>0 and
+                        live[0]==time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(t)) and
+                        live[2]==time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(t+live[1]+extra))),None)
+                    if matching is None or started+live[1]+matching[1]<=time.time():
                         raise ValueError('Progressive ticket database is not current')
-                    values[key]=started+duration
+                    # Each published projection is bounded to 24 hours ahead.
+                    # An ongoing attack can prolong the live F2B ticket, in
+                    # which case scheduled reconciliation extends it again.
+                    # The live display truncates subsecond ticket times.
+                    values[key]=min(started+live[1]+matching[1]+1,int(time.time())+MAX_LEGACY_EXPIRY)
             if set(tickets)!=set(values):
                 raise ValueError('Incomplete progressive ticket metadata')
             result[source]=values
@@ -1194,12 +1230,15 @@ def ticket_snapshot(root):
     saved_state=state(root)
     generation=saved_state.get('generation',0)
     try:
-        sources={source:query_tickets(source) for source in configured_sources(root)}
+        configured=configured_sources(root)
         migration=read(root,'ban-migration.json',{})
         progressive=migration.get('progressiveSources',[]) if isinstance(migration,dict) else []
-        if not isinstance(progressive,list) or len(progressive)!=len(set(progressive)) or set(progressive)-set(sources):
+        if not isinstance(progressive,list) or len(progressive)!=len(set(progressive)) or set(progressive)-set(configured):
             raise ValueError('Invalid progressive source configuration')
-        expiries=progressive_expiries(sources,progressive)
+        live_tickets={source:query_ticket_times(source) for source in progressive}
+        sources={source:set(live_tickets[source]) if source in live_tickets else query_tickets(source)
+                 for source in configured}
+        expiries=progressive_expiries(sources,progressive,live_tickets=live_tickets)
         if 'api' in sources:
             api_site=migration.get('apiSite') if isinstance(migration,dict) else None
             converted=set()
