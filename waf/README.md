@@ -280,3 +280,11 @@ EU 先后使用正式产物试点，语法、就绪、普通源站/公网请求�
 [同批产物发布 40285955080](https://github.com/kejilion/docker/actions/runs/40285955080) 已完成，未重建验证后的镜像。公开 `kjlion/nginx:alpine` / `1.31.8-alpine` 同指向 `sha256:065a40f37e508787769513aca655fc541acf687afffd57b25241b1a6bac53ef8`；amd64 配置 ID 为 `sha256:2a2a84d16b8f7ed8604e378dc6a39b0b716d3a7a9723b7648f66333d888a22b4`，arm64 为 `sha256:1a31e330f71409f19042cdbc78b5bc9d423d9eab47a33b8dbc15586b156bb323`。两个架构的公开配置和 RootFS 逐项匹配各自 CI 产物；EU 实际拉取不可变公开 digest 后与试点镜像一致。首份强制源码条件产物 `sha256:c64fd9585362f51a38d5716bc961b183d3a10789e4b8849b03e6427ffc8fefb3` 已由本版公共标签替代，不再作为后续升级方案。
 
 本轮不改版本号。现有用户通过原 Nginx 镜像更新入口取得本版即可，无须调整 CF 模式、重开 WAF 或手工维护补丁；仅更新镜像仍不会替换旧宿主规则包，也不会自动安装 KPanel 的 422 修复。镜像目录中的状态文件和正式构建报告用于核对当前是否启用可选加速，不能以版本号相同推断已取得同一产物。
+
+### 2026-10-29 防护动作与 CF 同步修复
+
+共享包 `fbb736a39235af21ad50a3f66fa2264c10136199` 和脚本 `4d2e36392de7a28003e723e72866ce7d41d6721f` 修复 Fail2Ban 普通重载丢失动作及 CF 空规则表达式无效的问题；动作缺失时仅重启受影响 Jail 并核验动作和既有票据，失败回退也核验此前动作。数据库不可用而仍有票据时拒绝自动重启。CF 空规则采用不会匹配请求的有效表达式；失败时保留待同步状态。版本号不变。
+
+隔离环境通过 159 项单元检查；Fail2Ban 1.0.2 与 1.1.0 的真实联动分别通过 62 项，覆盖动作丢失恢复、票据到期与失败回退，最终代码在 1.1.0 联动复验通过。生产试点已回读三条 Jail 动作、源站封禁表和三个 CF 区域的受管规则，并观察到 CF 规则实际拦截事件。CF 规则采用 [Cloudflare Rulesets API](https://developers.cloudflare.com/ruleset-engine/rulesets-api/add-rule/)；使用 [dry-run 验证](https://developers.cloudflare.com/ruleset-engine/rulesets-api/dry-run/)核对规则写入前的 API 接受情况。
+
+限制：未完成独立复核、长期生产观察或所有用户自定义配置的实测；未知动作和数据库不可用时保留原配置并提示。源代码回退点为共享包 `b6d8bda9c004abaf9f7dfad14ef2c6373c3546ae` 与脚本 `8a37071308feac7de2676fc8071c0ce5cee65a11`，这两个旧版本存在本轮修复的问题，回退后必须检查 Fail2Ban 动作及 CF 同步；正式配置按各主机安装事务的恢复点回滚。KPanel 配套变更仍在本地候选分支，未发布。
