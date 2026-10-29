@@ -917,6 +917,11 @@ def reconcile(root, config, value, cf, edge=True):
             sync_edge(cf, value)
             if changed:
                 raise ValueError('CF site inventory changed; stale rules cleaned, reconfigure CF mode')
+            if cf.get('mode')=='cloudflare' and cf.get('auth'):
+                migration=read(root,'ban-migration.json',{})
+                if migration.get('cfReentryRequired'):
+                    migration['cfReentryRequired']=False
+                    save(root,'ban-migration.json',migration)
     except Exception:
         save(root, 'ban-health.json', {'ok': False, 'checked': int(time.time()),
                                      'error': 'Ban enforcement synchronization failed'})
@@ -1117,11 +1122,6 @@ def configure_cf(root, auth=None, disable=False):
         # Keep desired configuration and credentials on failure so the scheduled
         # retry can repair partial remote writes; never falsely report healthy.
         save(root, 'ban-cf.json', cf)
-        if not disable:
-            migration=read(root,'ban-migration.json',{})
-            if migration.get('cfReentryRequired'):
-                migration['cfReentryRequired']=False
-                save(root,'ban-migration.json',migration)
         config = policy.validate(manage.load_json(root/'config/waf/policy.json'))
         reconcile(root, config, value, cf)
         if disable:

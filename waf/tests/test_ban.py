@@ -339,6 +339,19 @@ class BanTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):ban.configure_cf(self.root,disable=True)
         self.assertTrue(ban.status(self.root)['cleanupPending'])
 
+    def test_failed_cf_enable_preserves_reentry_requirement(self):
+        ban.save(self.root,'ban-migration.json',{'state':'legacy-imported','cfReentryRequired':True})
+        edge=Edge();edge.zones=lambda:{'example.com':ZONE}
+        with patch.object(ban,'status',return_value={'running':True}), \
+             patch.object(ban,'Cloudflare',return_value=edge), \
+             patch.object(ban,'sync_edge',side_effect=RuntimeError('unavailable')):
+            with self.assertRaises(RuntimeError):
+                ban.configure_cf(self.root,{'email':'','key':'x'*40})
+        self.assertTrue(ban.read(self.root,'ban-migration.json',{})['cfReentryRequired'])
+        with patch.object(ban,'sync_edge',return_value=None):
+            ban.change(self.root,'sync')
+        self.assertFalse(ban.read(self.root,'ban-migration.json',{})['cfReentryRequired'])
+
     def test_ticket_reconciliation_repairs_orphaned_manual_unban(self):
         value=copy.deepcopy(self.value)
         ban.reconcile_tickets(value,{'generation':0,'sources':{'attack':set(),'rate':set()}})
