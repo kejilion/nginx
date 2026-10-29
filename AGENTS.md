@@ -1,6 +1,7 @@
 # Nginx 与可选 WAF 协作规则
 
 - 本仓库面向 kejilion.sh / KPanel 生态。涉及性能、安全、镜像、模块、依赖或配置模板的变更，先读并遵循 [waf/PRINCIPLES.md](waf/PRINCIPLES.md)，操作入口与已验证范围见 [waf/README.md](waf/README.md)。
+- 网站防御、封禁与 CF 同步的跨仓维护执行入口为 [maintain-site-defense](.codex-workflows/maintain-site-defense.workflow.yaml)；它引用现有规范，不替代各仓库的授权与发布规则。
 - 以官方 Nginx 镜像为共同基线，WAF 是可选扩展。公共默认不能只适配试点网站；保留直连/CDN、原有开关和管理员自定义项，不顺带修改 KPanel 或替换现有架构。
 - 核对实际版本的官方文档、安全公告、依赖与特性采用状态；区分版本支持、配置启用、实际链路使用和经专项验证的收益。
 - 根据变更范围验证并记录取舍、余量、未覆盖项和恢复点。运行时发布按规范执行隔离验证、独立复核、已授权生产试点及公开消费回读；只改文档时检查差异、来源和链接，不机械重跑镜像或压力测试。
