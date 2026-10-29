@@ -141,6 +141,20 @@ include /etc/nginx/conf.d/*.conf;
         check('legacy-jails-retired','enabled = false' in (f2b/'jail.d/zz-kejilion-web-baseline.local').read_text())
         check('expiry-cron-installed','kejilion-waf-bans' in run('crontab','-l'))
         check('existing-cron-preserved','custom-task' in run('crontab','-l'))
+        # A pre-existing long-lived database ticket must prevent upgrading
+        # without replacing the working jail or its protection.
+        jail=f2b/'jail.d/zz-waf-managed.local';jail_before=jail.read_bytes()
+        with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+            db.execute('INSERT OR REPLACE INTO bips (ip,jail,timeofban,bantime,bancount,data) VALUES (?,?,?,?,?,?)',
+                       ('one.example.com|7.7.7.7','waf-attack',int(time.time()),172800,1,'{}'))
+        try:
+            tool('ban-install')
+            check('legacy-long-ticket-prevents-upgrade',False)
+        except RuntimeError as error:
+            check('legacy-long-ticket-prevents-upgrade','previous backend retained' in str(error))
+        check('legacy-long-ticket-keeps-working-jail',jail.read_bytes()==jail_before and json.loads(tool('ban-status'))['running'])
+        with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+            db.execute('DELETE FROM bips WHERE jail=? AND ip=?',('waf-attack','one.example.com|7.7.7.7'))
         # Exercise the actual observer with independently seeded, expired
         # history. No hostile traffic or public endpoint is involved.
         run('fail2ban-client','set','waf-attack','bantime','600')
@@ -212,6 +226,14 @@ include /etc/nginx/conf.d/*.conf;
                 return db.execute('SELECT timeofban,bantime FROM bips WHERE jail=? AND ip=?',
                                   ('waf-attack',attack_identity)).fetchone()
         wait('repeat-ban-uses-progressive-duration',lambda:progressive_ticket() is not None and progressive_ticket()[1]==360)
+        # Model a delayed/failed timer with an already expired action-stage
+        # projection while the real extended Fail2Ban ticket remains active.
+        saved=json.loads((state/'bans.json').read_text())
+        saved['records'][attack_identity]['attack']=int(time.time())-1
+        (state/'bans.json').write_text(json.dumps(saved))
+        run('fail2ban-client','set','waf-attack','banip','one.example.com|4.4.4.4')
+        wait('new-event-after-timer-failure-staged',lambda:'one.example.com|4.4.4.4' in json.loads((state/'bans.json').read_text())['records'])
+        check('new-event-preserves-unverified-extended-ban',request()==403 and attack_identity in json.loads((state/'bans.json').read_text())['records'])
         cron_command=(root/'crontab').read_text().split('* * * * * ',1)[1].split('\n',1)[0]
         run('sh','-c',cron_command)
         started,duration=progressive_ticket()

@@ -196,6 +196,40 @@ action = waf-unified-api[site=one.example.com]
             with self.assertRaisesRegex(ValueError,'Incomplete progressive'):
                 ban.progressive_expiries({'attack':{'two.example.com|8.8.8.8'}},['attack'])
 
+    def test_progressive_database_rejects_expired_previous_ticket(self):
+        dbpath=self.root/'fail2ban.sqlite3';now=int(time.time())
+        with sqlite3.connect(dbpath) as db:
+            db.execute('create table bips (jail text, ip text, timeofban integer, bantime integer)')
+            db.execute('insert into bips values (?,?,?,?)',('waf-attack','one.example.com|8.8.8.8',now-601,600))
+        with patch.object(ban,'fail2ban_database',return_value=dbpath):
+            with self.assertRaisesRegex(ValueError,'database is not current'):
+                ban.progressive_expiries({'attack':{'one.example.com|8.8.8.8'}},['attack'])
+
+    def test_progressive_older_future_ticket_does_not_shorten_new_ban(self):
+        now=int(time.time());identity='one.example.com|8.8.8.8'
+        value={'owner':OWNER,'generation':1,'records':{identity:{'attack':now+600}}}
+        snapshot={'generation':1,'sources':{'attack':{identity}},
+                  'expiries':{'attack':{identity:now+120}},'recoverable':set()}
+        self.assertTrue(ban.reconcile_tickets(value,snapshot))
+        self.assertEqual(value['records'][identity]['attack'],now+600)
+        self.assertTrue(value['ticketVerificationPending'])
+
+    def test_progressive_upgrade_rejects_active_long_and_permanent_legacy_tickets(self):
+        dbpath=self.root/'fail2ban.sqlite3';now=int(time.time())
+        with sqlite3.connect(dbpath) as db:
+            db.execute('create table bips (jail text, ip text, timeofban integer, bantime integer)')
+            db.execute('insert into bips values (?,?,?,?)',('waf-attack','one.example.com|8.8.8.8',now,172800))
+        with patch.object(ban,'fail2ban_database',return_value=dbpath):
+            with self.assertRaisesRegex(ValueError,'previous backend retained'):
+                ban.progressive_expiries({'attack':set()},['attack'],reject_legacy_active=True)
+            with sqlite3.connect(dbpath) as db:
+                db.execute('update bips set timeofban=?',(now-172801,))
+            self.assertEqual(ban.progressive_expiries({'attack':set()},['attack'],reject_legacy_active=True),{'attack':{}})
+            with sqlite3.connect(dbpath) as db:
+                db.execute('update bips set bantime=-1')
+            with self.assertRaisesRegex(ValueError,'previous backend retained'):
+                ban.progressive_expiries({'attack':set()},['attack'],reject_legacy_active=True)
+
     def test_progressive_reconcile_extends_and_recovers_tickets(self):
         now=int(time.time());identity='one.example.com|8.8.8.8';other='two.example.com|9.9.9.9'
         value={'owner':OWNER,'generation':1,'records':{identity:{'attack':now-1}}}
@@ -210,8 +244,63 @@ action = waf-unified-api[site=one.example.com]
         value={'owner':OWNER,'generation':2,'records':{identity:{'attack':now+600}}}
         snapshot={'generation':1,'sources':{'attack':{identity}},
                   'expiries':{'attack':{identity:now+3600}},'recoverable':set()}
-        ban.reconcile_tickets(value,snapshot)
+        self.assertFalse(ban.reconcile_tickets(value,snapshot))
         self.assertEqual(value['records'][identity]['attack'],now+600)
+
+    def test_progressive_event_retains_unverified_expiry_then_sync_restores_real_deadline(self):
+        now=int(time.time());old='one.example.com|8.8.8.8';new='one.example.com|9.9.9.9'
+        ban.save(self.root,'ban-migration.json',{'state':'current','progressiveSources':['attack']})
+        ban.save(self.root,'bans.json',{'owner':OWNER,'generation':1,'records':{old:{'attack':now-1}}})
+        self.event(ip='9.9.9.9',started=now)
+        value=ban.state(self.root)
+        self.assertGreater(value['records'][old]['attack'],now)
+        self.assertTrue(value['ticketVerificationPending'])
+        self.assertIn('"'+old+'" 1;', (self.root/'conf.d/waf/blocked.map').read_text())
+        actual=now+3600
+        snapshot={'generation':value['generation'],'sources':{'attack':{old,new}},
+                  'expiries':{'attack':{old:actual,new:now+600}},'recoverable':set()}
+        with patch.object(ban,'ticket_snapshot',return_value=snapshot):
+            ban.change(self.root,'sync')
+        self.assertEqual(ban.state(self.root)['records'][old]['attack'],actual)
+        self.assertFalse(ban.state(self.root).get('ticketVerificationPending',False))
+        ban.change(self.root,'unban',old,'attack')
+        self.assertNotIn(old,ban.state(self.root)['records'])
+
+    def test_progressive_sync_rejects_snapshot_after_concurrent_event(self):
+        now=int(time.time());old='one.example.com|8.8.8.8'
+        ban.save(self.root,'ban-migration.json',{'state':'current','progressiveSources':['attack']})
+        ban.save(self.root,'bans.json',{'owner':OWNER,'generation':2,'records':{old:{'attack':now+600}}})
+        snapshot={'generation':1,'sources':{'attack':set()},'expiries':{'attack':{}},'recoverable':set()}
+        with patch.object(ban,'ticket_snapshot',return_value=snapshot):
+            with self.assertRaisesRegex(ValueError,'changed during ticket verification'):
+                ban.change(self.root,'sync')
+        self.assertIn(old,ban.state(self.root)['records'])
+        self.assertFalse(ban.read(self.root,'ban-health.json',{})['ok'])
+
+    def test_progressive_cf_configuration_reports_unverified_tickets(self):
+        now=int(time.time());old='one.example.com|8.8.8.8'
+        ban.save(self.root,'ban-migration.json',{'state':'current','progressiveSources':['attack']})
+        ban.save(self.root,'bans.json',{'owner':OWNER,'generation':1,'records':{old:{'attack':now-1}}})
+        edge=Edge();edge.zones=lambda:{'example.com':ZONE}
+        with patch.object(ban,'Cloudflare',return_value=edge), patch.object(ban,'status',return_value={'running':True}):
+            ban.configure_cf(self.root,{'email':'','key':'x'*40})
+        self.assertTrue(ban.state(self.root)['ticketVerificationPending'])
+        self.assertFalse(ban.read(self.root,'ban-health.json',{})['ok'])
+        self.assertIn('8.8.8.8',edge.sets[ZONE]['rules'][0]['expression'])
+
+    def test_progressive_pending_ticket_is_not_reported_healthy(self):
+        jail=self.f2b/'jail.d/zz-waf-managed.local';jail.parent.mkdir(parents=True)
+        jail.write_text(ban.MARKER)
+        ban.save(self.root,'ban-migration.json',{'state':'current','progressiveSources':['attack']})
+        ban.save(self.root,'bans.json',{'owner':OWNER,'generation':1,'records':{},'ticketVerificationPending':True})
+        ban.save(self.root,'ban-health.json',{'ok':True,'checked':int(time.time()),'originGeneration':1,'syncedGeneration':1})
+        with patch.object(ban,'jail_action_loaded',return_value=True), \
+             patch.object(ban,'fail2ban_database'), \
+             patch.object(manage,'execute',return_value='true'):
+            result=ban.status(self.root)
+        self.assertTrue(result['running'])
+        self.assertFalse(result['healthy'])
+        self.assertTrue(result['pending'])
 
     def test_progressive_expiry_is_shared_by_origin_and_cf(self):
         jail=self.f2b/'jail.d/zz-waf-managed.local';jail.parent.mkdir(parents=True)

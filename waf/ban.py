@@ -779,6 +779,23 @@ def live_records(value, now):
             for key, sources in value['records'].items() if any(x > now for x in sources.values())}
 
 
+def hold_unverified_progressive(root,value):
+    """Do not expire a progressive ticket until a current snapshot proves it."""
+    migration=read(root,'ban-migration.json',{})
+    sources=migration.get('progressiveSources',[]) if isinstance(migration,dict) else []
+    if not isinstance(sources,list) or set(sources)-{'attack','rate','api'}:
+        raise ValueError('Invalid progressive source configuration')
+    now=int(time.time())
+    for entries in value['records'].values():
+        for source in sources:
+            if source in entries and entries[source]<=now:
+                # This is a provisional projection, not a new Fail2Ban ticket.
+                # A later verified snapshot or explicit unban restores the real
+                # deadline; persistent verification failure remains visible.
+                entries[source]=now+120
+                value['ticketVerificationPending']=True
+
+
 def merge_legacy_records(value, records):
     if len(set(value['records'])|set(records))>policy.MAX_BANS:
         raise ValueError('Combined legacy ban state exceeds the safe migration budget')
@@ -978,7 +995,9 @@ def origin(root, config, value):
         raise
 
 
-def reconcile(root, config, value, cf, edge=True):
+def reconcile(root, config, value, cf, edge=True, verified=False):
+    if not verified:
+        hold_unverified_progressive(root,value)
     value['records'] = live_records(value, int(time.time()))
     # Persist desired TTL state before changing either enforcement point. Cron
     # retries an interrupted or failed operation, including an overdue unban.
@@ -1008,7 +1027,7 @@ def reconcile(root, config, value, cf, edge=True):
                                      'error': 'Ban enforcement synchronization failed'})
         raise
     if edge:
-        save(root, 'ban-health.json', {'ok': True, 'checked': int(time.time()),
+        save(root, 'ban-health.json', {'ok': not value.get('ticketVerificationPending',False), 'checked': int(time.time()),
                                      'originGeneration':value.get('generation',0),'syncedGeneration':value.get('generation',0)})
     else:
         health=read(root,'ban-health.json',{'ok':False,'checked':0})
@@ -1023,6 +1042,7 @@ def stage(root, operation, identity, source, seconds, started):
     with manage.locked(root/'config/waf/ban.lock',timeout=90):
         config=policy.validate(manage.load_json(root/'config/waf/policy.json'))
         value=state(root)
+        hold_unverified_progressive(root,value)
         value['records']=live_records(value,int(time.time()))
         site,address=policy.key(identity)
         identity=site+'|'+address
@@ -1125,7 +1145,7 @@ def fail2ban_database():
     return path
 
 
-def progressive_expiries(raw_sources, progressive_sources):
+def progressive_expiries(raw_sources, progressive_sources, reject_legacy_active=False):
     """Read actual observer-adjusted ticket expiry; F2B action bantime is the base."""
     if not progressive_sources:
         return {}
@@ -1138,6 +1158,17 @@ def progressive_expiries(raw_sources, progressive_sources):
         if not {'jail','ip','timeofban','bantime'}<=columns:
             raise ValueError('Unsupported Fail2Ban database schema')
         for source in progressive_sources:
+            if reject_legacy_active:
+                # Check every still-valid historical row, not just our snapshot:
+                # old effective/global policies can leave longer live tickets.
+                # Reading SQLite here avoids Fail2Ban RPC while holding the
+                # install lock, which can deadlock against an action callback.
+                unsafe=db.execute('SELECT 1 FROM bips WHERE jail=? AND '
+                                  '(bantime<0 OR (bantime>? AND timeofban+bantime>?)) LIMIT 1',
+                                  (source_jail(source),MAX_LEGACY_EXPIRY,int(time.time()))).fetchone()
+                if unsafe:
+                    raise ValueError('Existing long or permanent '+source_jail(source)+
+                                     ' ticket requires explicit migration; previous backend retained')
             tickets=sorted(raw_sources.get(source,set()))
             values={}
             for offset in range(0,len(tickets),200):
@@ -1148,6 +1179,8 @@ def progressive_expiries(raw_sources, progressive_sources):
                         raise ValueError('Invalid progressive ticket metadata')
                     if started>time.time()+5:
                         raise ValueError('Invalid progressive ticket time')
+                    if started+duration<=time.time():
+                        raise ValueError('Progressive ticket database is not current')
                     values[key]=started+duration
             if set(tickets)!=set(values):
                 raise ValueError('Incomplete progressive ticket metadata')
@@ -1200,7 +1233,8 @@ def ticket_snapshot(root):
 
 def reconcile_tickets(value,snapshot):
     if snapshot is None or value.get('generation',0)!=snapshot['generation']:
-        return
+        return False
+    uncertain=False
     for identity,sources in value['records'].items():
         for source in list(sources):
             if source!='legacy' and source in snapshot['sources'] and identity not in snapshot['sources'][source]:
@@ -1211,6 +1245,11 @@ def reconcile_tickets(value,snapshot):
                 if expiry is not None and expiry>sources[source]:
                     sources[source]=expiry
                     value['generation']=value.get('generation',0)+1
+                elif expiry is not None and expiry<sources[source]:
+                    # A bips row can still describe the previous ticket while
+                    # the observer is asynchronously processing a new one.
+                    # Never shorten an enforcement projection on that basis.
+                    uncertain=True
     for source,identity in snapshot.get('recoverable',set()):
         expiry=snapshot['expiries'][source][identity]
         if expiry>time.time() and source not in value['records'].get(identity,{}):
@@ -1218,6 +1257,9 @@ def reconcile_tickets(value,snapshot):
                 raise ValueError('Ban budget exceeded during ticket recovery')
             value['records'].setdefault(identity,{})[source]=expiry
             value['generation']=value.get('generation',0)+1
+    if uncertain:value['ticketVerificationPending']=True
+    else:value.pop('ticketVerificationPending',None)
+    return True
 
 
 def change(root, operation, identity=None, source=None, seconds=None, lock_held=False, started=None):
@@ -1245,13 +1287,21 @@ def _change(root,operation,lock_held,snapshot):
         if config.get('banBackend') != 'existing' and operation not in {'clear','sync'}:
             raise ValueError('Unified origin ban hook is not enabled')
         value = state(root)
-        if operation=='sync':
-            reconcile_tickets(value,snapshot)
+        verified=False
+        if operation=='sync' and snapshot is not None:
+            if not reconcile_tickets(value,snapshot):
+                save(root,'ban-health.json',{'ok':False,'checked':int(time.time()),
+                                            'error':'Ban state changed during ticket verification'})
+                raise ValueError('Ban state changed during ticket verification; retry sync')
+            verified=True
+        if operation!='clear' and not verified:
+            hold_unverified_progressive(root,value)
         value['records'] = live_records(value, int(time.time()))
         cf = read(root, 'ban-cf.json', {'mode': 'local'})
         if operation == 'clear':
             value['records'] = {}
-        reconcile(root, config, value, cf, edge=operation in {'sync','clear'})
+            value.pop('ticketVerificationPending',None)
+        reconcile(root, config, value, cf, edge=operation in {'sync','clear'},verified=verified or operation=='clear')
 
 
 def configure_cf(root, auth=None, disable=False):
@@ -1382,10 +1432,11 @@ def status(root):
             running = True
         except Exception:
             pass
-    healthy = health.get('ok') is True and 0 <= int(time.time())-health.get('checked', 0) <= 180
     value=state(root)
+    healthy = (health.get('ok') is True and not value.get('ticketVerificationPending',False) and
+               0 <= int(time.time())-health.get('checked', 0) <= 180)
     healthy=healthy and health.get('originGeneration')==value.get('generation',0)
-    pending=health.get('syncedGeneration')!=value.get('generation',0)
+    pending=health.get('syncedGeneration')!=value.get('generation',0) or value.get('ticketVerificationPending') is True
     migration=migration_status(root)
     return {'mode': cf['mode'], 'cleanupPending':cf['mode']=='local' and bool(cf.get('auth')),
             'configured': configured, 'running': running,
@@ -1498,7 +1549,8 @@ def _install(root):
     content,progressive_sources=progressive_jail_content(content,plan['apiJail'])
     if progressive_sources:
         # Verify DB support before changing any production files or services.
-        progressive_expiries({source:set() for source in progressive_sources},progressive_sources)
+        progressive_expiries({source:set() for source in progressive_sources},progressive_sources,
+                             reject_legacy_active=True)
     files = {jail: content.encode(), F2B/'action.d/waf-unified.conf': action.encode(),
              F2B/'jail.d/zz-kejilion-web-baseline.local': (manage.BUNDLE/'legacy-jails.local').read_bytes()}
     api_site=plan['apiJail'].get('site') if plan['apiJail'] else None
@@ -1555,6 +1607,8 @@ def _install(root):
         manage.execute('fail2ban-client', 'reload')
         ensure_jail_actions(migration)
         verify_progressive_jails(migration)
+        progressive_expiries({source:set() for source in progressive_sources},progressive_sources,
+                             reject_legacy_active=True)
         change(root,'sync',lock_held=True)
         set_cron(cron_text)
     def restore_fail2ban():
