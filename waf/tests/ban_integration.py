@@ -6,6 +6,7 @@ installed as a host service. A private crontab shim isolates schedule writes.
 Never run against production; all HTTP goes through a private Unix socket.
 """
 import argparse
+import datetime
 import http.client
 import json
 import os
@@ -137,6 +138,33 @@ include /etc/nginx/conf.d/*.conf;
         check('legacy-jails-retired','enabled = false' in (f2b/'jail.d/zz-kejilion-web-baseline.local').read_text())
         check('expiry-cron-installed','kejilion-waf-bans' in run('crontab','-l'))
         check('existing-cron-preserved','custom-task' in run('crontab','-l'))
+        # Reproduce a real Fail2Ban reload that loses a newly named action.
+        # Installation must detect it, recover only that jail and keep tickets.
+        ticket='one.example.com|4.2.2.2'
+        run('fail2ban-client','set','waf-attack','banip',ticket)
+        wait('ticket-before-action-repair',lambda:ticket in json.loads((state/'bans.json').read_text())['records'])
+        ticket_before=run('fail2ban-client','get','waf-attack','banip','--with-time')
+        run('fail2ban-client','set','waf-attack','delaction','waf-unified')
+        check('action-removed-for-reproduction','waf-unified' not in run('fail2ban-client','get','waf-attack','actions').splitlines())
+        tool('ban-install')
+        check('missing-action-automatically-recovered','waf-unified' in run('fail2ban-client','get','waf-attack','actions').splitlines())
+        check('action-repair-preserves-live-ticket',ticket in run('fail2ban-client','get','waf-attack','banip').split())
+        ticket_after=run('fail2ban-client','get','waf-attack','banip','--with-time')
+        fmt='%Y-%m-%d %H:%M:%S'
+        expires_before=datetime.datetime.strptime(ticket_before.rsplit(' = ',1)[1].strip(),fmt)
+        expires_after=datetime.datetime.strptime(ticket_after.rsplit(' = ',1)[1].strip(),fmt)
+        check('action-repair-preserves-ticket-expiry',
+              abs((expires_after-expires_before).total_seconds())<=1)
+        failure.touch()
+        try:
+            tool('ban-install')
+            check('reinstall-failure-is-reported',False)
+        except RuntimeError:
+            check('reinstall-failure-is-reported',True)
+        check('failed-reinstall-restores-action','waf-unified' in run('fail2ban-client','get','waf-attack','actions').splitlines())
+        check('failed-reinstall-preserves-ticket',ticket in run('fail2ban-client','get','waf-attack','banip').split())
+        tool('ban-clear')
+        inject_identity()
         # Ordinary application errors never enter attack/rate event counters.
         for _ in range(12):check('business-403',request(path='/business403')==403)
         check('business-errors-not-banned',request()==200)

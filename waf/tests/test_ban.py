@@ -75,6 +75,47 @@ class BanTests(unittest.TestCase):
     def event(self,ip='8.8.8.8',site='one.example.com',source='attack',seconds=600,started=None):
         ban.change(self.root,'ban',site+'|'+ip,source,seconds,started=time.time() if started is None else started)
 
+    def test_missing_actions_restart_only_affected_jail(self):
+        actions={'waf-attack':['waf-unified'],'waf-rate':[],'waf-api-invalid':['waf-unified-api']}
+        calls=[]
+        def execute(*args):
+            calls.append(args)
+            if args[1:3]==('get','waf-rate'):
+                return '\n'.join(actions['waf-rate'])
+            if args[1]=='get':
+                return '\n'.join(actions[args[2]])
+            if args[1:3]==('reload','--restart'):
+                actions[args[3]]=['waf-unified']
+            return ''
+        with patch.object(manage,'execute',side_effect=execute):
+            ban.ensure_jail_actions({'apiJailEnabled':True,'apiSite':'one.example.com'})
+        self.assertEqual([c for c in calls if c[1]=='reload'],[('fail2ban-client','reload','--restart','waf-rate')])
+
+    def test_failed_action_recovery_is_an_error(self):
+        def execute(*args):
+            return 'No actions for jail' if args[1:2]==('get',) and args[-1]=='actions' else ''
+        with patch.object(manage,'execute',side_effect=execute):
+            with self.assertRaisesRegex(ValueError,'Fail2Ban action not loaded'):
+                ban.ensure_jail_actions({})
+
+    def test_recovery_refuses_to_drop_tickets_when_database_is_disabled(self):
+        def execute(*args):
+            if args[1:]==('get','waf-attack','banip'):return 'one.example.com|8.8.8.8'
+            if args[1:]==('get','dbfile'):return 'Current database file is:\n`- None\n'
+            return ''
+        with patch.object(manage,'execute',side_effect=execute) as execute_mock:
+            with self.assertRaisesRegex(ValueError,'without a Fail2Ban database'):
+                ban.ensure_jail_actions({})
+        self.assertFalse(any(c.args[1:3]==('reload','--restart') for c in execute_mock.call_args_list))
+
+    def test_status_rejects_jails_without_live_actions(self):
+        jail=self.f2b/'jail.d/zz-waf-managed.local';jail.parent.mkdir(parents=True)
+        jail.write_text(ban.MARKER)
+        with patch.object(manage,'execute',return_value='No actions for jail'):
+            result=ban.status(self.root)
+        self.assertFalse(result['running'])
+        self.assertFalse(result['healthy'])
+
     def test_site_isolation_and_origin_hook(self):
         self.event()
         text=(self.root/'conf.d/waf/blocked.map').read_text()
@@ -279,7 +320,7 @@ class BanTests(unittest.TestCase):
         jail.write_text(ban.MARKER)
         edge=Edge();edge.zones=lambda:{'example.com':ZONE}
         before=(self.root/'config/waf/policy.json').read_bytes()
-        with patch.object(ban,'Cloudflare',return_value=edge):
+        with patch.object(ban,'Cloudflare',return_value=edge),patch.object(ban,'jail_action_loaded',return_value=True):
             ban.configure_cf(self.root,{'email':'','key':'x'*40})
             self.event()
             self.assertEqual(edge.sets[ZONE]['rules'][0]['expression'],'false')

@@ -1126,6 +1126,56 @@ def configure_cf(root, auth=None, disable=False):
     return status(root)
 
 
+def required_jail_actions(migration):
+    actions={'waf-attack':'waf-unified','waf-rate':'waf-unified'}
+    if migration.get('apiJailEnabled'):
+        actions['waf-api-invalid']='waf-unified-api' if migration.get('apiSite') else 'waf-unified'
+    return actions
+
+
+def live_jail_actions(jail):
+    manage.execute('fail2ban-client','status',jail)
+    output=manage.execute('fail2ban-client','get',jail,'actions')
+    return {line.strip() for line in output.splitlines()
+            if re.fullmatch(r'[A-Za-z0-9_.-]+',line.strip())}
+
+
+def jail_action_loaded(jail, action):
+    return action in live_jail_actions(jail)
+
+
+def recover_jail_actions(jail,expected):
+    # Fail2Ban can discard a newly named action during an ordinary reload.
+    # Restart only an affected jail, without --unban, so database tickets can
+    # be restored with their original expiry. Never restart unrelated jails.
+    if expected and not expected<=live_jail_actions(jail):
+        before=set(manage.execute('fail2ban-client','get',jail,'banip').split())
+        if len(before)>policy.MAX_BANS:
+            raise ValueError('Fail2Ban ticket budget exceeded for '+jail)
+        if before:
+            database=manage.execute('fail2ban-client','get','dbfile').strip().splitlines()
+            dbpath=re.fullmatch(r'(?:[`|]-\s*)?(/[^\r\n]+)',database[-1].strip()) if database else None
+            if not dbpath or not Path(dbpath.group(1)).is_file():
+                raise ValueError('Cannot recover active tickets without a Fail2Ban database for '+jail)
+        manage.execute('fail2ban-client','reload','--restart',jail)
+        if not expected<=live_jail_actions(jail):
+            raise ValueError('Fail2Ban action not loaded for '+jail)
+        if before:
+            deadline=time.monotonic()+5
+            while True:
+                after=set(manage.execute('fail2ban-client','get',jail,'banip').split())
+                if before<=after:
+                    break
+                if time.monotonic()>=deadline:
+                    raise ValueError('Fail2Ban tickets changed during recovery for '+jail)
+                time.sleep(.2)
+
+
+def ensure_jail_actions(migration):
+    for jail,action in required_jail_actions(migration).items():
+        recover_jail_actions(jail,{action})
+
+
 def status(root):
     cf = read(root, 'ban-cf.json', {'mode': 'local'})
     health = read(root, 'ban-health.json', {'ok': False, 'checked': 0})
@@ -1135,11 +1185,9 @@ def status(root):
     if configured:
         try:
             migration=read(root,'ban-migration.json',{})
-            required=['waf-attack','waf-rate']
-            if migration.get('apiJailEnabled'):
-                required.append('waf-api-invalid')
-            for name in required:
-                manage.execute('fail2ban-client', 'status', name)
+            for name,action in required_jail_actions(migration).items():
+                if not jail_action_loaded(name,action):
+                    raise ValueError('Fail2Ban action not loaded for '+name)
             running = True
         except Exception:
             pass
@@ -1215,6 +1263,13 @@ def _install(root):
     config = policy.validate(manage.load_json(root/'config/waf/policy.json'))
     if not __import__('shutil').which('fail2ban-client') or not __import__('shutil').which('crontab'):
         raise ValueError('Install Fail2Ban and enable the existing cron service first')
+    previous_actions={}
+    for jail_name in ('waf-attack','waf-rate','waf-api-invalid'):
+        try:
+            manage.execute('fail2ban-client','status',jail_name)
+        except RuntimeError:
+            continue  # A new installation may not have this jail yet.
+        previous_actions[jail_name]=live_jail_actions(jail_name)
     json.loads(manage.execute('ip','-j','address','show'))
     directory = root/'conf.d/waf'
     runner = directory/'ban.py'
@@ -1301,10 +1356,13 @@ def _install(root):
         manage.execute('fail2ban-client', '-t')
         change(root, 'sync',lock_held=True)
         manage.execute('fail2ban-client', 'reload')
+        ensure_jail_actions(migration)
         change(root,'sync',lock_held=True)
-        for name in ['waf-attack', 'waf-rate']+(['waf-api-invalid'] if migration['apiJailEnabled'] else []):
-            manage.execute('fail2ban-client', 'status', name)
         set_cron(cron_text)
+    def restore_fail2ban():
+        manage.execute('fail2ban-client','reload')
+        for jail_name,actions in previous_actions.items():
+            recover_jail_actions(jail_name,actions)
     try:
         if plan['requiresMigration'] and plan['reconciler']['recognized']:
             set_legacy_reconciler(plan,False)
@@ -1331,7 +1389,7 @@ def _install(root):
                         lambda:set_cron(cron.stdout),
                         lambda:manage.restore(root,Path(policy_result['backup'])) if policy_result and policy_result.get('backup') else None,
                         lambda:manage.reload_nginx(config_before['container']) if policy_result else None,
-                        lambda:manage.execute('fail2ban-client','reload'),
+                        restore_fail2ban,
                         lambda:set_legacy_reconciler(plan,True) if reconciler_stopped else None]:
             try:restore()
             except Exception as error:errors.append(type(error).__name__)
