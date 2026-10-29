@@ -16,9 +16,11 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -35,6 +37,15 @@ LEGACY_MARKER = '# Managed shared WAF; only trusted defence events, isolated by 
 DISABLED = MARKER+'[waf-attack]\nenabled = false\n[waf-rate]\nenabled = false\n[waf-api-invalid]\nenabled = false\n'
 MAX_EXPRESSION = 4096
 MAX_LEGACY_EXPIRY = 24 * 60 * 60
+PROGRESSIVE_MARKER = '# Managed WAF progressive bans v1'
+PROGRESSIVE_OPTIONS = {
+    'bantime.increment':'true',
+    'bantime.factor':'1',
+    'bantime.multipliers':'1 6 36 144',
+    'bantime.maxtime':'86400',
+    'bantime.overalljails':'false',
+    'bantime.rndtime':'0',
+}
 F2B = Path('/etc/fail2ban')
 LEGACY_RECONCILER = Path('/etc/systemd/system/kejilion-waf.service')
 LEGACY_CF_ACTION = F2B/'action.d/cloudflare-docker.conf'
@@ -335,11 +346,28 @@ def validate_managed_jail(text,allow_unmarked_legacy=False,root=Path('/home/web'
                 raise ValueError('Unsupported jail threshold: '+field) from None
             if not low<=value<=high:
                 raise ValueError('Unsupported jail threshold: '+field)
-        if parsed.getboolean(section,'bantime.increment',fallback=False):
-            raise ValueError('Incremental bans are outside the bounded unified policy')
+        validate_progressive_settings(parsed,section)
     if not present:
         raise ValueError('Managed jail is incomplete; previous backend retained')
     return parsed
+
+
+def validate_progressive_settings(parsed,section):
+    try:
+        enabled=parsed.getboolean(section,'bantime.increment',fallback=False)
+        if not enabled:return
+        maximum=parsed.getint(section,'bantime.maxtime',fallback=0)
+        factor=parsed.get(section,'bantime.factor',fallback='1').strip()
+        multipliers=parsed.get(section,'bantime.multipliers',fallback='').split()
+        overall=parsed.getboolean(section,'bantime.overalljails',fallback=False)
+        random=parsed.getint(section,'bantime.rndtime',fallback=0)
+    except (ValueError,configparser.Error):
+        raise ValueError('Unsupported progressive ban configuration') from None
+    if (not 60<=maximum<=MAX_LEGACY_EXPIRY or factor!='1' or overall or random!=0 or
+        not 1<=len(multipliers)<=8 or any(not x.isdigit() or not 1<=int(x)<=1440 for x in multipliers) or
+        [int(x) for x in multipliers]!=sorted(int(x) for x in multipliers) or
+        parsed.has_option(section,'bantime.formula')):
+        raise ValueError('Unsupported progressive ban configuration')
 
 
 def api_jail():
@@ -375,13 +403,14 @@ def api_jail():
             raise ValueError('Unexpected managed API jail override; previous backend retained')
         override=parse_jail(managed_text)
         api_action=override.get('waf-api-invalid','action',fallback='').strip()
-        api_options=set(override.options('waf-api-invalid'))
+        api_options=set(override._sections.get('waf-api-invalid',{}))
         legacy_api_options={'action','enabled','filter','logpath','maxretry','findtime','bantime','bantime.increment'}
         scoped_action=re.fullmatch(r'waf-unified-api\[site=([A-Za-z0-9_.-]+)\]',api_action)
-        current_api_options=legacy_api_options if not sources else {'action'}
+        current_api_options=legacy_api_options|set(PROGRESSIVE_OPTIONS) if not sources else {'action'}|set(PROGRESSIVE_OPTIONS)
         if (marker=='current' and ((api_action!='waf-unified[source=api]' and not scoped_action) or not api_options<=current_api_options)) or (
                 marker=='legacy' and not api_options<=legacy_api_options):
             raise ValueError('Unexpected managed API jail override; previous backend retained')
+        validate_progressive_settings(override,'waf-api-invalid')
     if sources:
         path,text,parsed=sources[0]
     else:
@@ -413,17 +442,16 @@ def api_jail():
         except ValueError:raise ValueError('Invalid API jail threshold: '+field) from None
         if not low<=value<=high:
             raise ValueError('Invalid API jail threshold: '+field)
-    try:
-        incremental=parsed.getboolean(section,'bantime.increment',fallback=False)
-    except ValueError:
-        raise ValueError('Invalid API jail bantime.increment setting') from None
-    if incremental:
-        raise ValueError('Incremental API jail bans are outside the bounded unified policy')
+    validate_progressive_settings(parsed,section)
     try:enabled=parsed.getboolean(section,'enabled',fallback=False)
     except ValueError:raise ValueError('Invalid API jail enabled state') from None
-    if path==managed_path:
-        return {'path':path,'enabled':enabled,'action':action,'text':text,'managed':True,'site':site}
-    return {'path':path,'enabled':enabled,'action':action,'text':text,'site':site}
+    own=parsed._sections.get(section,{})
+    custom_progression=any(k.startswith('bantime.') and k!='bantime.increment' for k in own)
+    info={'path':path,'enabled':enabled,'action':action,'text':text,'site':site,
+          'customProgression':custom_progression,
+          'progressive':parsed.getboolean(section,'bantime.increment',fallback=False)}
+    if path==managed_path:info['managed']=True
+    return info
 
 
 def legacy_reconciler_state():
@@ -637,6 +665,59 @@ def managed_jail_content(previous,api,root=Path('/home/web'),defaults=None):
         api_action=('waf-unified-api[site='+api['site']+']' if api.get('site') else 'waf-unified[source=api]')
         content+='\n[waf-api-invalid]\naction = '+api_action+'\n'
     return content
+
+
+def progressive_jail_content(content,api):
+    """Enable bounded defaults once while preserving explicit custom policies."""
+    parsed=parse_jail(content)
+    marked=PROGRESSIVE_MARKER in content.splitlines()
+    chosen=set()
+    custom_keys=set(PROGRESSIVE_OPTIONS)-{'bantime.increment'}
+    inherited_custom=bool(custom_keys & set(parsed.defaults()))
+    for section in ('waf-attack','waf-rate','waf-api-invalid'):
+        if not parsed.has_section(section):continue
+        own=parsed._sections.get(section,{})
+        if section=='waf-api-invalid' and api and api.get('customProgression') and not any(k in own for k in custom_keys):
+            continue
+        if inherited_custom or any(k in own for k in custom_keys):continue
+        if marked and 'bantime.increment' in own:continue
+        if parsed.getboolean(section,'bantime.increment',fallback=False):continue
+        chosen.add(section)
+    lines=content.splitlines(keepends=True)
+    output=[];section=''
+    for line in lines:
+        header=re.match(r'^\s*\[([^\]]+)\]',line)
+        if header:
+            section=header[1].strip().lower();output.append(line)
+            if section in chosen:
+                ending='\r\n' if line.endswith('\r\n') else '\n'
+                if not line.endswith(('\r','\n')):output[-1]=line+ending
+                output.extend(k+' = '+v+ending for k,v in PROGRESSIVE_OPTIONS.items())
+            continue
+        if section in chosen and re.match(r'^\s*bantime\.increment\s*[=:]',line,re.I):continue
+        output.append(line)
+    result=''.join(output)
+    if not marked:
+        lines=result.splitlines(keepends=True)
+        for i,line in enumerate(lines):
+            if line.strip().removeprefix('\ufeff')==MARKER.strip():
+                ending='\r\n' if line.endswith('\r\n') else '\n'
+                if not line.endswith(('\r','\n')):lines[i]=line+ending
+                lines.insert(i+1,PROGRESSIVE_MARKER+ending);break
+        else:raise ValueError('Managed WAF marker missing')
+        result=''.join(lines)
+    result_parsed=parse_jail(result)
+    sources=[]
+    for section,source in (('waf-attack','attack'),('waf-rate','rate'),('waf-api-invalid','api')):
+        if not result_parsed.has_section(section):continue
+        if source=='api' and api and not api.get('enabled'):continue
+        fallback=bool(api and api.get('progressive')) if source=='api' else False
+        if result_parsed.getboolean(section,'bantime.increment',fallback=fallback):
+            if not (source=='api' and api and api.get('customProgression') and
+                    'bantime.increment' not in result_parsed._sections.get(section,{})):
+                validate_progressive_settings(result_parsed,section)
+            sources.append(source)
+    return result,sources
 
 
 def private_snapshot(paths):
@@ -1031,24 +1112,88 @@ def query_tickets(source):
     return tickets
 
 
+def fail2ban_database():
+    output=manage.execute('fail2ban-client','get','dbfile').strip().splitlines()
+    match=re.fullmatch(r'(?:[`|]-\s*)?(/[^\r\n]+)',output[-1].strip()) if output else None
+    if not match:
+        raise ValueError('Fail2Ban persistent database is unavailable')
+    path=Path(match.group(1))
+    manage.safe_parent(path)
+    info=path.lstat()
+    if path.is_symlink() or not path.is_file() or info.st_uid!=os.geteuid() or info.st_mode&0o022:
+        raise ValueError('Fail2Ban database is not trusted')
+    return path
+
+
+def progressive_expiries(raw_sources, progressive_sources):
+    """Read actual observer-adjusted ticket expiry; F2B action bantime is the base."""
+    if not progressive_sources:
+        return {}
+    path=fail2ban_database()
+    uri='file:'+urllib.parse.quote(str(path),safe='/')+'?mode=ro'
+    result={}
+    with contextlib.closing(sqlite3.connect(uri,uri=True,timeout=5)) as db:
+        db.execute('PRAGMA query_only=ON')
+        columns={row[1] for row in db.execute('PRAGMA table_info(bips)')}
+        if not {'jail','ip','timeofban','bantime'}<=columns:
+            raise ValueError('Unsupported Fail2Ban database schema')
+        for source in progressive_sources:
+            tickets=sorted(raw_sources.get(source,set()))
+            values={}
+            for offset in range(0,len(tickets),200):
+                chunk=tickets[offset:offset+200]
+                sql='SELECT ip,timeofban,bantime FROM bips WHERE jail=? AND ip IN ('+','.join('?' for _ in chunk)+')'
+                for key,started,duration in db.execute(sql,[source_jail(source),*chunk]):
+                    if key in values or type(started) is not int or type(duration) is not int or not 1<=duration<=MAX_LEGACY_EXPIRY:
+                        raise ValueError('Invalid progressive ticket metadata')
+                    if started>time.time()+5:
+                        raise ValueError('Invalid progressive ticket time')
+                    values[key]=started+duration
+            if set(tickets)!=set(values):
+                raise ValueError('Incomplete progressive ticket metadata')
+            result[source]=values
+    return result
+
+
 def ticket_snapshot(root):
     # RPC must stay outside configuration/ban locks: a simultaneous unban can
     # wait for its action process, which itself needs those locks.
-    generation=state(root).get('generation',0)
+    saved_state=state(root)
+    generation=saved_state.get('generation',0)
     try:
         sources={source:query_tickets(source) for source in configured_sources(root)}
+        migration=read(root,'ban-migration.json',{})
+        progressive=migration.get('progressiveSources',[]) if isinstance(migration,dict) else []
+        if not isinstance(progressive,list) or len(progressive)!=len(set(progressive)) or set(progressive)-set(sources):
+            raise ValueError('Invalid progressive source configuration')
+        expiries=progressive_expiries(sources,progressive)
         if 'api' in sources:
-            migration=read(root,'ban-migration.json',{})
             api_site=migration.get('apiSite') if isinstance(migration,dict) else None
             converted=set()
             for ticket in sources['api']:
                 if '|' not in ticket:
                     if not api_site:raise ValueError('Missing API ticket site')
+                    original=ticket
                     ticket=policy.scope(api_site)+'|'+str(ipaddress.ip_address(ticket))
+                    if 'api' in expiries:expiries['api'][ticket]=expiries['api'].pop(original)
                 policy.key(ticket)
                 converted.add(ticket)
             sources['api']=converted
-        return {'generation':generation,'sources':sources}
+        missing={(source,identity) for source,entries in expiries.items() for identity,expiry in entries.items()
+                 if expiry>time.time() and source not in saved_state['records'].get(identity,{})}
+        recoverable=set()
+        if missing:
+            config=policy.validate(manage.load_json(root/'config/waf/policy.json'))
+            protected=policy.networks(manage.load_json(root/'config/waf/cloudflare-ips.json'))
+            protected+=config.get('trustedProxies',[])+config.get('banIgnore',[])
+            protected += [p for s in config['sites'].values() for p in s.get('trustedProxies',[])]
+            local=json.loads(manage.execute('ip','-j','address','show'))
+            protected += [a['local'] for interface in local for a in interface.get('addr_info',[])]
+            sites=inventory(root)
+            for source,identity in missing:
+                site,address=policy.key(identity)
+                if site in sites and policy.eligible(address,protected):recoverable.add((source,identity))
+        return {'generation':generation,'sources':sources,'expiries':expiries,'recoverable':recoverable}
     except Exception:
         return None  # Unavailable/restarting jail is not proof of a removal.
 
@@ -1061,6 +1206,18 @@ def reconcile_tickets(value,snapshot):
             if source!='legacy' and source in snapshot['sources'] and identity not in snapshot['sources'][source]:
                 sources.pop(source)
                 value['generation']=value.get('generation',0)+1
+            elif source in snapshot.get('expiries',{}):
+                expiry=snapshot['expiries'][source].get(identity)
+                if expiry is not None and expiry>sources[source]:
+                    sources[source]=expiry
+                    value['generation']=value.get('generation',0)+1
+    for source,identity in snapshot.get('recoverable',set()):
+        expiry=snapshot['expiries'][source][identity]
+        if expiry>time.time() and source not in value['records'].get(identity,{}):
+            if identity not in value['records'] and len(value['records'])>=policy.MAX_BANS:
+                raise ValueError('Ban budget exceeded during ticket recovery')
+            value['records'].setdefault(identity,{})[source]=expiry
+            value['generation']=value.get('generation',0)+1
 
 
 def change(root, operation, identity=None, source=None, seconds=None, lock_held=False, started=None):
@@ -1068,6 +1225,11 @@ def change(root, operation, identity=None, source=None, seconds=None, lock_held=
         stage(root,operation,identity,source,seconds,started)
         operation='local'
     snapshot=ticket_snapshot(root) if operation=='sync' and not lock_held else None
+    if operation=='sync' and not lock_held and snapshot is None and read(root,'ban-migration.json',{}).get('progressiveSources'):
+        with manage.locked(root/'config/waf/ban.lock',timeout=10):
+            save(root,'ban-health.json',{'ok':False,'checked':int(time.time()),
+                                        'error':'Progressive ticket verification failed'})
+        raise ValueError('Cannot verify progressive tickets; previous enforcement retained')
     try:
         return _change(root,operation,lock_held,snapshot)
     except RuntimeError as error:
@@ -1083,9 +1245,9 @@ def _change(root,operation,lock_held,snapshot):
         if config.get('banBackend') != 'existing' and operation not in {'clear','sync'}:
             raise ValueError('Unified origin ban hook is not enabled')
         value = state(root)
-        value['records'] = live_records(value, int(time.time()))
         if operation=='sync':
             reconcile_tickets(value,snapshot)
+        value['records'] = live_records(value, int(time.time()))
         cf = read(root, 'ban-cf.json', {'mode': 'local'})
         if operation == 'clear':
             value['records'] = {}
@@ -1179,18 +1341,44 @@ def ensure_jail_actions(migration):
         recover_jail_actions(jail,{action})
 
 
+def verify_progressive_jails(migration):
+    enabled=set(migration.get('progressiveSources',[]))
+    for source in ('attack','rate')+ (('api',) if migration.get('apiJailEnabled') else ()):
+        jail=source_jail(source)
+        value=manage.execute('fail2ban-client','get',jail,'bantime.increment').strip().lower()
+        if value not in {'true','false'} or (value=='true')!=(source in enabled):
+            raise ValueError('Fail2Ban progressive setting mismatch for '+jail)
+        if source in enabled:
+            fields={key:manage.execute('fail2ban-client','get',jail,'bantime.'+key).strip()
+                    for key in ('factor','multipliers','maxtime','overalljails','rndtime')}
+            probe=configparser.RawConfigParser(interpolation=None)
+            probe.add_section(jail)
+            probe.set(jail,'bantime.increment','true')
+            for key,value in fields.items():probe.set(jail,'bantime.'+key,value)
+            validate_progressive_settings(probe,jail)
+
+
 def status(root):
     cf = read(root, 'ban-cf.json', {'mode': 'local'})
     health = read(root, 'ban-health.json', {'ok': False, 'checked': 0})
     jail = F2B/'jail.d/zz-waf-managed.local'
     configured = jail.exists() and managed_jail_marker(manage.read_config(jail))=='current'
     running = False
+    progressive=[]
     if configured:
         try:
             migration=read(root,'ban-migration.json',{})
             for name,action in required_jail_actions(migration).items():
                 if not jail_action_loaded(name,action):
                     raise ValueError('Fail2Ban action not loaded for '+name)
+            progressive=migration.get('progressiveSources',[])
+            if not isinstance(progressive,list) or set(progressive)-set(configured_sources(root)):
+                raise ValueError('Invalid progressive source configuration')
+            if progressive:
+                fail2ban_database()
+                for source in progressive:
+                    if manage.execute('fail2ban-client','get',source_jail(source),'bantime.increment').strip().lower()!='true':
+                        raise ValueError('Fail2Ban progressive setting mismatch')
             running = True
         except Exception:
             pass
@@ -1202,6 +1390,7 @@ def status(root):
     return {'mode': cf['mode'], 'cleanupPending':cf['mode']=='local' and bool(cf.get('auth')),
             'configured': configured, 'running': running,
             'healthy': healthy and running, 'pending': pending,
+            'progressiveSources':progressive,
             'activeBans': len(live_records(value, int(time.time()))),
             'migration': migration}
 
@@ -1306,6 +1495,10 @@ def _install(root):
                     f'action = waf-unified[source={name}]\n')
     content=managed_jail_content(content if not previous or previous==DISABLED else previous,
                                  plan['apiJail'],root,defaults=content)
+    content,progressive_sources=progressive_jail_content(content,plan['apiJail'])
+    if progressive_sources:
+        # Verify DB support before changing any production files or services.
+        progressive_expiries({source:set() for source in progressive_sources},progressive_sources)
     files = {jail: content.encode(), F2B/'action.d/waf-unified.conf': action.encode(),
              F2B/'jail.d/zz-kejilion-web-baseline.local': (manage.BUNDLE/'legacy-jails.local').read_bytes()}
     api_site=plan['apiJail'].get('site') if plan['apiJail'] else None
@@ -1352,6 +1545,7 @@ def _install(root):
         migration['cfReentryRequired']=plan['cfReentryRequired'] or migration.get('cfReentryRequired',False)
     if api_site:
         migration['apiSite']=api_site
+    migration['progressiveSources']=progressive_sources
     def activate():
         for name in ['waf-rate.log','waf-audit.json']:
             path=root/'log/nginx'/name
@@ -1360,6 +1554,7 @@ def _install(root):
         change(root, 'sync',lock_held=True)
         manage.execute('fail2ban-client', 'reload')
         ensure_jail_actions(migration)
+        verify_progressive_jails(migration)
         change(root,'sync',lock_held=True)
         set_cron(cron_text)
     def restore_fail2ban():
@@ -1385,6 +1580,7 @@ def _install(root):
         policy_result = manage.apply(root, config,lock_held=True)
         result = manage._external_update(root, files, 'unified-bans', activate)
         result['migration']=status(root)['migration']
+        result['progressiveSources']=progressive_sources
     except Exception:
         errors=[]
         for restore in [lambda:restore_private(files_before),

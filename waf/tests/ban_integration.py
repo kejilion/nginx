@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -135,9 +136,38 @@ include /etc/nginx/conf.d/*.conf;
         tool('ban-install')
         inject_identity()
         check('unified-jails-running',json.loads(tool('ban-status'))['running'])
+        check('progression-enabled',run('fail2ban-client','get','waf-attack','bantime.increment').strip().lower()=='true')
+        check('progression-ladder-configured',run('fail2ban-client','get','waf-attack','bantime.multipliers').strip()=='1 6 36 144')
         check('legacy-jails-retired','enabled = false' in (f2b/'jail.d/zz-kejilion-web-baseline.local').read_text())
         check('expiry-cron-installed','kejilion-waf-bans' in run('crontab','-l'))
         check('existing-cron-preserved','custom-task' in run('crontab','-l'))
+        # Exercise the actual observer with independently seeded, expired
+        # history. No hostile traffic or public endpoint is involved.
+        run('fail2ban-client','set','waf-attack','bantime','600')
+        examples=[(0,'one.example.com|8.8.8.1',600),(1,'one.example.com|8.8.8.2',3600),
+                  (2,'one.example.com|8.8.8.3',21600),(3,'one.example.com|8.8.8.4',86400),
+                  (5,'one.example.com|8.8.8.5',86400),(0,'two.example.com|8.8.8.4',600)]
+        for count,identity,expected in examples:
+            if count:
+                with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+                    db.execute('INSERT OR REPLACE INTO bips (ip,jail,timeofban,bantime,bancount,data) VALUES (?,?,?,?,?,?)',
+                               (identity,'waf-attack',int(time.time())-1200,600,count,'{}'))
+            run('fail2ban-client','set','waf-attack','banip',identity)
+            def observed():
+                with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+                    row=db.execute('SELECT bantime,bancount FROM bips WHERE jail=? AND ip=?',('waf-attack',identity)).fetchone()
+                return row is not None and row[0]==expected and row[1]>=count+1
+            wait('stage-'+str(count)+'-'+str(expected),observed)
+        wait('all-stage-actions-staged',lambda:all(identity in json.loads((state/'bans.json').read_text())['records'] for _,identity,_ in examples))
+        cron_command=(root/'crontab').read_text().split('* * * * * ',1)[1].split('\n',1)[0]
+        run('sh','-c',cron_command)
+        current=json.loads((state/'bans.json').read_text())['records']
+        with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+            for _,identity,expected in examples:
+                started,duration=db.execute('SELECT timeofban,bantime FROM bips WHERE jail=? AND ip=?',('waf-attack',identity)).fetchone()
+                check('stage-expiry-projected-'+str(expected)+'-'+identity,current[identity]['attack']==started+duration)
+        tool('ban-clear')
+        run('fail2ban-client','set','waf-attack','bantime','60')
         # Reproduce a real Fail2Ban reload that loses a newly named action.
         # Installation must detect it, recover only that jail and keep tickets.
         ticket='one.example.com|4.2.2.2'
@@ -165,12 +195,29 @@ include /etc/nginx/conf.d/*.conf;
         check('failed-reinstall-preserves-ticket',ticket in run('fail2ban-client','get','waf-attack','banip').split())
         tool('ban-clear')
         inject_identity()
+        # Seed one expired historical ticket so the next real defence event
+        # exercises Fail2Ban's second stage without waiting for a minute.
+        attack_identity='one.example.com|8.8.8.8'
+        with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+            db.execute('INSERT OR REPLACE INTO bips (ip,jail,timeofban,bantime,bancount,data) VALUES (?,?,?,?,?,?)',
+                       (attack_identity,'waf-attack',int(time.time())-120,60,1,'{}'))
         # Ordinary application errors never enter attack/rate event counters.
         for _ in range(12):check('business-403',request(path='/business403')==403)
         check('business-errors-not-banned',request()==200)
         for _ in range(10):check('waf-secret-path-blocked',request(path='/.env')==403)
         wait('real-waf-log-to-fail2ban-to-origin',lambda:request()==403)
         wait('ban-action-completed',lambda:'Banned 1 / 1' in (root/'fail2ban.log').read_text())
+        def progressive_ticket():
+            with sqlite3.connect(root/'fail2ban.sqlite3',timeout=5) as db:
+                return db.execute('SELECT timeofban,bantime FROM bips WHERE jail=? AND ip=?',
+                                  ('waf-attack',attack_identity)).fetchone()
+        wait('repeat-ban-uses-progressive-duration',lambda:progressive_ticket() is not None and progressive_ticket()[1]==360)
+        cron_command=(root/'crontab').read_text().split('* * * * * ',1)[1].split('\n',1)[0]
+        run('sh','-c',cron_command)
+        started,duration=progressive_ticket()
+        check('progressive-expiry-projected-to-origin',
+              json.loads((state/'bans.json').read_text())['records'][attack_identity]['attack']==started+duration)
+        check('progressive-still-isolates-other-site',request(host='two.example.com')==200)
         check('same-ip-other-site-unaffected',request(host='two.example.com')==200)
         check('other-ip-unaffected',request(ip='9.9.9.9')==200)
         check('original-ticket-recorded','one.example.com|8.8.8.8' in json.loads((state/'bans.json').read_text())['records'])

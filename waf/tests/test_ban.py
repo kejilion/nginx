@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import os
+import sqlite3
 from pathlib import Path
 import sys
 import tempfile
@@ -74,6 +75,165 @@ class BanTests(unittest.TestCase):
 
     def event(self,ip='8.8.8.8',site='one.example.com',source='attack',seconds=600,started=None):
         ban.change(self.root,'ban',site+'|'+ip,source,seconds,started=time.time() if started is None else started)
+
+    def test_progressive_defaults_upgrade_and_respect_fixed_override(self):
+        previous=ban.MARKER+'''[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 600
+bantime.increment = false
+action = waf-unified[source=attack]
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 900
+bantime.increment = false
+action = waf-unified[source=rate]
+'''
+        changed,sources=ban.progressive_jail_content(previous,None)
+        self.assertEqual(sources,['attack','rate'])
+        self.assertIn(ban.PROGRESSIVE_MARKER,changed)
+        self.assertIn('bantime = 900',changed)
+        self.assertEqual(changed.count('bantime.multipliers = 1 6 36 144'),2)
+        parsed=ban.parse_jail(changed)
+        ban.validate_progressive_settings(parsed,'waf-attack')
+        disabled=changed.replace('bantime.increment = true','bantime.increment = false',1)
+        again,sources=ban.progressive_jail_content(disabled,None)
+        self.assertEqual(sources,['rate'])
+        self.assertIn('bantime.increment = false',again)
+
+    def test_progressive_custom_policy_is_preserved(self):
+        previous=ban.MARKER+'''[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 900
+bantime.increment = true
+bantime.factor = 1
+bantime.multipliers = 1 2 4
+bantime.maxtime = 14400
+bantime.overalljails = false
+bantime.rndtime = 0
+action = waf-unified[source=attack]
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+bantime.increment = false
+action = waf-unified[source=rate]
+'''
+        ban.validate_managed_jail(previous)
+        changed,sources=ban.progressive_jail_content(previous,None)
+        parsed=ban.parse_jail(changed)
+        self.assertEqual(parsed.get('waf-attack','bantime.multipliers'),'1 2 4')
+        self.assertEqual(parsed.get('waf-attack','bantime.maxtime'),'14400')
+        self.assertEqual(sources,['attack','rate'])
+
+    def test_progressive_api_override_preserves_scope_and_thresholds(self):
+        previous=ban.MARKER+'''[waf-attack]
+enabled = true
+findtime = 120
+maxretry = 20
+bantime = 600
+action = waf-unified[source=attack]
+[waf-rate]
+enabled = true
+findtime = 120
+maxretry = 120
+bantime = 600
+action = waf-unified[source=rate]
+[waf-api-invalid]
+action = waf-unified-api[site=one.example.com]
+'''
+        api={'enabled':True,'site':'one.example.com','progressive':False,'customProgression':False}
+        changed,sources=ban.progressive_jail_content(previous,api)
+        self.assertEqual(sources,['attack','rate','api'])
+        parsed=ban.parse_jail(changed)
+        self.assertEqual(parsed.get('waf-api-invalid','action'),'waf-unified-api[site=one.example.com]')
+        self.assertEqual(parsed.get('waf-api-invalid','bantime.maxtime'),'86400')
+
+    def test_progressive_invalid_unbounded_custom_policy_is_rejected(self):
+        parsed=ban.parse_jail('[waf-attack]\nbantime.increment = true\nbantime.factor = 1\nbantime.multipliers = 1 6 36 144\nbantime.maxtime = 2592000\n')
+        with self.assertRaisesRegex(ValueError,'Unsupported progressive'):
+            ban.validate_progressive_settings(parsed,'waf-attack')
+
+    def test_progressive_ticket_database_uses_effective_expiry(self):
+        dbpath=self.root/'fail2ban.sqlite3';now=int(time.time())
+        with sqlite3.connect(dbpath) as db:
+            db.execute('create table bips (jail text, ip text, timeofban integer, bantime integer)')
+            db.execute('insert into bips values (?,?,?,?)',('waf-attack','one.example.com|8.8.8.8',now-30,3600))
+        with patch.object(ban,'fail2ban_database',return_value=dbpath):
+            actual=ban.progressive_expiries({'attack':{'one.example.com|8.8.8.8'}},['attack'])
+        self.assertEqual(actual['attack']['one.example.com|8.8.8.8'],now-30+3600)
+
+    def test_progressive_api_ticket_is_scoped_to_site_with_its_expiry(self):
+        identity='one.example.com|8.8.8.8';expiry=int(time.time())+3600
+        saved={'owner':OWNER,'generation':1,'records':{identity:{'api':expiry-3000}}}
+        migration={'apiSite':'one.example.com','progressiveSources':['api']}
+        with patch.object(ban,'state',return_value=saved), \
+             patch.object(ban,'read',return_value=migration), \
+             patch.object(ban,'configured_sources',return_value=['api']), \
+             patch.object(ban,'query_tickets',return_value={'8.8.8.8'}), \
+             patch.object(ban,'progressive_expiries',return_value={'api':{'8.8.8.8':expiry}}):
+            snapshot=ban.ticket_snapshot(self.root)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot['sources']['api'],{identity})
+        self.assertEqual(snapshot['expiries']['api'],{identity:expiry})
+        ban.reconcile_tickets(saved,snapshot)
+        self.assertEqual(saved['records'][identity]['api'],expiry)
+
+    def test_progressive_database_rejects_missing_or_unbounded_tickets(self):
+        dbpath=self.root/'fail2ban.sqlite3';now=int(time.time())
+        with sqlite3.connect(dbpath) as db:
+            db.execute('create table bips (jail text, ip text, timeofban integer, bantime integer)')
+            db.execute('insert into bips values (?,?,?,?)',('waf-attack','one.example.com|8.8.8.8',now,86401))
+        with patch.object(ban,'fail2ban_database',return_value=dbpath):
+            with self.assertRaisesRegex(ValueError,'Invalid progressive'):
+                ban.progressive_expiries({'attack':{'one.example.com|8.8.8.8'}},['attack'])
+            with self.assertRaisesRegex(ValueError,'Incomplete progressive'):
+                ban.progressive_expiries({'attack':{'two.example.com|8.8.8.8'}},['attack'])
+
+    def test_progressive_reconcile_extends_and_recovers_tickets(self):
+        now=int(time.time());identity='one.example.com|8.8.8.8';other='two.example.com|9.9.9.9'
+        value={'owner':OWNER,'generation':1,'records':{identity:{'attack':now-1}}}
+        snapshot={'generation':1,'sources':{'attack':{identity,other}},
+                  'expiries':{'attack':{identity:now+3600,other:now+600}},'recoverable':{('attack',other)}}
+        ban.reconcile_tickets(value,snapshot)
+        self.assertEqual(value['records'][identity]['attack'],now+3600)
+        self.assertEqual(value['records'][other]['attack'],now+600)
+
+    def test_progressive_reconcile_does_not_apply_stale_snapshot(self):
+        identity='one.example.com|8.8.8.8';now=int(time.time())
+        value={'owner':OWNER,'generation':2,'records':{identity:{'attack':now+600}}}
+        snapshot={'generation':1,'sources':{'attack':{identity}},
+                  'expiries':{'attack':{identity:now+3600}},'recoverable':set()}
+        ban.reconcile_tickets(value,snapshot)
+        self.assertEqual(value['records'][identity]['attack'],now+600)
+
+    def test_progressive_expiry_is_shared_by_origin_and_cf(self):
+        jail=self.f2b/'jail.d/zz-waf-managed.local';jail.parent.mkdir(parents=True)
+        jail.write_text(ban.MARKER)
+        ban.save(self.root,'ban-migration.json',{'state':'current','progressiveSources':['attack']})
+        edge=Edge();edge.zones=lambda:{'example.com':ZONE}
+        identity='one.example.com|8.8.8.8';started=int(time.time())-30
+        dbpath=self.root/'fail2ban.sqlite3'
+        with sqlite3.connect(dbpath) as db:
+            db.execute('create table bips (jail text, ip text, timeofban integer, bantime integer)')
+            db.execute('insert into bips values (?,?,?,?)',('waf-attack',identity,started,3600))
+        with patch.object(ban,'Cloudflare',return_value=edge), \
+             patch.object(ban,'status',return_value={'running':True}), \
+             patch.object(ban,'fail2ban_database',return_value=dbpath), \
+             patch.object(ban,'query_tickets',side_effect=lambda source:{identity} if source=='attack' else set()):
+            ban.configure_cf(self.root,{'email':'','key':'x'*40})
+            self.event(started=started)
+            ban.change(self.root,'sync')
+            self.assertEqual(ban.state(self.root)['records'][identity]['attack'],started+3600)
+            self.assertIn('"'+identity+'" 1;', (self.root/'conf.d/waf/blocked.map').read_text())
+            self.assertIn('8.8.8.8',edge.sets[ZONE]['rules'][0]['expression'])
+            self.assertNotIn('two.example.com',edge.sets[ZONE]['rules'][0]['expression'])
 
     def test_missing_actions_restart_only_affected_jail(self):
         actions={'waf-attack':['waf-unified'],'waf-rate':[],'waf-api-invalid':['waf-unified-api']}
