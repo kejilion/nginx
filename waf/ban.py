@@ -278,6 +278,15 @@ def validate_legacy_wafctl_action(name):
     root_arg=rf'(?:--root\s+{root}\s+)?'
     ban_pattern=re.compile(rf'{python}\s+{runtime}\s+{root_arg}ban\s+--key\s+{ip}\s+--ttl\s+<bantime>\s+--reason\s+{reason}')
     unban_pattern=re.compile(rf'{python}\s+{runtime}\s+{root_arg}unban\s+--key\s+{ip}\s+--reason\s+{reason}')
+    # An older API jail used an explicitly scoped key and expiry instead of
+    # an unban action. Preserve that site when adapting its IP-only tickets.
+    if name=='waf-api-invalid' and not has_init:
+        scoped=re.fullmatch(rf'{python}\s+{runtime}\s+{root_arg}ban\s+--key\s+"([A-Za-z0-9_.-]+)\|<ip>"\s+--ttl\s+<bantime>\s+--reason\s+rate',definition.get('actionban','').strip())
+        if scoped and not definition.get('actionunban','').strip() and not any(definition.get(field,'').strip() for field in ('actionstart','actionstop','actioncheck')):
+            site=policy.scope(scoped.group(1))
+            if site!=scoped.group(1):
+                raise ValueError('Non-canonical legacy API site; previous backend retained')
+            return site
     if (not ban_pattern.fullmatch(definition.get('actionban','').strip()) or
         not unban_pattern.fullmatch(definition.get('actionunban','').strip()) or
         any(definition.get(field,'').strip() for field in ('actionstart','actionstop','actioncheck'))):
@@ -352,6 +361,8 @@ def api_jail():
     sources=[item for item in matches if item[0]!=managed_path]
     if len(managed)>1 or len(sources)>1:
         raise ValueError('Ambiguous waf-api-invalid jail; previous backend retained')
+    if managed and not sources and managed[0][1]==DISABLED:
+        return None
     if managed:
         managed_text=managed[0][1]
         marker=managed_jail_marker(managed_text)
@@ -363,7 +374,9 @@ def api_jail():
         api_action=override.get('waf-api-invalid','action',fallback='').strip()
         api_options=set(override.options('waf-api-invalid'))
         legacy_api_options={'action','enabled','filter','logpath','maxretry','findtime','bantime','bantime.increment'}
-        if (marker=='current' and (api_action!='waf-unified[source=api]' or api_options!={'action'})) or (
+        scoped_action=re.fullmatch(r'waf-unified-api\[site=([A-Za-z0-9_.-]+)\]',api_action)
+        current_api_options=legacy_api_options if not sources else {'action'}
+        if (marker=='current' and ((api_action!='waf-unified[source=api]' and not scoped_action) or not api_options<=current_api_options)) or (
                 marker=='legacy' and not api_options<=legacy_api_options):
             raise ValueError('Unexpected managed API jail override; previous backend retained')
     if sources:
@@ -374,15 +387,21 @@ def api_jail():
     if path!=managed_path and (path.parent!=directory or path.name>=managed_path.name):
         raise ValueError('API jail cannot be safely overridden without changing load order')
     action=parsed.get(section,'action',fallback='').strip()
-    if action not in {'waf-api-invalid','waf-local[reason=api]','waf-local[reason=waf-api-invalid]','waf-unified[source=api]'}:
+    scoped_action=re.fullmatch(r'waf-unified-api\[site=([A-Za-z0-9_.-]+)\]',action)
+    if action not in {'waf-api-invalid','waf-local[reason=api]','waf-local[reason=waf-api-invalid]','waf-unified[source=api]'} and not scoped_action:
         raise ValueError('Custom API jail action requires explicit migration')
     if parsed.get(section,'filter',fallback='').strip()!='waf-api-invalid':
         raise ValueError('Unknown API jail filter; previous backend retained')
     logpath=parsed.get(section,'logpath',fallback='').strip().split()[0:1]
     if not logpath or not re.fullmatch(r'/home/web/log/nginx/[A-Za-z0-9_.-]{1,128}',logpath[0]):
         raise ValueError('Unknown API jail log path; previous backend retained')
-    if action!='waf-unified[source=api]':
-        validate_legacy_wafctl_action('waf-api-invalid' if action=='waf-api-invalid' else 'waf-local')
+    site=policy.scope(scoped_action.group(1)) if scoped_action else None
+    if action!='waf-unified[source=api]' and not scoped_action:
+        site=validate_legacy_wafctl_action('waf-api-invalid' if action=='waf-api-invalid' else 'waf-local')
+    if managed and sources and marker=='current':
+        expected='waf-unified-api[site='+site+']' if site else 'waf-unified[source=api]'
+        if api_action!=expected:
+            raise ValueError('API site scope changed; previous backend retained')
     for field,low,high in [('maxretry',1,10000),('findtime',1,86400),('bantime',60,86400)]:
         raw=parsed.get(section,field,fallback=None)
         if raw is None:
@@ -400,8 +419,8 @@ def api_jail():
     try:enabled=parsed.getboolean(section,'enabled',fallback=False)
     except ValueError:raise ValueError('Invalid API jail enabled state') from None
     if path==managed_path:
-        return {'path':path,'enabled':enabled,'action':action,'text':text,'managed':True}
-    return {'path':path,'enabled':enabled,'action':action,'text':text}
+        return {'path':path,'enabled':enabled,'action':action,'text':text,'managed':True,'site':site}
+    return {'path':path,'enabled':enabled,'action':action,'text':text,'site':site}
 
 
 def legacy_reconciler_state():
@@ -475,7 +494,8 @@ def migration_plan(root):
     managed_api=False
     if previous:
         parsed_previous=parse_jail(previous)
-        managed_api=parsed_previous.get('waf-api-invalid','action',fallback='').strip()=='waf-unified[source=api]'
+        managed_action=parsed_previous.get('waf-api-invalid','action',fallback='').strip()
+        managed_api=(managed_action=='waf-unified[source=api]' or bool(re.fullmatch(r'waf-unified-api\[site=[A-Za-z0-9_.-]+\]',managed_action)))
     legacy_api=bool(api and api['action']!='waf-unified[source=api]' and not managed_api)
     reentry_required=bool(saved_migration.get('cfReentryRequired',old_cf))
     requires=(imported or legacy_marker or legacy_api or
@@ -512,17 +532,20 @@ def managed_jail_content(previous,api,root=Path('/home/web'),defaults=None):
         content=canonicalize_waf_section_names(content)
         parsed=parse_jail(content)
         action_overrides={}
+        api_action=('waf-unified-api[site='+api['site']+']' if api and api.get('site')
+                    else 'waf-unified[source=api]')
         for section,source in [('waf-attack','attack'),('waf-rate','rate'),('waf-api-invalid','api')]:
             if not parsed.has_section(section):
                 continue
             action=parsed.get(section,'action',fallback='').strip()
             if (legacy_waf_action_matches(action,source) or
                 action=='waf-api-invalid' and source=='api' or
+                source=='api' and re.fullmatch(r'waf-unified-api\[site=[A-Za-z0-9_.-]+\]',action) or
                 action=='waf-unified[source='+source+']'):
                 # DEFAULT action values are inherited by all sections. Add a
                 # local WAF action instead of changing the administrator's
                 # shared default for unrelated jails.
-                action_overrides[section]='waf-unified[source='+source+']'
+                action_overrides[section]=api_action if source=='api' else 'waf-unified[source='+source+']'
 
         attack_logpath=None
         if parsed.has_section('waf-attack'):
@@ -608,7 +631,8 @@ def managed_jail_content(previous,api,root=Path('/home/web'),defaults=None):
         content=''
     if api and not re.search(r'(?m)^\s*\[waf-api-invalid\]\s*$',content):
         if content and not content.endswith('\n'):content+='\n'
-        content+='\n[waf-api-invalid]\naction = waf-unified[source=api]\n'
+        api_action=('waf-unified-api[site='+api['site']+']' if api.get('site') else 'waf-unified[source=api]')
+        content+='\n[waf-api-invalid]\naction = '+api_action+'\n'
     return content
 
 
@@ -923,7 +947,7 @@ def stage(root, operation, identity, source, seconds, started):
             proxies+=[a['local'] for interface in local for a in interface.get('addr_info',[])]
             if site not in inventory(root) or not policy.eligible(address,proxies):
                 raise ValueError('Untrusted site or protected infrastructure address')
-            if type(seconds) is not int or not 60<=seconds<=3600:
+            if type(seconds) is not int or not 60<=seconds<=MAX_LEGACY_EXPIRY:
                 raise ValueError('Ban duration outside supported range')
             if started is None or not __import__('math').isfinite(started) or started>time.time()+5:
                 raise ValueError('Valid original ticket time required')
@@ -991,7 +1015,11 @@ def query_tickets(source):
         raise ValueError('Cannot read complete Fail2Ban tickets')
     tickets=set(process.stdout.split())
     if len(tickets)>policy.MAX_BANS:raise ValueError('Ticket budget exceeded')
-    for ticket in tickets:policy.key(ticket)
+    for ticket in tickets:
+        if source=='api' and '|' not in ticket:
+            ipaddress.ip_address(ticket)
+        else:
+            policy.key(ticket)
     return tickets
 
 
@@ -1000,7 +1028,19 @@ def ticket_snapshot(root):
     # wait for its action process, which itself needs those locks.
     generation=state(root).get('generation',0)
     try:
-        return {'generation':generation,'sources':{source:query_tickets(source) for source in configured_sources(root)}}
+        sources={source:query_tickets(source) for source in configured_sources(root)}
+        if 'api' in sources:
+            migration=read(root,'ban-migration.json',{})
+            api_site=migration.get('apiSite') if isinstance(migration,dict) else None
+            converted=set()
+            for ticket in sources['api']:
+                if '|' not in ticket:
+                    if not api_site:raise ValueError('Missing API ticket site')
+                    ticket=policy.scope(api_site)+'|'+str(ipaddress.ip_address(ticket))
+                policy.key(ticket)
+                converted.add(ticket)
+            sources['api']=converted
+        return {'generation':generation,'sources':sources}
     except Exception:
         return None  # Unavailable/restarting jail is not proof of a removal.
 
@@ -1210,6 +1250,15 @@ def _install(root):
                                  plan['apiJail'],root,defaults=content)
     files = {jail: content.encode(), F2B/'action.d/waf-unified.conf': action.encode(),
              F2B/'jail.d/zz-kejilion-web-baseline.local': (manage.BUNDLE/'legacy-jails.local').read_bytes()}
+    api_site=plan['apiJail'].get('site') if plan['apiJail'] else None
+    if api_site:
+        if api_site not in inventory(root):
+            raise ValueError('Legacy API site is not present in the site inventory')
+        api_action=('[Definition]\nactionban = '+interpreter+' -E -s -B '+str(runner)+
+                    ' --root '+str(root)+' ban --identity "<site>|<ip>" --source api --seconds <bantime> --started <time>\n'+
+                    'actionunban = '+interpreter+' -E -s -B '+str(runner)+
+                    ' --root '+str(root)+' unban --identity "<site>|<ip>" --source api\n[Init]\nsite = '+api_site+'\ntimeout = 180\n')
+        files[F2B/'action.d/waf-unified-api.conf']=api_action.encode()
     for name, text in policy.render_filters().items():
         files[F2B/'filter.d'/name] = text.encode()
     for name in ['waf-rate.log', 'waf-audit.json']:
@@ -1243,6 +1292,8 @@ def _install(root):
         migration['apiJailEnabled']=bool(plan['apiJail'] and plan['apiJail']['enabled']) or migration.get('apiJailEnabled',False)
         migration['legacyCFDetected']=plan['legacyCFDetected'] or migration.get('legacyCFDetected',False)
         migration['cfReentryRequired']=plan['cfReentryRequired'] or migration.get('cfReentryRequired',False)
+    if api_site:
+        migration['apiSite']=api_site
     def activate():
         for name in ['waf-rate.log','waf-audit.json']:
             path=root/'log/nginx'/name

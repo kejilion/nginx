@@ -99,8 +99,9 @@ class BanTests(unittest.TestCase):
         self.assertEqual(ban.state(self.root)['records'],{})
 
     def test_invalid_durations_and_future_time(self):
-        for seconds in [0,59,3601]:
+        for seconds in [0,59,86401]:
             with self.assertRaises(ValueError):self.event(seconds=seconds)
+        self.event(seconds=3601)
         with self.assertRaises(ValueError):self.event(started=time.time()+100)
 
     def test_proxy_private_unknown_and_allowlisted_rejected(self):
@@ -801,6 +802,42 @@ reason = attack
         (jail_dir/'custom.local').write_text('[waf-api-invalid]\nenabled = true\nfilter = waf-api-invalid\nlogpath = /home/web/log/nginx/waf-protocol.log\naction = custom-ban\n')
         with self.assertRaisesRegex(ValueError,'Custom API jail action'):
             ban.api_jail()
+
+    def test_disabled_managed_jail_is_not_an_api_configuration(self):
+        jail_dir=self.f2b/'jail.d'; jail_dir.mkdir(parents=True)
+        (jail_dir/'zz-waf-managed.local').write_text(ban.DISABLED)
+        self.assertIsNone(ban.api_jail())
+
+    def test_scoped_legacy_api_action_preserves_site(self):
+        jail_dir=self.f2b/'jail.d'; action_dir=self.f2b/'action.d'
+        jail_dir.mkdir(parents=True); action_dir.mkdir(parents=True)
+        (jail_dir/'zz-waf-api-invalid.local').write_text('[waf-api-invalid]\nenabled = true\nfilter = waf-api-invalid\nlogpath = /home/web/log/nginx/waf-protocol.log tail\nmaxretry = 120\nfindtime = 120\nbantime = 600\naction = waf-api-invalid\n')
+        action='[Definition]\nactionstart =\nactionstop =\nactioncheck =\nactionban = /usr/bin/python3 /home/web/conf.d/waf/wafctl.py --root /home/web ban --key "one.example.com|<ip>" --ttl <bantime> --reason rate\nactionunban =\n'
+        (action_dir/'waf-api-invalid.conf').write_text(action)
+        api=ban.api_jail()
+        self.assertEqual(api['site'],'one.example.com')
+        self.assertIn('action = waf-unified-api[site=one.example.com]',ban.managed_jail_content('',api))
+        (jail_dir/'zz-waf-managed.local').write_text(ban.MARKER+'[waf-api-invalid]\naction = waf-unified-api[site=one.example.com]\n')
+        self.assertEqual(ban.api_jail()['site'],'one.example.com')
+        (jail_dir/'zz-waf-managed.local').write_text(ban.MARKER+'[waf-api-invalid]\naction = waf-unified-api[site=two.example.com]\n')
+        with self.assertRaisesRegex(ValueError,'API site scope changed'):
+            ban.api_jail()
+        (jail_dir/'zz-waf-managed.local').unlink()
+        (action_dir/'waf-api-invalid.conf').write_text(action.replace('one.example.com|<ip>', 'one.example.com|<ip>"; touch /tmp/evil; echo "'))
+        with self.assertRaisesRegex(ValueError,'Unknown legacy WAF action'):
+            ban.api_jail()
+
+    def test_scoped_api_ticket_snapshot_preserves_site(self):
+        with patch.object(ban,'state',return_value={'generation':2}), \
+             patch.object(ban,'configured_sources',return_value=['api']), \
+             patch.object(ban,'read',return_value={'apiSite':'one.example.com'}), \
+             patch.object(ban,'query_tickets',return_value={'8.8.8.8'}):
+            self.assertEqual(ban.ticket_snapshot(self.root)['sources']['api'],{'one.example.com|8.8.8.8'})
+        with patch.object(ban,'state',return_value={'generation':2}), \
+             patch.object(ban,'configured_sources',return_value=['api']), \
+             patch.object(ban,'read',return_value={}), \
+             patch.object(ban,'query_tickets',return_value={'8.8.8.8'}):
+            self.assertIsNone(ban.ticket_snapshot(self.root))
 
     def test_direct_legacy_wafctl_action_without_init_is_recognized(self):
         directory=self.f2b/'action.d';directory.mkdir(parents=True)
