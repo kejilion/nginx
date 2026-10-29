@@ -27,6 +27,9 @@ import nginx_edit
 import policy
 
 PHASE = 'http_request_firewall_custom'
+# Cloudflare expressions do not support a bare boolean literal. This
+# contradiction is valid in the Ruleset Engine and cannot match any request.
+CF_NEVER_MATCH = '(ip.src eq 192.0.2.1 and ip.src ne 192.0.2.1)'
 MARKER = '# Managed shared WAF; unified event bans v1\n'
 LEGACY_MARKER = '# Managed shared WAF; only trusted defence events, isolated by canonical site and client.\n'
 DISABLED = MARKER+'[waf-attack]\nenabled = false\n[waf-rate]\nenabled = false\n[waf-api-invalid]\nenabled = false\n'
@@ -818,7 +821,7 @@ def expressions(records, mapping, overflow=None):
             if overflow is None:
                 raise ValueError('Cloudflare expression limit; origin bans remain active')
             overflow.append(zone)
-            expression='false'
+            expression=CF_NEVER_MATCH
         result[zone] = expression
     return result
 
@@ -831,7 +834,7 @@ def sync_edge(cf, value, client=None):
     if len(zones)>20 or any(not re.fullmatch('[a-f0-9]{32}', z) for z in zones):
         raise ValueError('CF zone budget exceeded (maximum 20)')
     active_zones={t['zone'] for entries in cf['targets'].values() for t in entries}
-    desired = {zone: 'false' for zone in active_zones} if cf['mode'] == 'cloudflare' else {}
+    desired = {zone: CF_NEVER_MATCH for zone in active_zones} if cf['mode'] == 'cloudflare' else {}
     overflow=[]
     if cf['mode'] == 'cloudflare':
         desired.update(expressions(value['records'], cf['targets'],overflow))
@@ -871,7 +874,7 @@ def sync_edge(cf, value, client=None):
             body = {'ref': ref, 'description': ref, 'action': 'block',
                     'expression': expression, 'enabled': True}
             if not rule:
-                body['position']={'index':1}
+                body['position']={'before':''}
             client.request('PATCH' if rule else 'POST', endpoint, body)
     if overflow:
         raise ValueError('CF capacity exceeded; affected edge rules cleared, origin bans retained')

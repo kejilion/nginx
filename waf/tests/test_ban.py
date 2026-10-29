@@ -212,7 +212,8 @@ class BanTests(unittest.TestCase):
     def test_edge_enable_empty_checks_write_permissions(self):
         edge=Edge();value=dict(self.value,records={})
         ban.sync_edge(self.cf,value,edge)
-        self.assertEqual(edge.sets[ZONE]['rules'][0]['expression'],'false')
+        self.assertEqual(edge.sets[ZONE]['rules'][0]['expression'],ban.CF_NEVER_MATCH)
+        self.assertEqual(edge.sets[ZONE]['rules'][0]['position'],{'before':''})
 
     def test_edge_drift_refuses_overwrite(self):
         edge=Edge();ban.sync_edge(self.cf,self.value,edge)
@@ -236,7 +237,7 @@ class BanTests(unittest.TestCase):
         edge=Edge();ban.sync_edge(self.cf,self.value,edge)
         with patch.object(ban,'MAX_EXPRESSION',1),self.assertRaisesRegex(ValueError,'capacity'):
             ban.sync_edge(self.cf,self.value,edge)
-        self.assertEqual(edge.sets[ZONE]['rules'][0]['expression'],'false')
+        self.assertEqual(edge.sets[ZONE]['rules'][0]['expression'],ban.CF_NEVER_MATCH)
 
     def test_cf_off_works_when_fail2ban_is_stopped(self):
         edge=Edge();value=ban.state(self.root)
@@ -323,7 +324,7 @@ class BanTests(unittest.TestCase):
         with patch.object(ban,'Cloudflare',return_value=edge),patch.object(ban,'jail_action_loaded',return_value=True):
             ban.configure_cf(self.root,{'email':'','key':'x'*40})
             self.event()
-            self.assertEqual(edge.sets[ZONE]['rules'][0]['expression'],'false')
+            self.assertEqual(edge.sets[ZONE]['rules'][0]['expression'],ban.CF_NEVER_MATCH)
             ban.change(self.root,'sync')
             self.assertIn('8.8.8.8',edge.sets[ZONE]['rules'][0]['expression'])
             ban.configure_cf(self.root,disable=True)
