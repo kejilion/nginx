@@ -17,6 +17,27 @@ import policy
 
 
 class ManagedTrustTests(unittest.TestCase):
+    def test_static_first_migration_status_and_second_plan_converge(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory);(root/'conf.d').mkdir()
+            main='events {} http { modsecurity on; modsecurity_rules_file /etc/nginx/modsec/modsecurity.conf; include conf.d/*.conf; }'
+            site='server { server_name static.example; root /var/www/html/static; modsecurity on; location / {try_files $uri =404;} }'
+            (root/'nginx.conf').write_text(main);(root/'conf.d/site.conf').write_text(site)
+            config=json.loads((manage.BUNDLE/'example-policy.json').read_text());config['mode']='on'
+            dump='# configuration file /etc/nginx/nginx.conf:\n'+main+'\n# configuration file /etc/nginx/conf.d/site.conf:\n'+site
+            with patch.object(manage,'execute',return_value=dump),patch.object(manage,'kpanel_endpoints',return_value=set()):
+                changes,_=manage.make_plan(root,config)
+            self.assertIn(b'ruleRemoveTargetById=932260;REQUEST_FILENAME',changes[root/'conf.d/waf/profile-rules.conf'])
+            graph={}
+            for path,data in changes.items():
+                path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(data)
+                if path.suffix in {'.conf','.inc','.map'} or path.name=='nginx.conf':graph['/etc/nginx/'+path.relative_to(root).as_posix()]=data.decode()
+            installed=nginx_edit.candidate_configuration(dump,graph)
+            with patch.object(manage,'execute',return_value=installed),patch.object(manage,'kpanel_endpoints',return_value=set()):
+                self.assertTrue(manage.configured_status(root,config)['requestSemantics']['synchronized'])
+                second,_=manage.make_plan(root,config)
+            self.assertEqual(second[root/'conf.d/waf/profile-rules.conf'],changes[root/'conf.d/waf/profile-rules.conf'])
+
     def test_cache_predicates_preserve_http_server_and_location_inheritance(self):
         def check(server):
             return nginx_edit.cache_inheritance('# configuration file /etc/nginx/nginx.conf:\nhttp { proxy_cache_bypass $arg_nocache; proxy_no_cache $http_x_private; '+server+' }')['panel.example']

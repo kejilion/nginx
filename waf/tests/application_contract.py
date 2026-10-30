@@ -167,7 +167,7 @@ def main():
     profiles={'panel.example':'kpanel','servercache.example':'kpanel','locationcache.example':'kpanel','generic.example':'generic','api.example':'api','cms.example':'wordpress','forum.example':'flarum','upload.example':'upload','stream.example':'streaming'}
     config=json.loads((bundle/'example-policy.json').read_text());config.update(mode='on',cdn='direct',sites={name:{'profile':profile}for name,profile in profiles.items()})
     config['sites']['generic.example']['sourceText']=[{'method':'POST','path':'/api/source-note','fields':['content']}]
-    config['sites']['static.example']={'profile':'generic'}
+    # A fresh static site has no explicit policy/profile entry.
     assets=work/'desktop-icons/xp';assets.mkdir(parents=True);(assets/'docker-v1.svg').write_text('<svg/>')
     cf=policy.networks(json.loads((bundle/'cloudflare-ips.json').read_text()))
     def server(host):

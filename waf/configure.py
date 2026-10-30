@@ -428,7 +428,6 @@ def make_plan(root, config, cfdata=None):
     header_scopes=nginx_edit.configuration_headers(effective,allowed_proxy_files)
     method_controls=nginx_edit.method_override_controls(effective)
     cache_controls=nginx_edit.cache_inheritance(effective)
-    resource_controls=nginx_edit.static_resource_controls(effective)
     if any(name not in allowed_proxy_files and not name.startswith('/etc/nginx/conf.d/waf/') for name,_ in header_scopes):
         raise ValueError('Proxy directives outside managed site files need explicit integration')
     main_text=read_config(main)
@@ -478,6 +477,12 @@ def make_plan(root, config, cfdata=None):
         raise ValueError('Site count exceeds supported budget')
     policy.validate(config)
     directory = root / 'conf.d/waf'
+    # Prove the configuration that this transaction will actually install,
+    # including native switch and legacy global-rule migration.
+    replacements={'/etc/nginx/'+str(path.relative_to(root)).replace('\\','/'):data.decode() for path,data in changes.items()}
+    replacements.update({'/etc/nginx/conf.d/waf/'+name:text for name,text in policy.bundle_files(config,cloudflare,method_controls,cache_controls).items()})
+    replacements.setdefault('/etc/nginx/conf.d/waf/blocked.map','')
+    resource_controls=nginx_edit.static_resource_controls(nginx_edit.candidate_configuration(effective,replacements))
     for name, content in policy.bundle_files(config, cloudflare,method_controls,cache_controls,resource_controls).items():
         changes[directory / name] = content.encode()
     changes[directory / 'cloudflare-ips.json'] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()

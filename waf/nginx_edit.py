@@ -243,7 +243,8 @@ def configuration_scopes(dump):
                 target=stream[i+1].value.strip('\"\'')
                 if '$' in target:raise ValueError('Dynamic Nginx include needs explicit migration')
                 if not target.startswith('/'):target=posixpath.join('/etc/nginx',target)
-                matches=sorted(n for n in files if fnmatch.fnmatchcase(n,target))
+                # Nginx glob '*' does not cross a directory separator.
+                matches=sorted(n for n in files if len(n.split('/'))==len(target.split('/')) and all(fnmatch.fnmatchcase(part,pattern) for part,pattern in zip(n.split('/'),target.split('/'))))
                 if not matches and not any(c in target for c in '*?['):
                     raise ValueError('Missing include snapshot: '+target)
                 for match in matches:out.extend(expand(match,(*parents,name)))
@@ -255,6 +256,14 @@ def configuration_scopes(dump):
     main='/etc/nginx/nginx.conf'
     if main not in files: raise ValueError('Missing main configuration snapshot')
     return statement_scopes(expand(main))
+
+
+def candidate_configuration(dump, replacements):
+    """Overlay validated candidate bytes without discarding external includes."""
+    parts=re.split(r'(?m)^# configuration file ([^\r\n]+):\n',dump)
+    files=dict(zip(parts[1::2],parts[2::2]))
+    files.update(replacements)
+    return ''.join('# configuration file '+name+':\n'+body+'\n' for name,body in files.items())
 
 
 def static_resource_controls(dump):

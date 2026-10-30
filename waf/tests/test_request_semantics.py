@@ -56,6 +56,19 @@ class SemanticsTests(unittest.TestCase):
     def test_legacy_native_switch_does_not_change_file_capability(self):
         self.assertEqual(self.controls('modsecurity on; location / { modsecurity on; try_files $uri =404; }'),'file-only')
 
+    def test_global_legacy_migration_uses_candidate_capability(self):
+        main='http { modsecurity_rules_file /etc/nginx/modsec/modsecurity.conf; include /etc/nginx/conf.d/*.conf; }'
+        site='server {server_name any.example;root /var/www/html/any;}'
+        dump='# configuration file /etc/nginx/nginx.conf:\n'+main+'\n# configuration file /etc/nginx/conf.d/site.conf:\n'+site
+        self.assertNotEqual(nginx_edit.static_resource_controls(dump)['any.example'],'file-only')
+        replacements={'/etc/nginx/nginx.conf':nginx_edit.patch_main(main),'/etc/nginx/conf.d/site.conf':site}
+        candidate=nginx_edit.candidate_configuration(dump,replacements)
+        self.assertEqual(nginx_edit.static_resource_controls(candidate)['any.example'],'file-only')
+
+    def test_include_glob_never_includes_nested_unloaded_handlers(self):
+        dump='# configuration file /etc/nginx/nginx.conf:\nhttp {include /etc/nginx/conf.d/*.conf;}\n# configuration file /etc/nginx/conf.d/site.conf:\nserver {server_name any.example;root /var/www/html/any;}\n# configuration file /etc/nginx/conf.d/nested/unused.conf:\nserver {server_name any.example;location / {proxy_pass http://backend;}}'
+        self.assertEqual(nginx_edit.static_resource_controls(dump)['any.example'],'file-only')
+
     def test_source_contract_validation_and_no_implicit_exemptions(self):
         base={'schemaVersion':1,'mode':'on','cdn':'direct','container':'nginx','sites':{'any.example':{'profile':'generic'}}}
         contract={'method':'POST','path':'/api/note','fields':['content']}
