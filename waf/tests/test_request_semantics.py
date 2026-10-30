@@ -14,6 +14,23 @@ class SemanticsTests(unittest.TestCase):
         self.assertEqual(self.controls('location / { try_files $uri =404; }'),'file-only')
         self.assertEqual(self.controls('location / { try_files $uri $uri/ /index.html; }'),'file-only')
 
+    def test_public_templates_are_recognized(self):
+        root=Path(__file__).resolve().parents[2]
+        import re
+        for template in ['nginx.conf','nginx10.conf']:
+            main=(root/template).read_text()
+            # Supply the complete include snapshot as nginx -T would. Managed
+            # optional globs are absent on a fresh install; MIME data is passive.
+            includes=re.findall(r'(?m)^\s*include\s+([^;]+);',main)
+            files={'/etc/nginx/nginx.conf':main,'/etc/nginx/conf.d/example.conf':(root/'html.conf').read_text()}
+            for target in includes:
+                target=target.strip().strip('"\'')
+                if not any(c in target for c in '*?['):
+                    if not target.startswith('/'):target='/etc/nginx/'+target
+                    files.setdefault(target,'')
+            dump=''.join('# configuration file '+name+':\n'+body+'\n' for name,body in files.items())
+            with self.subTest(template=template):self.assertEqual(nginx_edit.static_resource_controls(dump)['yuming.com'],'file-only')
+
     def test_dynamic_or_uncertain_handlers_never_inherit_static_exception(self):
         for body in ['location / { proxy_pass http://backend; }','location ~ \\.php$ { fastcgi_pass unix:/run/php; }',
                      'location / { try_files $uri /index.php; }','location / { alias /tmp; }',

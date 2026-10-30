@@ -491,6 +491,7 @@ def render_profile_rules(config: dict, method_controls=None, resource_controls=N
                 controls=','.join('ctl:ruleRemoveTargetByTag='+tag+';ARGS:json.'+field for tag in CODE_TAGS)
                 controls+=','+','.join('ctl:ruleRemoveTargetByTag='+tag+';REQUEST_BODY' for tag in CODE_TAGS)
                 lines += [f'SecRule TX:{flag} "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,chain"',
+                          '    SecRule &ARGS:/(?i:_method)$/ "@eq 0" "t:none,chain"',
                           '    SecRule &ARGS:json.'+field+' "@eq 1" "t:none,'+controls+'"']
                 rid+=1
     return "\n".join(lines + exceptions) + "\n"

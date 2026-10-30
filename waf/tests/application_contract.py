@@ -146,6 +146,8 @@ def cases():
     add('generic-source-wrong-method','PUT','/api/source-note',{'content':'cat /etc/passwd; cp .env.example .env'},403,host='generic.example')
     add('generic-source-query-protected','POST','/api/source-note?q=%3Cscript%3Ealert(1)%3C/script%3E',{'content':'code'},403,host='generic.example')
     add('generic-source-query-alias','POST','/api/source-note?json.content=%3Cscript%3Ealert(1)%3C/script%3E',{'content':'code'},403,host='generic.example')
+    add('generic-source-query-method-override','POST','/api/source-note?_method=DELETE',{'content':'cat /etc/passwd; cp .env.example .env'},403,host='generic.example')
+    add('generic-source-body-method-override','POST','/api/source-note',{'_method':'DELETE','content':'cat /etc/passwd; cp .env.example .env'},403,host='generic.example')
     add('generic-source-override','POST','/api/source-note',{'content':'cat /etc/passwd; cp .env.example .env'},403,headers={'X-HTTP-Method-Override':'PATCH'},host='generic.example')
     add('generic-source-duplicate-type','POST','/api/source-note',{'content':'cat /etc/passwd; cp .env.example .env'},403,headers={'Content-Type':'application/json','content-type':'text/plain'},host='generic.example')
     add('generic-source-duplicate-field','POST','/api/source-note',b'{"content":"safe","content":"cat /etc/passwd; cp .env.example .env"}',403,headers={'Content-Type':'application/json'},host='generic.example')

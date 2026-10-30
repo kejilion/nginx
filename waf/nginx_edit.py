@@ -275,7 +275,7 @@ def static_resource_controls(dump):
         'server_tokens types_hash_bucket_size variables_hash_bucket_size variables_hash_max_size '
         'gzip_buffers gzip_comp_level gzip_min_length http2 http2_body_preread_size http2_chunk_size '
         'http2_max_concurrent_streams http2_recv_buffer_size http3 http3_max_concurrent_streams http3_stream_buffer_size '
-        'quic_active_connection_id_limit quic_gso quic_retry ssl_buffer_size ssl_certificate_cache ssl_session_cache ssl_session_timeout').split())
+        'quic_active_connection_id_limit quic_gso quic_retry ssl_buffer_size ssl_certificate_cache ssl_session_cache ssl_session_timeout ssl_session_tickets gzip_proxied limit_req_zone limit_req_status limit_conn_zone limit_conn_status').split())
     inherited_allowed |= {prefix+suffix for prefix in ['proxy_','fastcgi_'] for suffix in ('buffer_size buffering buffers busy_buffers_size cache_background_update cache_bypass cache_key cache_lock cache_lock_timeout cache_methods cache_path cache_use_stale cache_valid connect_timeout hide_header intercept_errors keep_conn max_temp_file_size no_cache read_timeout send_timeout socket_keepalive headers_hash_bucket_size headers_hash_max_size').split()}
     inherited_reason=''
     for node in groups.values():
