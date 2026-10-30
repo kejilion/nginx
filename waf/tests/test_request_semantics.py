@@ -46,6 +46,16 @@ class SemanticsTests(unittest.TestCase):
         dump='# configuration file /etc/nginx/nginx.conf:\nhttp { server { server_name any.example; root /var/www/html/any; } server { server_name any.example; root /var/www/html/any; location / {proxy_pass http://backend;} }}'
         self.assertNotEqual(nginx_edit.static_resource_controls(dump)['any.example'],'file-only')
 
+    def test_unconfigured_file_site_gets_default_exception(self):
+        config={'schemaVersion':1,'mode':'on','cdn':'direct','container':'nginx','sites':{}}
+        rendered=policy.render_profile_rules(config,resource_controls={'any.example':'file-only'})
+        self.assertIn('@beginsWith any.example|',rendered)
+        self.assertIn('ruleRemoveTargetById=932260;REQUEST_FILENAME',rendered)
+        self.assertNotIn('@beginsWith unsafe.example|',policy.render_profile_rules(config,resource_controls={'unsafe.example':'unsupported handler'}))
+
+    def test_legacy_native_switch_does_not_change_file_capability(self):
+        self.assertEqual(self.controls('modsecurity on; location / { modsecurity on; try_files $uri =404; }'),'file-only')
+
     def test_source_contract_validation_and_no_implicit_exemptions(self):
         base={'schemaVersion':1,'mode':'on','cdn':'direct','container':'nginx','sites':{'any.example':{'profile':'generic'}}}
         contract={'method':'POST','path':'/api/note','fields':['content']}

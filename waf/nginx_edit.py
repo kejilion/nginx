@@ -268,7 +268,7 @@ def static_resource_controls(dump):
                  'limit_req limit_conn limit_req_dry_run limit_conn_dry_run limit_rate '
                  'limit_rate_after allow deny auth_basic auth_basic_user_file satisfy '
                  'gzip gzip_types gzip_vary gzip_static etag if_modified_since '
-                 'try_files return disable_symlinks').split())
+                 'try_files return disable_symlinks modsecurity').split())
     inherited_allowed=allowed | set(('client_body_buffer_size client_body_timeout client_header_buffer_size client_header_timeout '
         'large_client_header_buffers keepalive_requests keepalive_timeout log_format modsecurity '
         'reset_timedout_connection send_timeout output_buffers server_names_hash_bucket_size server_names_hash_max_size '

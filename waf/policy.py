@@ -468,7 +468,8 @@ def render_profile_rules(config: dict, method_controls=None, resource_controls=N
             rid+=1
     # Capabilities come from a complete nginx -T snapshot, never from a client
     # header, extension alone, or an application profile.
-    for name in sorted(config['sites']):
+    static_names={name for name,state in (resource_controls or {}).items() if state=='file-only' and SCOPE.fullmatch(name) and name==name.lower()}
+    for name in sorted(config['sites'].keys() | static_names):
         if (resource_controls or {}).get(name)=='file-only':
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                       '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
@@ -476,7 +477,7 @@ def render_profile_rules(config: dict, method_controls=None, resource_controls=N
                       '    SecRule REQUEST_URI_RAW "@rx ^/[^%?]*(?:[?].*)?$" "t:none,chain"',
                       '    SecRule REQUEST_FILENAME "@rx ^/(?!.*[.][.])(?:[A-Za-z0-9_-]{1,64}/){0,8}[A-Za-z0-9][A-Za-z0-9_.-]{0,199}[.](?:webp|png|jpe?g|svg|ico|gif|avif|css|js|woff2?)$" "t:none,ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME"']
             rid+=1
-        for contract in config['sites'][name].get('sourceText',[]):
+        for contract in config['sites'].get(name,{}).get('sourceText',[]):
             flag='waf_source_'+str(rid)
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                       '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
