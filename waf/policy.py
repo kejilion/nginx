@@ -70,8 +70,9 @@ def validate(config: dict) -> dict:
     sites = config.get("sites", {})
     if not isinstance(sites, dict) or len(sites) > MAX_SITES:
         raise ValueError("Invalid or excessive sites")
+    contract_count=field_count=0
     for name, site in sites.items():
-        if set(site) - {"profile", "mode", "exclusions", "cdn", "trustedProxies", "proxyHeader", "methodOverride"}:
+        if set(site) - {"profile", "mode", "exclusions", "cdn", "trustedProxies", "proxyHeader", "methodOverride", "sourceText"}:
             raise ValueError("Unknown site policy fields")
         if scope(name) != name:
             raise ValueError("Site scopes must be normalized")
@@ -90,6 +91,20 @@ def validate(config: dict) -> dict:
                 raise ValueError("Exclusion requires one named argument or exact filename")
         if len(site.get("exclusions", [])) > 32:
             raise ValueError("Too many exclusions")
+        contracts=site.get('sourceText',[])
+        if not isinstance(contracts,list) or len(contracts)>16:raise ValueError('Too many source text contracts')
+        contract_count+=len(contracts)
+        if contract_count>256:raise ValueError('Global source text contract budget exceeded')
+        for contract in contracts:
+            if not isinstance(contract,dict) or set(contract)!={'method','path','fields'}:raise ValueError('Invalid source text contract')
+            if contract['method'] not in {'POST','PUT','PATCH'}:raise ValueError('Invalid source text method')
+            if not isinstance(contract['path'],str) or not re.fullmatch(r'/[A-Za-z0-9_/-]{1,200}',contract['path']) or '//' in contract['path']:raise ValueError('Source text requires a literal path')
+            fields=contract['fields']
+            if not isinstance(fields,list) or not 1<=len(fields)<=8 or any(not isinstance(f,str) for f in fields):raise ValueError('Invalid source text fields')
+            if len(set(fields))!=len(fields):raise ValueError('Duplicate source text fields')
+            field_count+=len(fields)
+            if field_count>1024:raise ValueError('Global source text field budget exceeded')
+            if any(not isinstance(field,str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:[.][A-Za-z_][A-Za-z0-9_]*){0,7}',field) for field in fields):raise ValueError('Invalid JSON field name')
         if "cdn" in site:
             validate({"schemaVersion": 1, "mode": config["mode"], "cdn": site["cdn"],
                       "container": config["container"], "sites": {},
@@ -356,7 +371,7 @@ def _content_application_rules(sites, first_id):
     return lines,rid
 
 
-def render_profile_rules(config: dict, method_controls=None) -> str:
+def render_profile_rules(config: dict, method_controls=None, resource_controls=None) -> str:
     # No capability proof means strict. Only the manager's complete Nginx graph
     # can establish absence of method-dependent gateway access controls.
     strict_all,strict_sites=method_controls if method_controls is not None else (True,set())
@@ -451,6 +466,33 @@ def render_profile_rules(config: dict, method_controls=None) -> str:
                       '    SecRule &REQUEST_HEADERS:/^(?i:content-encoding)$/ "@eq 1" "t:none,chain"',
                       '    SecRule REQUEST_HEADERS:Content-Encoding "@streq gzip" "t:none,t:lowercase,ctl:ruleRemoveTargetById=920450;REQUEST_HEADERS_NAMES:Content-Encoding,ctl:ruleRemoveTargetById=920450;REQUEST_HEADERS_NAMES:content-encoding,ctl:ruleRemoveTargetById=920450;REQUEST_HEADERS_NAMES:CONTENT-ENCODING"']
             rid+=1
+    # Capabilities come from a complete nginx -T snapshot, never from a client
+    # header, extension alone, or an application profile.
+    for name in sorted(config['sites']):
+        if (resource_controls or {}).get(name)=='file-only':
+            lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+                      '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
+                      '    SecRule REQUEST_URI_RAW "@rx ^/[^%?]*(?:[?].*)?$" "t:none,chain"',
+                      '    SecRule REQUEST_FILENAME "@rx ^/(?!.*[.][.])(?:[A-Za-z0-9_-]{1,64}/){0,8}[A-Za-z0-9][A-Za-z0-9_.-]{0,199}[.](?:webp|png|jpe?g|svg|ico|gif|avif|css|js|woff2?)$" "t:none,ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME"']
+            rid+=1
+        for contract in config['sites'][name].get('sourceText',[]):
+            flag='waf_source_'+str(rid)
+            lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:Content-Encoding "@eq 0" "t:none,chain"',
+                      '    SecRule &REQUEST_HEADERS:Content-Type "@eq 1" "t:none,chain"',
+                      '    SecRule &ARGS_GET:/^json[.]/ "@eq 0" "t:none,chain"',
+                      '    SecRule REQUEST_METHOD "@streq '+contract['method']+'" "t:none,chain"',
+                      '    SecRule REQUEST_HEADERS:Content-Type "@rx ^application/(?:[a-z0-9.+-]+\\+)?json(?:;|$)" "t:none,t:lowercase,chain"',
+                      '    SecRule REQUEST_FILENAME "@streq '+contract['path']+'" "t:none,setvar:tx.'+flag+'=1"']
+            rid+=1
+            for field in contract['fields']:
+                controls=','.join('ctl:ruleRemoveTargetByTag='+tag+';ARGS:json.'+field for tag in CODE_TAGS)
+                controls+=','+','.join('ctl:ruleRemoveTargetByTag='+tag+';REQUEST_BODY' for tag in CODE_TAGS)
+                lines += [f'SecRule TX:{flag} "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,chain"',
+                          '    SecRule &ARGS:json.'+field+' "@eq 1" "t:none,'+controls+'"']
+                rid+=1
     return "\n".join(lines + exceptions) + "\n"
 
 
@@ -543,11 +585,11 @@ def render_bans(records: dict, now: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def bundle_files(config: dict, cloudflare: list[str], method_controls=None, cache_controls=None) -> dict[str, str]:
+def bundle_files(config: dict, cloudflare: list[str], method_controls=None, cache_controls=None, resource_controls=None) -> dict[str, str]:
     validate(config)
     result = {
         "http.conf": render_http(config), "realip.conf": render_realip(config, cloudflare),
-        "server-default.inc": render_server(existing_bans=config.get('banBackend','existing')=='existing'), "profile-rules.conf": render_profile_rules(config,method_controls),
+        "server-default.inc": render_server(existing_bans=config.get('banBackend','existing')=='existing'), "profile-rules.conf": render_profile_rules(config,method_controls,resource_controls),
         "method-override.conf": render_method_override(),
         "modsecurity.conf": render_modsecurity(config), "request-guard.conf": render_guard(),
         "access-log.inc": 'access_log /var/log/nginx/waf-rate.log waf_rate if=$waf_rate_event;\n',

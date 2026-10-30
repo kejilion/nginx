@@ -139,6 +139,22 @@ def cases():
     upload=('--'+boundary+'\r\nContent-Disposition: form-data; name="file"; filename="backup.tar.gz"\r\nContent-Type: application/octet-stream\r\n\r\nfixture archive bytes\r\n--'+boundary+'--\r\n').encode()
     add('upload-multipart','POST','/upload',upload,headers={'Content-Type':'multipart/form-data; boundary='+boundary},host='upload.example')
     add('stream-sse','GET','/sse',headers={'Accept':'text/event-stream'},host='stream.example')
+    add('generic-source-text','POST','/api/source-note',{'content':'cat /etc/passwd; cp .env.example .env; <script> is code'},host='generic.example')
+    add('generic-source-title-protected','POST','/api/source-note',{'content':'code','title':'<script>alert(1)</script>'},403,host='generic.example')
+    add('generic-source-wrong-route','POST','/api/other-note',{'content':'cat /etc/passwd; cp .env.example .env'},403,host='generic.example')
+    add('generic-source-other-site','POST','/api/source-note',{'content':'cat /etc/passwd; cp .env.example .env'},403,host='api.example')
+    add('generic-source-wrong-method','PUT','/api/source-note',{'content':'cat /etc/passwd; cp .env.example .env'},403,host='generic.example')
+    add('generic-source-query-protected','POST','/api/source-note?q=%3Cscript%3Ealert(1)%3C/script%3E',{'content':'code'},403,host='generic.example')
+    add('generic-source-query-alias','POST','/api/source-note?json.content=%3Cscript%3Ealert(1)%3C/script%3E',{'content':'code'},403,host='generic.example')
+    add('generic-source-override','POST','/api/source-note',{'content':'cat /etc/passwd; cp .env.example .env'},403,headers={'X-HTTP-Method-Override':'PATCH'},host='generic.example')
+    add('generic-source-duplicate-type','POST','/api/source-note',{'content':'cat /etc/passwd; cp .env.example .env'},403,headers={'Content-Type':'application/json','content-type':'text/plain'},host='generic.example')
+    add('generic-source-duplicate-field','POST','/api/source-note',b'{"content":"safe","content":"cat /etc/passwd; cp .env.example .env"}',403,headers={'Content-Type':'application/json'},host='generic.example')
+    add('generic-file-resource','GET','/desktop-icons/xp/docker-v1.svg',host='static.example')
+    add('generic-file-resource-head','HEAD','/desktop-icons/xp/docker-v1.svg',host='static.example')
+    add('generic-file-query-protected','GET','/desktop-icons/xp/docker-v1.svg?q=%3Cscript%3Ealert(1)%3C/script%3E',expected=403,host='static.example')
+    add('generic-proxy-not-exempt','GET','/desktop-icons/xp/docker-v1.svg',expected=403,host='generic.example')
+    add('generic-file-post-not-exempt','POST','/desktop-icons/xp/docker-v1.svg',expected=403,host='static.example')
+    add('generic-file-encoding-not-exempt','GET','/desktop-icons/xp/%64ocker-v1.svg',expected=403,host='static.example')
     return result
 
 
@@ -148,15 +164,21 @@ def main():
     bundle=Path(__file__).resolve().parents[1];generated=work/'waf';generated.mkdir();logs=work/'logs';logs.mkdir()
     profiles={'panel.example':'kpanel','servercache.example':'kpanel','locationcache.example':'kpanel','generic.example':'generic','api.example':'api','cms.example':'wordpress','forum.example':'flarum','upload.example':'upload','stream.example':'streaming'}
     config=json.loads((bundle/'example-policy.json').read_text());config.update(mode='on',cdn='direct',sites={name:{'profile':profile}for name,profile in profiles.items()})
+    config['sites']['generic.example']['sourceText']=[{'method':'POST','path':'/api/source-note','fields':['content']}]
+    config['sites']['static.example']={'profile':'generic'}
+    assets=work/'desktop-icons/xp';assets.mkdir(parents=True);(assets/'docker-v1.svg').write_text('<svg/>')
     cf=policy.networks(json.loads((bundle/'cloudflare-ips.json').read_text()))
     def server(host):
         own='proxy_cache_bypass $http_x_skip_cache; proxy_no_cache $http_x_skip_cache;' if host=='servercache.example' else ''
         location='proxy_cache_bypass $http_x_location_cache; proxy_no_cache $http_x_location_cache;' if host=='locationcache.example' else ''
         return 'server { listen unix:/test/front.sock; server_name '+host+'; '+own+' location = /cache-fixture { '+location+' proxy_pass http://fixture; proxy_cache fixture; proxy_cache_valid 200 404 10m; proxy_cache_key "$host$request_uri"; add_header X-Fixture-Cache $upstream_cache_status always; } location / { proxy_pass http://fixture; proxy_http_version 1.1; proxy_set_header Connection close; } }'
     raw_servers='\n'.join(server(host)for host in [*profiles,'other.example'])
+    raw_servers+='server { listen unix:/test/front.sock; server_name static.example; root /var/www/html/fixture; location / { try_files $uri =404; } }'
     inherited='proxy_cache_bypass $arg_nocache; proxy_no_cache $arg_nocache;'
     controls=nginx_edit.cache_inheritance('# configuration file /etc/nginx/nginx.conf:\nhttp { '+inherited+raw_servers+' }')
-    for name,text in policy.bundle_files(config,cf,cache_controls=controls).items():(generated/name).write_text(text)
+    resources=nginx_edit.static_resource_controls('# configuration file /etc/nginx/nginx.conf:\nhttp { '+inherited+raw_servers+' }')
+    assert resources['static.example']=='file-only' and resources['generic.example']!='file-only'
+    for name,text in policy.bundle_files(config,cf,cache_controls=controls,resource_controls=resources).items():(generated/name).write_text(text)
     (generated/'blocked.map').write_text(policy.render_bans({},int(time.time())))
     backend=UnixHTTP(str(work/'backend.sock'),ApplicationBackend);os.chmod(work/'backend.sock',0o666)
     threading.Thread(target=backend.serve_forever,daemon=True).start()
@@ -165,7 +187,7 @@ def main():
     name='waf-kpanel-contract-'+uuid.uuid4().hex[:8];results=[]
     def run(cmd):return subprocess.run(cmd,capture_output=True,check=True,timeout=60)
     try:
-        run(['docker','run','-d','--pull=never','--name',name,'--network=none','--read-only','--memory=768m','--cpus=1','--pids-limit=64','--tmpfs','/tmp:rw,nosuid,size=64m','--tmpfs','/run:rw,nosuid,size=8m','--tmpfs','/var/cache/nginx:rw,nosuid,size=16m','--mount','type=bind,src='+str(work)+',dst=/test','--mount','type=bind,src='+str(logs)+',dst=/var/log/nginx','--mount','type=bind,src='+str(generated)+',dst=/etc/nginx/conf.d/waf,readonly','--mount','type=bind,src='+str(work/'nginx.conf')+',dst=/etc/nginx/nginx.conf,readonly','--entrypoint','nginx',args.image,'-g','daemon off;'])
+        run(['docker','run','-d','--pull=never','--name',name,'--network=none','--read-only','--memory=768m','--cpus=1','--pids-limit=64','--tmpfs','/tmp:rw,nosuid,size=64m','--tmpfs','/run:rw,nosuid,size=8m','--tmpfs','/var/cache/nginx:rw,nosuid,size=16m','--mount','type=bind,src='+str(work)+',dst=/test','--mount','type=bind,src='+str(logs)+',dst=/var/log/nginx','--mount','type=bind,src='+str(generated)+',dst=/etc/nginx/conf.d/waf,readonly','--mount','type=bind,src='+str(work/'nginx.conf')+',dst=/etc/nginx/nginx.conf,readonly','--mount','type=bind,src='+str(work)+',dst=/var/www/html/fixture,readonly','--entrypoint','nginx',args.image,'-g','daemon off;'])
         for _ in range(100):
             if(work/'front.sock').exists():break
             time.sleep(.1)

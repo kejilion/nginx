@@ -1,0 +1,43 @@
+import copy
+import sys
+import unittest
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+import nginx_edit
+import policy
+
+class SemanticsTests(unittest.TestCase):
+    def controls(self,body='',parent=''):
+        return nginx_edit.static_resource_controls('# configuration file /etc/nginx/nginx.conf:\nhttp { '+parent+' server { server_name any.example; root /var/www/html/any; '+body+' }}')['any.example']
+
+    def test_file_only_is_independent_of_application(self):
+        self.assertEqual(self.controls('location / { try_files $uri =404; }'),'file-only')
+        self.assertEqual(self.controls('location / { try_files $uri $uri/ /index.html; }'),'file-only')
+
+    def test_dynamic_or_uncertain_handlers_never_inherit_static_exception(self):
+        for body in ['location / { proxy_pass http://backend; }','location ~ \\.php$ { fastcgi_pass unix:/run/php; }',
+                     'location / { try_files $uri /index.php; }','location / { alias /tmp; }',
+                     'location / { custom_handler on; }','rewrite ^ /index.html last;',
+                     'root $arg_root;','location / { js_content handler; }']:
+            with self.subTest(body=body):self.assertNotEqual(self.controls(body),'file-only')
+
+    def test_inherited_execution_and_unknown_modules_fail_closed(self):
+        for parent in ['access_by_lua_file /test.lua;','rewrite_by_lua_block { return; }','custom_handler on;']:
+            self.assertNotEqual(self.controls(parent=parent),'file-only')
+
+    def test_conflicting_same_name_servers_fail_closed(self):
+        dump='# configuration file /etc/nginx/nginx.conf:\nhttp { server { server_name any.example; root /var/www/html/any; } server { server_name any.example; root /var/www/html/any; location / {proxy_pass http://backend;} }}'
+        self.assertNotEqual(nginx_edit.static_resource_controls(dump)['any.example'],'file-only')
+
+    def test_source_contract_validation_and_no_implicit_exemptions(self):
+        base={'schemaVersion':1,'mode':'on','cdn':'direct','container':'nginx','sites':{'any.example':{'profile':'generic'}}}
+        contract={'method':'POST','path':'/api/note','fields':['content']}
+        self.assertNotIn('waf_source_',policy.render_profile_rules(base))
+        for bad in [dict(contract,path='/.*'),dict(contract,method='GET'),dict(contract,fields=['a;deny']),dict(contract,fields=['content','content'])]:
+            value=copy.deepcopy(base);value['sites']['any.example']['sourceText']=[bad]
+            with self.assertRaises(ValueError):policy.validate(value)
+        base['sites']['any.example']['sourceText']=[contract]
+        policy.validate(base)
+        self.assertIn('waf_source_',policy.render_profile_rules(base))
+
+if __name__=='__main__':unittest.main()

@@ -49,6 +49,20 @@ python3 -B configure.py status
 
 ## 通用请求语义兼容
 
+共享管理器根据完整 `nginx -T` 能力图为纯文件站点自动生成通用静态资源例外，不依赖 `profile` 或站点名称。仅 GET/HEAD、规范字面路径及受限资源扩展名可排除 932260 的路径目标；查询、其他规则、认证与限流继续执行。发现代理、PHP、脚本处理器、动态 root、未知指令或无法证明的回退时保持原检查。配置改变后先执行受管 apply/刷新，再检查 doctor；原始 Nginx reload 不会重新计算能力。
+
+代码正文使用站点策略中的 `sourceText` 语义声明，例如：
+
+```json
+"sourceText": [{"method":"POST","path":"/api/source-note","fields":["content"]}]
+```
+
+声明与应用类型无关，只适用于管理员确认作为代码或富文本处理的 JSON 字段。要求指定方法、精确路径、单个 JSON 媒体头、无压缩和方法覆盖、无 `json.*` 查询参数；指定字段在 phase 2 恰好出现一次时才排除该字段的代码注入目标及重复的原始正文检查，其他 JSON 字段继续扫描。应用仍负责身份、CSRF、内容渲染和存储安全。每站最多 16 个端点、每端点 8 个字面字段，未知键/模式/重复字段拒绝。
+
+`status`/`doctor` 的 `requestSemantics` 回读静态例外的证明或保守拒绝原因、正文声明数量和同步状态；配置漂移令 doctor 失败。删除声明并 apply 可撤销正文例外，静态处理能力消失后受管刷新也会撤销例外。旧 profile 和精确 exclusions 仍兼容，不自动把任意正文识别为安全内容。
+
+2026-10-30 本地候选验证：同正式服镜像的隔离应用矩阵 162 项、引擎集成 181 项、相关单测 88 项通过。完整单测中的两项封禁检查在未修改基线上也失败，未将其记为通过；本轮未改封禁逻辑。独立复核、正式服应用及公共发布尚未完成。原始测试位于试点主机 `/tmp/waf-semantics-contract2`、`/tmp/waf-semantics-integration2`；这些是隔离测试记录，不是线上业务证明。
+
 共享修复 `eb58fe4` 将方法覆盖按协议行为统一处理，不绑定 Flarum、域名或 `/api` 路径。仅原始 POST、单个 `X-HTTP-Method-Override` / `X-HTTP-Method` / `X-Method-Override` 头、明确的 PUT/PATCH/DELETE 且完整匹配既有允许方法时，才可进入兼容处理。请求方法及正文不改写，SQLi/XSS 等攻击检查继续执行；重复、冲突、危险值、覆盖头与顶层 query/body `_method` 混用仍由协议守卫按原评分基线拦截。参数 `_method` 单独使用仍遵循原有 PL1/PL2 行为，此开关不替代框架授权或 CSRF 防护。
 
 默认策略为 `methodOverride: guarded`，但只有管理工具核对完整 `nginx -T` 能力图后才激活。遇到 `limit_except`、按原始方法派生的权限条件、认证子请求、脚本认证或方法头改写等不确定语义时，对相应作用域保持 strict。覆盖请求不继承 WordPress、KPanel、Git 及自定义参数的业务排除，避免把原 POST 的特例错误用于另一种方法。也可明确设置全局或站点 `methodOverride: strict`；原有 WAF Off/Detect/On 和 CDN 模式独立保留。
