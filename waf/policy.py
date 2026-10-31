@@ -83,12 +83,16 @@ def validate(config: dict) -> dict:
         if site.get('methodOverride',config.get('methodOverride','guarded')) not in {'guarded','strict'}:
             raise ValueError('Invalid site method override policy')
         for rule in site.get("exclusions", []):
-            if not isinstance(rule.get("ruleId"), int) or not 900000 <= rule["ruleId"] <= 999999:
-                raise ValueError("Exclusions must identify a CRS rule")
+            if not isinstance(rule.get("ruleId"), int) or not (900000 <= rule["ruleId"] <= 999999 or rule["ruleId"] == 1110):
+                raise ValueError("Exclusions must identify a CRS rule or the exact dot-path guard")
             if not re.fullmatch(r"/[\w./-]{0,250}", rule.get("path", "")):
                 raise ValueError("Exclusion requires an exact path")
             if rule.get('target')!='REQUEST_FILENAME' and not re.fullmatch(r"ARGS:[A-Za-z0-9_.\[\]-]{1,100}", rule.get("target", "")):
                 raise ValueError("Exclusion requires one named argument or exact filename")
+            if rule['ruleId']==1110 and (rule['target']!='REQUEST_FILENAME' or
+                    not re.fullmatch(r'/[A-Za-z0-9_./-]{1,250}',rule['path']) or
+                    '//' in rule['path'] or any(part in {'.','..'} for part in rule['path'].split('/'))):
+                raise ValueError('Dot-path guard exclusion requires a canonical ASCII filename path')
         if len(site.get("exclusions", [])) > 32:
             raise ValueError("Too many exclusions")
         contracts=site.get('sourceText',[])
@@ -416,6 +420,9 @@ def render_profile_rules(config: dict, method_controls=None, resource_controls=N
             ]
             if item['target']=='REQUEST_FILENAME':
                 exceptions.append('    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"')
+            if item['ruleId']==1110:
+                # Administrator-attested public files never cover encoded aliases.
+                exceptions.append('    SecRule REQUEST_URI_RAW "@rx ^'+re.escape(item['path'])+'(?:[?].*)?$" "t:none,chain"')
             exceptions.append(f'    SecRule REQUEST_FILENAME "@streq {item["path"]}" "t:none,ctl:ruleRemoveTargetById={item["ruleId"]};{item["target"]}"')
             rid += 1
     if global_mode != "on" and engine_enabled(config):

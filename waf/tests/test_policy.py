@@ -125,6 +125,19 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.validate(self.config)
 
+    def test_dot_guard_exclusion_is_exact_filename_only(self):
+        entry={'ruleId':1110,'path':'/raw.example/repo/main/.env','target':'REQUEST_FILENAME'}
+        self.config['sites']={'one.example':{'exclusions':[entry]}}
+        policy.validate(self.config)
+        rendered=policy.render_profile_rules(self.config)
+        self.assertIn('REQUEST_URI_RAW "@rx ^/raw\\.example/repo/main/\\.env(?:[?].*)?$',rendered)
+        self.assertIn('ruleRemoveTargetById=1110;REQUEST_FILENAME',rendered)
+        self.assertNotIn('ruleRemoveById=1110',rendered)
+        for field,value in [('ruleId',1111),('target','ARGS:file'),('path','/x/../.env'),('path','//.env'),('path','/x/%2eenv'),('path','/x/./.env'),('path','/例/.env')]:
+            bad=dict(entry);bad[field]=value
+            self.config['sites']['one.example']['exclusions']=[bad]
+            with self.subTest(field=field,value=value),self.assertRaises(ValueError):policy.validate(self.config)
+
     def test_no_global_business_path_blacklist_or_acme_bypass(self):
         rendered = policy.render_guard()
         for path in ['/feed', '/readme.html', '/xmlrpc.php', 'allow,', 'ruleEngine=Off']:

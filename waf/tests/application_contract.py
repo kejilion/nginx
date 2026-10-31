@@ -157,6 +157,21 @@ def cases():
     add('generic-proxy-not-exempt','GET','/desktop-icons/xp/docker-v1.svg',expected=403,host='generic.example')
     add('generic-file-post-not-exempt','POST','/desktop-icons/xp/docker-v1.svg',expected=403,host='static.example')
     add('generic-file-encoding-not-exempt','GET','/desktop-icons/xp/%64ocker-v1.svg',expected=403,host='static.example')
+    public_file='/raw.example/acme/project/main/compose/.env'
+    for method in ['GET','HEAD']:
+        add('explicit-public-dotfile-'+method,method,public_file,host='generic.example')
+    for host,path,method,headers in [
+        ('other.example',public_file,'GET',{}),
+        ('generic.example',public_file,'POST',{}),
+        ('generic.example',public_file,'GET',{'X-HTTP-Method-Override':'DELETE'}),
+        ('generic.example',public_file+'?q=%3Cscript%3Ealert(1)%3C/script%3E','GET',{}),
+        ('generic.example',public_file.replace('/.env','/%2eenv'),'GET',{}),
+        ('generic.example',public_file.replace('/.env','/%252eenv'),'GET',{}),
+        ('generic.example',public_file.replace('/.env','/../.env'),'GET',{}),
+        ('generic.example',public_file+'.backup','GET',{}),
+        ('generic.example','/.env','GET',{}),
+        ('generic.example','/.git/config','GET',{})]:
+        add('dotfile-guard-'+host+path+method,method,path,expected=403,headers=headers,host=host)
     return result
 
 
@@ -167,6 +182,7 @@ def main():
     profiles={'panel.example':'kpanel','servercache.example':'kpanel','locationcache.example':'kpanel','generic.example':'generic','api.example':'api','cms.example':'wordpress','forum.example':'flarum','upload.example':'upload','stream.example':'streaming'}
     config=json.loads((bundle/'example-policy.json').read_text());config.update(mode='on',cdn='direct',sites={name:{'profile':profile}for name,profile in profiles.items()})
     config['sites']['generic.example']['sourceText']=[{'method':'POST','path':'/api/source-note','fields':['content']}]
+    config['sites']['generic.example']['exclusions']=[{'ruleId':rule,'path':'/raw.example/acme/project/main/compose/.env','target':'REQUEST_FILENAME'}for rule in [1110,930130]]
     # A fresh static site has no explicit policy/profile entry.
     assets=work/'desktop-icons/xp';assets.mkdir(parents=True);(assets/'docker-v1.svg').write_text('<svg/>')
     cf=policy.networks(json.loads((bundle/'cloudflare-ips.json').read_text()))

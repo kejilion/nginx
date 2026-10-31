@@ -305,6 +305,10 @@ EU 先后使用正式产物试点，语法、就绪、普通源站/公网请求�
 
 限制：未完成独立复核、长期生产观察或所有用户自定义配置的实测；未知动作和数据库不可用时保留原配置并提示。源代码回退点为共享包 `b6d8bda9c004abaf9f7dfad14ef2c6373c3546ae` 与脚本 `8a37071308feac7de2676fc8071c0ce5cee65a11`，这两个旧版本存在本轮修复的问题，回退后必须检查 Fail2Ban 动作及 CF 同步；正式配置按各主机安装事务的恢复点回滚。KPanel 配套变更仍在本地候选分支，未发布。
 
+### 精确公开点文件例外
+
+管理员核实某个点文件确为公开下载资源后，可在该站点既有 `exclusions` 中使用 `{"ruleId":1110,"path":"/raw.example/owner/repo/main/compose/.env","target":"REQUEST_FILENAME"}`。此能力适用于所有配置档，不依赖站点类型；公共默认不添加任何业务文件或域名。仅接受 ASCII 字面路径、GET/HEAD、无方法覆盖头，原始路径必须逐字匹配；编码别名、`.` / `..` 路径段及重复斜杠不适用。只移除该精确路径在点文件守卫中的目标，查询、正文、其他规则及其他本地敏感文件继续检查。若同时命中 CRS，还须另行核实其具体规则；不能批量放行 `.env` 或全部远程地址。依据：[ModSecurity 运行期目标排除](https://github.com/owasp-modsecurity/ModSecurity/wiki/Reference-Manual-%28v3.x%29#ctl)。
+
 ### 2026-10-29 站点封禁递进发布
 
 共享包 `d8c178df8c851419087194178314473ec6a6a478` 与脚本 `108ccf2a3db470594f64471b96bdeeb191532274` 已发布；脚本版本仍为 4.5.16。默认首次 600 秒时，同一站点、客户端和来源依次为 10 分钟、1 小时、6 小时、24 小时；持续命中可能延长实际结束时间，投影每次最多覆盖未来 24 小时。已有自定义阈值和支持的递进设置保留。历史记忆期限由宿主 Fail2Ban 数据库配置决定；仅更新脚本不会替换既有 Jail，需通过原建站防护安装/升级入口应用。依据：[Fail2Ban 官方 jail 配置](https://github.com/fail2ban/fail2ban/blob/master/config/jail.conf)及[递进动作说明](https://github.com/fail2ban/fail2ban/blob/master/ChangeLog)。
