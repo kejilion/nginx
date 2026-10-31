@@ -311,6 +311,8 @@ EU 先后使用正式产物试点，语法、就绪、普通源站/公网请求�
 
 本轮核实 [Paperless 官方公开 compose 环境文件](https://raw.githubusercontent.com/paperless-ngx/paperless-ngx/refs/heads/main/docker/compose/.env)在公开源与镜像后端返回同样的 200 正文，前端点文件守卫拦截；站点只声明该完整文件路径，不扩展全部远程点文件。固定生产镜像 `sha256:5cdeeb593a6a1f517acb733e5f92cb33695e2d84847e3955d763008ca12993c1` 的无网络隔离环境通过 176 项应用正反例、181 项引擎集成，以及 95 项相关单元检查（不包含未修改的 `test_ban.py`）。独立只读复核未发现新增可确认缺陷；复核环境缺少 Python/Docker，运行时验证由独立 Linux 隔离测试提供。首次测试因临时目录权限及缺少模板失败，补齐测试夹具并使用受保护临时目录后重跑通过；未放宽管理工具的权限检查。本轮不改镜像、版本号、封禁机制或默认例外；代码回退基线为 `c830bf34ae6da8e183b4892860fbce30ea6dc651`。
 
+正式服使用同一产物试点后，该完整公开文件返回 200 且正文与上游一致；公共固定包 [`4c08b76`](https://github.com/kejilion/nginx/commit/4c08b76a38f08069a589aa48b2a80c55d61823ad) 的七文件摘要及字节、脚本 [`afa0330`](https://github.com/kejilion/sh/commit/afa03300e36794e555e1e9f8a27fa5e381c15cf3) 根/CN 字节均回读一致。两处实际脚本仅替换共享包 pin 与 `policy.py` 摘要，真实 `k web waf doctor` 通过，WAF On 且重复计划无差异。配置恢复点 `/home/web/backups/waf-managed/20261031T020745329530Z-policy`，脚本原件在 `/home/web/backups/waf-dotfile-20261031`；回退时先恢复配置，再恢复两处脚本固定引用。只验证了短窗口，未验证登录后的管理操作；日志中的搜索类及不透明加密字段请求仍需独立核实，不借本次修复扩大排除。已有用户须更新脚本并通过原受管应用/刷新入口取得新包；公共默认不自动添加文件例外。
+
 ### 2026-10-29 站点封禁递进发布
 
 共享包 `d8c178df8c851419087194178314473ec6a6a478` 与脚本 `108ccf2a3db470594f64471b96bdeeb191532274` 已发布；脚本版本仍为 4.5.16。默认首次 600 秒时，同一站点、客户端和来源依次为 10 分钟、1 小时、6 小时、24 小时；持续命中可能延长实际结束时间，投影每次最多覆盖未来 24 小时。已有自定义阈值和支持的递进设置保留。历史记忆期限由宿主 Fail2Ban 数据库配置决定；仅更新脚本不会替换既有 Jail，需通过原建站防护安装/升级入口应用。依据：[Fail2Ban 官方 jail 配置](https://github.com/fail2ban/fail2ban/blob/master/config/jail.conf)及[递进动作说明](https://github.com/fail2ban/fail2ban/blob/master/ChangeLog)。
