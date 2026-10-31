@@ -305,9 +305,11 @@ EU 先后使用正式产物试点，语法、就绪、普通源站/公网请求�
 
 限制：未完成独立复核、长期生产观察或所有用户自定义配置的实测；未知动作和数据库不可用时保留原配置并提示。源代码回退点为共享包 `b6d8bda9c004abaf9f7dfad14ef2c6373c3546ae` 与脚本 `8a37071308feac7de2676fc8071c0ce5cee65a11`，这两个旧版本存在本轮修复的问题，回退后必须检查 Fail2Ban 动作及 CF 同步；正式配置按各主机安装事务的恢复点回滚。KPanel 配套变更仍在本地候选分支，未发布。
 
-### 精确公开点文件例外
+### 2026-10-31 精确公开点文件例外
 
 管理员核实某个点文件确为公开下载资源后，可在该站点既有 `exclusions` 中使用 `{"ruleId":1110,"path":"/raw.example/owner/repo/main/compose/.env","target":"REQUEST_FILENAME"}`。此能力适用于所有配置档，不依赖站点类型；公共默认不添加任何业务文件或域名。仅接受 ASCII 字面路径、GET/HEAD、无方法覆盖头，原始路径必须逐字匹配；编码别名、`.` / `..` 路径段及重复斜杠不适用。只移除该精确路径在点文件守卫中的目标，查询、正文、其他规则及其他本地敏感文件继续检查。若同时命中 CRS，还须另行核实其具体规则；不能批量放行 `.env` 或全部远程地址。依据：[ModSecurity 运行期目标排除](https://github.com/owasp-modsecurity/ModSecurity/wiki/Reference-Manual-%28v3.x%29#ctl)。
+
+本轮核实 [Paperless 官方公开 compose 环境文件](https://raw.githubusercontent.com/paperless-ngx/paperless-ngx/refs/heads/main/docker/compose/.env)在公开源与镜像后端返回同样的 200 正文，前端点文件守卫拦截；站点只声明该完整文件路径，不扩展全部远程点文件。固定生产镜像 `sha256:5cdeeb593a6a1f517acb733e5f92cb33695e2d84847e3955d763008ca12993c1` 的无网络隔离环境通过 176 项应用正反例、181 项引擎集成，以及 95 项相关单元检查（不包含未修改的 `test_ban.py`）。独立只读复核未发现新增可确认缺陷；复核环境缺少 Python/Docker，运行时验证由独立 Linux 隔离测试提供。首次测试因临时目录权限及缺少模板失败，补齐测试夹具并使用受保护临时目录后重跑通过；未放宽管理工具的权限检查。本轮不改镜像、版本号、封禁机制或默认例外；代码回退基线为 `c830bf34ae6da8e183b4892860fbce30ea6dc651`。
 
 ### 2026-10-29 站点封禁递进发布
 
