@@ -540,6 +540,12 @@ Include /etc/nginx/modsec/plugins/*-config.conf
 Include {BASE}/request-guard.conf
 Include /etc/nginx/modsec/plugins/wordpress-rule-exclusions-before.conf
 Include {BASE}/method-override.conf
+# Nginx validates HTTP/3 authority before invoking the connector. Its header
+# list omits the :authority pseudo-header, so CRS cannot require a literal Host.
+# Match the parsed protocol, never a client forwarding header; keep empty Host
+# and every other protocol/attack rule active.
+SecRule REQUEST_PROTOCOL "@streq HTTP/3.0" "id:200008,phase:1,pass,nolog,t:none,chain"
+    SecRule &REQUEST_HEADERS:Host "@eq 0" "t:none,ctl:ruleRemoveById=920280"
 Include /etc/nginx/modsec/rules/*.conf
 SecRuleUpdateTargetById 920450 "!REQUEST_HEADERS_NAMES:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/"
 SecRule TX:BLOCKING_INBOUND_ANOMALY_SCORE "@ge 5" "id:1112,phase:5,pass,nolog,ctl:auditEngine=On"
