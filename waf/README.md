@@ -319,6 +319,8 @@ EU 先后使用正式产物试点，语法、就绪、普通源站/公网请求�
 
 本轮日志确认两条公开仓库资源因仓库名以点开头被守卫阻断共 6 次，公开源和镜像后端均返回 200；有界读取的正文片段摘要一致，不将截断读取冒充完整文件一致性。生产固定 amd64 镜像 `sha256:5cdeeb593a6a1f517acb733e5f92cb33695e2d84847e3955d763008ca12993c1` 的无网络隔离测试通过 198 项应用、181 项引擎、23 项 HTTP/1.1 / HTTP/2 / HTTP/3 检查和 96 项相关单元检查，未修改的 `test_ban.py` 未纳入此次单元结果；继承已发布的 HTTP/3 authority 修复。独立只读复核未发现新增可确认缺陷，复核进程未执行运行时测试。首次单元检查因归档带来的暂存目录/文件可写权限失败，收紧私有测试副本权限后重跑通过，未修改管理工具的权限校验。代码回退基线 `31ace4394e1dd1c3864ea27d4e0924b5613d4183`，原生脚本公共基线 `71d4e8f1b19f646fce15013d46059196fe623e4c`；不改镜像、版本号、封禁机制或自动增加例外。
 
+108 试点恢复两条完整路径为 200，抽样正文摘要与预期一致；保留此前公开文件例外。配置事务备份 `/home/web/backups/waf-managed/20261101T020523453772Z-policy`，两处原脚本与原策略在 `/home/web/backups/waf-url-dotfile-20261101`。固定包 [`87848a0`](https://github.com/kejilion/nginx/commit/87848a0f98b80b3e26f68e6d516184e27ece628d) 七文件公开字节及摘要、脚本 [`777908e`](https://github.com/kejilion/sh/commit/777908e62893053b12ac6981eb1cf75eaae6c59c) 根/CN 各自字节均回读一致；12 项包引导检查及根/CN Shell 语法通过。正式服两处实际脚本仅替换固定包 revision 和 `policy.py` 摘要，真实 `k web waf doctor` 通过，WAF On、配置无漂移，正常业务和私有管理入口为 200。短窗口未再见对应拦截，不能外推长期稳定或登录后业务已验证。回退先恢复该配置事务，再恢复两处原脚本；本机原包 pin 为 `4c08b76`，回退会同时失去后来继承的 HTTP/3 修复。已有用户更新脚本并通过原受管应用/刷新入口获取公共能力，具体公开资源仍须管理员精确声明；搜索及编码异常请求未扩大排除。
+
 ### 2026-11-01 HTTP/3 authority 兼容修复
 
 配置包候选 `67f76ea02d2c88f6e9b6af17009ae4baaac49ee3` 仅在解析协议为 `HTTP/3.0` 且没有字面 `Host` 头时，运行期移除 CRS `920280` 缺 Host 检查。Nginx 在进入模块前已校验 authority；HTTP/1.x、HTTP/2、空 Host、其他协议检查及攻击检测不扩大豁免。依据：[HTTP/3 请求伪头](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3.1)、[Nginx 1.31.8 校验实现](https://raw.githubusercontent.com/nginx/nginx/release-1.31.8/src/http/v3/ngx_http_v3_request.c)、[连接器 1.0.4 头列表传递](https://raw.githubusercontent.com/owasp-modsecurity/ModSecurity-nginx/v1.0.4/src/ngx_http_modsecurity_rewrite.c)。保留 HTTP/3，无须更换镜像或修改 KPanel。
