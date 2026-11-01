@@ -651,9 +651,17 @@ action = waf-unified-api[site=one.example.com]
             return subprocess.CompletedProcess(command,255,
                 f"Sorry but the jail '{command[2]}' does not exist\n",'NOK')
         with patch.object(subprocess,'run',side_effect=reply):
-            ban.clear(self.root)
+            ban.clear(self.root,allow_missing=True)
         self.assertEqual(ban.state(self.root)['records'],{})
         self.assertFalse(any(call.args[0:2]==('fail2ban-client','set') for call in self.execute.call_args_list))
+
+    def test_ordinary_clear_preserves_projection_when_jail_missing(self):
+        ban.save(self.root,'bans.json',self.value)
+        reply=subprocess.CompletedProcess([],255,"Sorry but the jail 'waf-attack' does not exist\n",'NOK')
+        with patch.object(subprocess,'run',return_value=reply):
+            with self.assertRaisesRegex(ValueError,'Cannot read complete'):
+                ban.clear(self.root)
+        self.assertEqual(ban.state(self.root)['records'],self.value['records'])
 
     def test_remove_with_missing_jails_disables_owned_integration(self):
         jail=self.f2b/'jail.d/zz-waf-managed.local'
