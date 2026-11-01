@@ -477,7 +477,13 @@ def make_plan(root, config, cfdata=None):
         raise ValueError('Site count exceeds supported budget')
     policy.validate(config)
     directory = root / 'conf.d/waf'
-    for name, content in policy.bundle_files(config, cloudflare,method_controls,cache_controls).items():
+    # Prove the configuration that this transaction will actually install,
+    # including native switch and legacy global-rule migration.
+    replacements={'/etc/nginx/'+str(path.relative_to(root)).replace('\\','/'):data.decode() for path,data in changes.items()}
+    replacements.update({'/etc/nginx/conf.d/waf/'+name:text for name,text in policy.bundle_files(config,cloudflare,method_controls,cache_controls).items()})
+    replacements.setdefault('/etc/nginx/conf.d/waf/blocked.map','')
+    resource_controls=nginx_edit.static_resource_controls(nginx_edit.candidate_configuration(effective,replacements))
+    for name, content in policy.bundle_files(config, cloudflare,method_controls,cache_controls,resource_controls).items():
         changes[directory / name] = content.encode()
     changes[directory / 'cloudflare-ips.json'] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()
     changes[current] = (json.dumps(cfdata, sort_keys=True)+'\n').encode()
@@ -643,9 +649,11 @@ def configured_status(root,config):
     nginx_edit.configuration_headers(effective,{'/etc/nginx/conf.d/'+path.name for path in files})
     strict_all,strict_sites=nginx_edit.method_override_controls(effective)
     profile=root/'conf.d/waf/profile-rules.conf'
-    synchronized=profile.exists() and read_config(profile)==policy.render_profile_rules(config,(strict_all,strict_sites))
+    resources=nginx_edit.static_resource_controls(effective)
+    synchronized=profile.exists() and read_config(profile)==policy.render_profile_rules(config,(strict_all,strict_sites),resources)
     mode='off' if not engine else ('on' if not policy.engine_enabled(config) else (next(iter(modes)) if len(modes)==1 else 'mixed'))
     return {'mode':mode,'engineEnabled':engine,'sites':config['sites'],'siteCount':len(names),
+            'requestSemantics':{'staticResources':resources,'sourceTextContracts':{name:len(site.get('sourceText',[])) for name,site in config['sites'].items() if site.get('sourceText')},'synchronized':synchronized},
             'banBackend':config.get('banBackend','existing'),'source':'configuration',
             'methodOverride':{'configured':config.get('methodOverride','guarded'),
                               'gatewayStrictAll':strict_all,'gatewayStrictSites':sorted(strict_sites),

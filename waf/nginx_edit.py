@@ -243,7 +243,8 @@ def configuration_scopes(dump):
                 target=stream[i+1].value.strip('\"\'')
                 if '$' in target:raise ValueError('Dynamic Nginx include needs explicit migration')
                 if not target.startswith('/'):target=posixpath.join('/etc/nginx',target)
-                matches=sorted(n for n in files if fnmatch.fnmatchcase(n,target))
+                # Nginx glob '*' does not cross a directory separator.
+                matches=sorted(n for n in files if len(n.split('/'))==len(target.split('/')) and all(fnmatch.fnmatchcase(part,pattern) for part,pattern in zip(n.split('/'),target.split('/'))))
                 if not matches and not any(c in target for c in '*?['):
                     raise ValueError('Missing include snapshot: '+target)
                 for match in matches:out.extend(expand(match,(*parents,name)))
@@ -255,6 +256,63 @@ def configuration_scopes(dump):
     main='/etc/nginx/nginx.conf'
     if main not in files: raise ValueError('Missing main configuration snapshot')
     return statement_scopes(expand(main))
+
+
+def candidate_configuration(dump, replacements):
+    """Overlay validated candidate bytes without discarding external includes."""
+    parts=re.split(r'(?m)^# configuration file ([^\r\n]+):\n',dump)
+    files=dict(zip(parts[1::2],parts[2::2]))
+    files.update(replacements)
+    return ''.join('# configuration file '+name+':\n'+body+'\n' for name,body in files.items())
+
+
+def static_resource_controls(dump):
+    """Prove file-only handlers from the expanded config, independently of app names."""
+    groups=configuration_scopes(dump); decisions={}
+    allowed=set(('listen server_name root index charset default_type types_hash_max_size '
+                 'ssl_certificate ssl_certificate_key ssl_protocols ssl_ciphers ssl_prefer_server_ciphers '
+                 'add_header add_header_inherit expires access_log error_log log_not_found '
+                 'aio sendfile tcp_nopush tcp_nodelay open_file_cache open_file_cache_valid '
+                 'open_file_cache_min_uses open_file_cache_errors client_max_body_size '
+                 'limit_req limit_conn limit_req_dry_run limit_conn_dry_run limit_rate '
+                 'limit_rate_after allow deny auth_basic auth_basic_user_file satisfy '
+                 'gzip gzip_types gzip_vary gzip_static etag if_modified_since '
+                 'try_files return disable_symlinks modsecurity').split())
+    inherited_allowed=allowed | set(('client_body_buffer_size client_body_timeout client_header_buffer_size client_header_timeout '
+        'large_client_header_buffers keepalive_requests keepalive_timeout log_format modsecurity '
+        'reset_timedout_connection send_timeout output_buffers server_names_hash_bucket_size server_names_hash_max_size '
+        'server_tokens types_hash_bucket_size variables_hash_bucket_size variables_hash_max_size '
+        'gzip_buffers gzip_comp_level gzip_min_length http2 http2_body_preread_size http2_chunk_size '
+        'http2_max_concurrent_streams http2_recv_buffer_size http3 http3_max_concurrent_streams http3_stream_buffer_size '
+        'quic_active_connection_id_limit quic_gso quic_retry ssl_buffer_size ssl_certificate_cache ssl_session_cache ssl_session_timeout ssl_session_tickets gzip_proxied limit_req_zone limit_req_status limit_conn_zone limit_conn_status').split())
+    inherited_allowed |= {prefix+suffix for prefix in ['proxy_','fastcgi_'] for suffix in ('buffer_size buffering buffers busy_buffers_size cache_background_update cache_bypass cache_key cache_lock cache_lock_timeout cache_methods cache_path cache_use_stale cache_valid connect_timeout hide_header intercept_errors keep_conn max_temp_file_size no_cache read_timeout send_timeout socket_keepalive headers_hash_bucket_size headers_hash_max_size').split()}
+    inherited_reason=''
+    for node in groups.values():
+        if node['kind']=='http':
+            if any(s[0].value not in inherited_allowed and not s[0].source.startswith('/etc/nginx/conf.d/waf/') for s in node['statements']):inherited_reason='unknown inherited handler'
+        elif node['parent'] is not None and groups[node['parent']]['kind']=='http' and node['kind'] not in {'server','map','geo','upstream','types','split_clients'}:
+            inherited_reason='unknown inherited handler block'
+    for ident,group in groups.items():
+        if group['kind'].strip('"\'')!='server':continue
+        names=[t.value.strip('"\'').lower() for s in group['statements'] if s[0].value=='server_name' for t in s[1:-1]]
+        roots=[s[1].value.strip('"\'') for s in group['statements'] if s[0].value=='root' and len(s)==3]
+        reason='' if len(roots)==1 and roots[0].startswith('/var/www/html/') and '$' not in roots[0] else 'unproven document root'
+        for child,node in groups.items():
+            parent=child
+            while parent is not None and parent!=ident:parent=groups[parent]['parent']
+            if parent!=ident:continue
+            if child!=ident and node['kind'].strip('"\'') not in {'location','if','limit_except'}:reason='unknown handler block'
+            for s in node['statements']:
+                directive=s[0].value.strip('"\''); values=[t.value.strip('"\'') for t in s[1:-1]]
+                if s[0].source.startswith('/etc/nginx/conf.d/waf/'):continue
+                if directive not in allowed:reason='unsupported handler: '+directive
+                elif directive=='root' and (len(values)!=1 or '$' in values[0] or not values[0].startswith('/')):reason='dynamic document root'
+                elif directive=='try_files' and (values not in [['$uri','=404'],['$uri','$uri/','=404'],['$uri','$uri/','/index.html']]):reason='dynamic fallback'
+                elif directive=='return' and (not values or not values[0].isdigit() or int(values[0]) not in {301,302,303,307,308,400,401,403,404,405,410}):reason='non-file response'
+        for name in names:
+            value=inherited_reason or reason or 'file-only'
+            decisions[name]=value if name not in decisions or decisions[name]==value else 'conflicting server definitions'
+    return decisions
 
 
 def cache_inheritance(dump):

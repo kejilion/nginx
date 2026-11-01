@@ -49,6 +49,22 @@ python3 -B configure.py status
 
 ## 通用请求语义兼容
 
+共享管理器根据完整 `nginx -T` 能力图为纯文件站点自动生成通用静态资源例外，不依赖 `profile` 或站点名称。仅 GET/HEAD、规范字面路径及受限资源扩展名可排除 932260 的路径目标；查询、其他规则、认证与限流继续执行。发现代理、PHP、脚本处理器、动态 root、未知指令或无法证明的回退时保持原检查。配置改变后先执行受管 apply/刷新，再检查 doctor；原始 Nginx reload 不会重新计算能力。
+
+代码正文使用站点策略中的 `sourceText` 语义声明，例如：
+
+```json
+"sourceText": [{"method":"POST","path":"/api/source-note","fields":["content"]}]
+```
+
+声明与应用类型无关，只适用于管理员确认作为代码或富文本处理的 JSON 字段。要求指定方法、精确路径、单个 JSON 媒体头、无压缩和方法覆盖、无 `json.*` 查询参数；指定字段在 phase 2 恰好出现一次时才排除该字段的代码注入目标及重复的原始正文检查，其他 JSON 字段继续扫描。应用仍负责身份、CSRF、内容渲染和存储安全。每站最多 16 个端点、每端点 8 个字面字段，未知键/模式/重复字段拒绝。
+
+`status`/`doctor` 的 `requestSemantics` 回读静态例外的证明或保守拒绝原因、正文声明数量和同步状态；配置漂移令 doctor 失败。删除声明并 apply 可撤销正文例外，静态处理能力消失后受管刷新也会撤销例外。旧 profile 和精确 exclusions 仍兼容，不自动把任意正文识别为安全内容。
+
+2026-10-30，最终功能候选 `1000ad1` 通过同正式服镜像的隔离应用矩阵 164 项、引擎集成 181 项及相关单测；专项包含 10 项能力/声明测试和 38 项配置管理检查。完整单测中的两项封禁检查在未修改基线上也失败，未将其记为通过；本轮未改封禁逻辑。独立静态复核已完成，发现的公共模板遗漏、方法参数覆盖、默认未登记站点及首次迁移能力图问题均已修复并回归。复核环境没有 Python，执行测试由独立的 Linux 容器环境承担，不能声称复核者独立运行了测试。
+
+已授权 108 试点撤下两条具体图标路径的例外，由通用文件能力规则接替；图标、论坛读取 API、博客分类和另一个静态站均返回 200。doctor 同步、再次 plan 无改动；未以真实账号提交论坛帖子，线上正文仍使用已有应用声明，未自动对所有站点启用正文例外。原始隔离记录位于试点主机 `/tmp/waf-semantics-final-contract`、`/tmp/waf-semantics-final-integration`。配置恢复点为 `/home/web/backups/waf-managed/20261030T030117434239Z-policy`，脚本/策略基线为 `/home/web/backups/waf-semantics-20261030-release`；回滚配置包时也须恢复对应脚本固定引用。公共新包继续以提交和文件摘要分发；已有用户需通过受管 WAF 应用/刷新取得并生成新规则，只更新镜像不会迁移策略。版本号保持 1.1.0。
+
 共享修复 `eb58fe4` 将方法覆盖按协议行为统一处理，不绑定 Flarum、域名或 `/api` 路径。仅原始 POST、单个 `X-HTTP-Method-Override` / `X-HTTP-Method` / `X-Method-Override` 头、明确的 PUT/PATCH/DELETE 且完整匹配既有允许方法时，才可进入兼容处理。请求方法及正文不改写，SQLi/XSS 等攻击检查继续执行；重复、冲突、危险值、覆盖头与顶层 query/body `_method` 混用仍由协议守卫按原评分基线拦截。参数 `_method` 单独使用仍遵循原有 PL1/PL2 行为，此开关不替代框架授权或 CSRF 防护。
 
 默认策略为 `methodOverride: guarded`，但只有管理工具核对完整 `nginx -T` 能力图后才激活。遇到 `limit_except`、按原始方法派生的权限条件、认证子请求、脚本认证或方法头改写等不确定语义时，对相应作用域保持 strict。覆盖请求不继承 WordPress、KPanel、Git 及自定义参数的业务排除，避免把原 POST 的特例错误用于另一种方法。也可明确设置全局或站点 `methodOverride: strict`；原有 WAF Off/Detect/On 和 CDN 模式独立保留。
@@ -288,6 +304,22 @@ EU 先后使用正式产物试点，语法、就绪、普通源站/公网请求�
 隔离环境通过 159 项单元检查；Fail2Ban 1.0.2 与 1.1.0 的真实联动分别通过 62 项，覆盖动作丢失恢复、票据到期与失败回退，最终代码在 1.1.0 联动复验通过。生产试点已回读三条 Jail 动作、源站封禁表和三个 CF 区域的受管规则，并观察到 CF 规则实际拦截事件。CF 规则采用 [Cloudflare Rulesets API](https://developers.cloudflare.com/ruleset-engine/rulesets-api/add-rule/)；使用 [dry-run 验证](https://developers.cloudflare.com/ruleset-engine/rulesets-api/dry-run/)核对规则写入前的 API 接受情况。
 
 限制：未完成独立复核、长期生产观察或所有用户自定义配置的实测；未知动作和数据库不可用时保留原配置并提示。源代码回退点为共享包 `b6d8bda9c004abaf9f7dfad14ef2c6373c3546ae` 与脚本 `8a37071308feac7de2676fc8071c0ce5cee65a11`，这两个旧版本存在本轮修复的问题，回退后必须检查 Fail2Ban 动作及 CF 同步；正式配置按各主机安装事务的恢复点回滚。KPanel 配套变更仍在本地候选分支，未发布。
+
+### 2026-10-31 精确公开点文件例外
+
+管理员核实某个点文件确为公开下载资源后，可在该站点既有 `exclusions` 中使用 `{"ruleId":1110,"path":"/raw.example/owner/repo/main/compose/.env","target":"REQUEST_FILENAME"}`。此能力适用于所有配置档，不依赖站点类型；公共默认不添加任何业务文件或域名。仅接受 ASCII 字面路径、GET/HEAD、无方法覆盖头，原始路径必须逐字匹配；编码别名、`.` / `..` 路径段及重复斜杠不适用。只移除该精确路径在点文件守卫中的目标，查询、正文、其他规则及其他本地敏感文件继续检查。若同时命中 CRS，还须另行核实其具体规则；不能批量放行 `.env` 或全部远程地址。依据：[ModSecurity 运行期目标排除](https://github.com/owasp-modsecurity/ModSecurity/wiki/Reference-Manual-%28v3.x%29#ctl)。
+
+本轮核实 [Paperless 官方公开 compose 环境文件](https://raw.githubusercontent.com/paperless-ngx/paperless-ngx/refs/heads/main/docker/compose/.env)在公开源与镜像后端返回同样的 200 正文，前端点文件守卫拦截；站点只声明该完整文件路径，不扩展全部远程点文件。固定生产镜像 `sha256:5cdeeb593a6a1f517acb733e5f92cb33695e2d84847e3955d763008ca12993c1` 的无网络隔离环境通过 176 项应用正反例、181 项引擎集成，以及 95 项相关单元检查（不包含未修改的 `test_ban.py`）。独立只读复核未发现新增可确认缺陷；复核环境缺少 Python/Docker，运行时验证由独立 Linux 隔离测试提供。首次测试因临时目录权限及缺少模板失败，补齐测试夹具并使用受保护临时目录后重跑通过；未放宽管理工具的权限检查。本轮不改镜像、版本号、封禁机制或默认例外；代码回退基线为 `c830bf34ae6da8e183b4892860fbce30ea6dc651`。
+
+正式服使用同一产物试点后，该完整公开文件返回 200 且正文与上游一致；公共固定包 [`4c08b76`](https://github.com/kejilion/nginx/commit/4c08b76a38f08069a589aa48b2a80c55d61823ad) 的七文件摘要及字节、脚本 [`afa0330`](https://github.com/kejilion/sh/commit/afa03300e36794e555e1e9f8a27fa5e381c15cf3) 根/CN 字节均回读一致。两处实际脚本仅替换共享包 pin 与 `policy.py` 摘要，真实 `k web waf doctor` 通过，WAF On 且重复计划无差异。配置恢复点 `/home/web/backups/waf-managed/20261031T020745329530Z-policy`，脚本原件在 `/home/web/backups/waf-dotfile-20261031`；回退时先恢复配置，再恢复两处脚本固定引用。只验证了短窗口，未验证登录后的管理操作；日志中的搜索类及不透明加密字段请求仍需独立核实，不借本次修复扩大排除。已有用户须更新脚本并通过原受管应用/刷新入口取得新包；公共默认不自动添加文件例外。
+
+### 2026-11-01 HTTP/3 authority 兼容修复
+
+配置包候选 `67f76ea02d2c88f6e9b6af17009ae4baaac49ee3` 仅在解析协议为 `HTTP/3.0` 且没有字面 `Host` 头时，运行期移除 CRS `920280` 缺 Host 检查。Nginx 在进入模块前已校验 authority；HTTP/1.x、HTTP/2、空 Host、其他协议检查及攻击检测不扩大豁免。依据：[HTTP/3 请求伪头](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3.1)、[Nginx 1.31.8 校验实现](https://raw.githubusercontent.com/nginx/nginx/release-1.31.8/src/http/v3/ngx_http_v3_request.c)、[连接器 1.0.4 头列表传递](https://raw.githubusercontent.com/owasp-modsecurity/ModSecurity-nginx/v1.0.4/src/ngx_http_modsecurity_rewrite.c)。保留 HTTP/3，无须更换镜像或修改 KPanel。
+
+固定 ARM 镜像 `sha256:1a31e330f71409f19042cdbc78b5bc9d423d9eab47a33b8dbc15586b156bb323` 的无网络隔离验证通过 181 项既有引擎集成和 23 项三协议专项，覆盖有效正文、SQLi/XSS、秘密路径、无 authority、伪造协议、旧规则复现和 Off/Detect/On。完整单测 191 项中 189 通过；两个 ban 用例在原始 `c95218e` 基线同环境下也失败，未修改或掩盖这些既有失败。首次夹具因只读缓存、临时目录权限及 Off 开关模拟不完整失败，修正夹具后上述专项通过。独立只读复核回读源码和原始结果，未发现新增可信阻断项；amd64、登录后完整业务和长期 QUIC 负载未专项实测。
+
+EU 试点只更新受管 `modsecurity.conf` 与 `policy.py`，保留模式 On、mixed 来源信任、站点策略及封禁配置。重载后旧 QUIC worker 排空期间出现连接失败，重启 Nginx 后三次 HTTP/3、HTTP/2 和公网正常请求均返回 200；doctor 通过。配置恢复点 `/home/web/backups/waf-managed/20261101T001423677319Z-policy`；原始证据留在试点机 `/root/waf-h3-20261101/`。本轮短窗口结果不代表长期连接或所有客户端已验证。旧公共包 pin 为 `4c08b76a38f08069a589aa48b2a80c55d61823ad`，EU 原安装 pin 为 `1e185a050b7c6d5670a82dd70a8e85bbd49de3f6`。回退先恢复配置事务，再恢复脚本引用；旧规则会恢复本次 HTTP/3 误拦截。
 
 ### 2026-10-29 站点封禁递进发布
 
