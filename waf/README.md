@@ -321,6 +321,8 @@ EU 先后使用正式产物试点，语法、就绪、普通源站/公网请求�
 
 EU 试点只更新受管 `modsecurity.conf` 与 `policy.py`，保留模式 On、mixed 来源信任、站点策略及封禁配置。重载后旧 QUIC worker 排空期间出现连接失败，重启 Nginx 后三次 HTTP/3、HTTP/2 和公网正常请求均返回 200；doctor 通过。配置恢复点 `/home/web/backups/waf-managed/20261101T001423677319Z-policy`；原始证据留在试点机 `/root/waf-h3-20261101/`。本轮短窗口结果不代表长期连接或所有客户端已验证。旧公共包 pin 为 `4c08b76a38f08069a589aa48b2a80c55d61823ad`，EU 原安装 pin 为 `1e185a050b7c6d5670a82dd70a8e85bbd49de3f6`。回退先恢复配置事务，再恢复脚本引用；旧规则会恢复本次 HTTP/3 误拦截。
 
+公共主线已发布上述固定包，原生脚本候选 `46823664b5610a0e9341e794b75588ec696f8b77`（主线集成 `71d4e8f1b19f646fce15013d46059196fe623e4c`）仅更新根/CN 两处包 pin 和 `policy.py` 摘要 `e92133a697ac75e14d941fcb33b4459dce45803a0d47b4093c5483fa02ec7222`，版本号仍为 4.5.16。公开七文件摘要、根/CN 各自字节及 EU 实际下载缓存均已回读一致，12 项下载/缓存完整性测试及原生开关回归通过。EU 两处已安装脚本仅替换版本函数和 manifest，原件在 `/root/waf-h3-20261101/installed-script-backup/`。实际 `k web waf apply`、doctor 和重复计划无差异通过；最终重启后 HTTP/3 连续三次及 HTTP/2 均为 200，正文逐字匹配后端，公网 HTTPS 200。最终应用事务备份 `/home/web/backups/waf-managed/20261101T001827277809Z-policy`。一次消费测试因根/CN 全文件误作相等断言而中止，随后按各自源码字节核验通过；期间旧入口曾重新应用旧包，已通过新入口重新应用并核验最终规则及缓存，没有把失败尝试计为成功。已有用户更新原生脚本后通过原受管应用/刷新入口取得新包；本轮未重发 KPanel 或镜像。
+
 ### 2026-10-29 站点封禁递进发布
 
 共享包 `d8c178df8c851419087194178314473ec6a6a478` 与脚本 `108ccf2a3db470594f64471b96bdeeb191532274` 已发布；脚本版本仍为 4.5.16。默认首次 600 秒时，同一站点、客户端和来源依次为 10 分钟、1 小时、6 小时、24 小时；持续命中可能延长实际结束时间，投影每次最多覆盖未来 24 小时。已有自定义阈值和支持的递进设置保留。历史记忆期限由宿主 Fail2Ban 数据库配置决定；仅更新脚本不会替换既有 Jail，需通过原建站防护安装/升级入口应用。依据：[Fail2Ban 官方 jail 配置](https://github.com/fail2ban/fail2ban/blob/master/config/jail.conf)及[递进动作说明](https://github.com/fail2ban/fail2ban/blob/master/ChangeLog)。
