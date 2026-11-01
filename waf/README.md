@@ -313,6 +313,14 @@ EU 先后使用正式产物试点，语法、就绪、普通源站/公网请求�
 
 正式服使用同一产物试点后，该完整公开文件返回 200 且正文与上游一致；公共固定包 [`4c08b76`](https://github.com/kejilion/nginx/commit/4c08b76a38f08069a589aa48b2a80c55d61823ad) 的七文件摘要及字节、脚本 [`afa0330`](https://github.com/kejilion/sh/commit/afa03300e36794e555e1e9f8a27fa5e381c15cf3) 根/CN 字节均回读一致。两处实际脚本仅替换共享包 pin 与 `policy.py` 摘要，真实 `k web waf doctor` 通过，WAF On 且重复计划无差异。配置恢复点 `/home/web/backups/waf-managed/20261031T020745329530Z-policy`，脚本原件在 `/home/web/backups/waf-dotfile-20261031`；回退时先恢复配置，再恢复两处脚本固定引用。只验证了短窗口，未验证登录后的管理操作；日志中的搜索类及不透明加密字段请求仍需独立核实，不借本次修复扩大排除。已有用户须更新脚本并通过原受管应用/刷新入口取得新包；公共默认不自动添加文件例外。
 
+### 2026-11-01 HTTP/3 authority 兼容修复
+
+配置包候选 `67f76ea02d2c88f6e9b6af17009ae4baaac49ee3` 仅在解析协议为 `HTTP/3.0` 且没有字面 `Host` 头时，运行期移除 CRS `920280` 缺 Host 检查。Nginx 在进入模块前已校验 authority；HTTP/1.x、HTTP/2、空 Host、其他协议检查及攻击检测不扩大豁免。依据：[HTTP/3 请求伪头](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3.1)、[Nginx 1.31.8 校验实现](https://raw.githubusercontent.com/nginx/nginx/release-1.31.8/src/http/v3/ngx_http_v3_request.c)、[连接器 1.0.4 头列表传递](https://raw.githubusercontent.com/owasp-modsecurity/ModSecurity-nginx/v1.0.4/src/ngx_http_modsecurity_rewrite.c)。保留 HTTP/3，无须更换镜像或修改 KPanel。
+
+固定 ARM 镜像 `sha256:1a31e330f71409f19042cdbc78b5bc9d423d9eab47a33b8dbc15586b156bb323` 的无网络隔离验证通过 181 项既有引擎集成和 23 项三协议专项，覆盖有效正文、SQLi/XSS、秘密路径、无 authority、伪造协议、旧规则复现和 Off/Detect/On。完整单测 191 项中 189 通过；两个 ban 用例在原始 `c95218e` 基线同环境下也失败，未修改或掩盖这些既有失败。首次夹具因只读缓存、临时目录权限及 Off 开关模拟不完整失败，修正夹具后上述专项通过。独立只读复核回读源码和原始结果，未发现新增可信阻断项；amd64、登录后完整业务和长期 QUIC 负载未专项实测。
+
+EU 试点只更新受管 `modsecurity.conf` 与 `policy.py`，保留模式 On、mixed 来源信任、站点策略及封禁配置。重载后旧 QUIC worker 排空期间出现连接失败，重启 Nginx 后三次 HTTP/3、HTTP/2 和公网正常请求均返回 200；doctor 通过。配置恢复点 `/home/web/backups/waf-managed/20261101T001423677319Z-policy`；原始证据留在试点机 `/root/waf-h3-20261101/`。本轮短窗口结果不代表长期连接或所有客户端已验证。旧公共包 pin 为 `4c08b76a38f08069a589aa48b2a80c55d61823ad`，EU 原安装 pin 为 `1e185a050b7c6d5670a82dd70a8e85bbd49de3f6`。回退先恢复配置事务，再恢复脚本引用；旧规则会恢复本次 HTTP/3 误拦截。
+
 ### 2026-10-29 站点封禁递进发布
 
 共享包 `d8c178df8c851419087194178314473ec6a6a478` 与脚本 `108ccf2a3db470594f64471b96bdeeb191532274` 已发布；脚本版本仍为 4.5.16。默认首次 600 秒时，同一站点、客户端和来源依次为 10 分钟、1 小时、6 小时、24 小时；持续命中可能延长实际结束时间，投影每次最多覆盖未来 24 小时。已有自定义阈值和支持的递进设置保留。历史记忆期限由宿主 Fail2Ban 数据库配置决定；仅更新脚本不会替换既有 Jail，需通过原建站防护安装/升级入口应用。依据：[Fail2Ban 官方 jail 配置](https://github.com/fail2ban/fail2ban/blob/master/config/jail.conf)及[递进动作说明](https://github.com/fail2ban/fail2ban/blob/master/ChangeLog)。
