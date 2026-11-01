@@ -313,6 +313,12 @@ EU 先后使用正式产物试点，语法、就绪、普通源站/公网请求�
 
 正式服使用同一产物试点后，该完整公开文件返回 200 且正文与上游一致；公共固定包 [`4c08b76`](https://github.com/kejilion/nginx/commit/4c08b76a38f08069a589aa48b2a80c55d61823ad) 的七文件摘要及字节、脚本 [`afa0330`](https://github.com/kejilion/sh/commit/afa03300e36794e555e1e9f8a27fa5e381c15cf3) 根/CN 字节均回读一致。两处实际脚本仅替换共享包 pin 与 `policy.py` 摘要，真实 `k web waf doctor` 通过，WAF On 且重复计划无差异。配置恢复点 `/home/web/backups/waf-managed/20261031T020745329530Z-policy`，脚本原件在 `/home/web/backups/waf-dotfile-20261031`；回退时先恢复配置，再恢复两处脚本固定引用。只验证了短窗口，未验证登录后的管理操作；日志中的搜索类及不透明加密字段请求仍需独立核实，不借本次修复扩大排除。已有用户须更新脚本并通过原受管应用/刷新入口取得新包；公共默认不自动添加文件例外。
 
+### 2026-11-01 URL 前缀精确文件声明
+
+点文件守卫的 `ruleId:1110` / `REQUEST_FILENAME` 精确例外现支持下载网关的字面 `/http://host.example/路径` 与 `/https://host.example/路径`。完整路径上限仍为 251 字符；仅校验声明时识别一个普通域名的 URL 前缀，不改写请求、不自动信任任意远程地址、不依赖配置档类型。原始请求必须逐字匹配声明，仍仅支持 GET/HEAD 且无方法覆盖头；路径中的重复斜杠、`.` / `..` 段、编码别名、用户信息、端口及额外冒号不纳入兼容。其他 CRS 规则的声明语法不变。公共默认没有具体下载路径，管理员须先核实资源为公开且实际由预期后端提供。
+
+本轮日志确认两条公开仓库资源因仓库名以点开头被守卫阻断共 6 次，公开源和镜像后端均返回 200；有界读取的正文片段摘要一致，不将截断读取冒充完整文件一致性。生产固定 amd64 镜像 `sha256:5cdeeb593a6a1f517acb733e5f92cb33695e2d84847e3955d763008ca12993c1` 的无网络隔离测试通过 198 项应用、181 项引擎、23 项 HTTP/1.1 / HTTP/2 / HTTP/3 检查和 96 项相关单元检查，未修改的 `test_ban.py` 未纳入此次单元结果；继承已发布的 HTTP/3 authority 修复。独立只读复核未发现新增可确认缺陷，复核进程未执行运行时测试。首次单元检查因归档带来的暂存目录/文件可写权限失败，收紧私有测试副本权限后重跑通过，未修改管理工具的权限校验。代码回退基线 `31ace4394e1dd1c3864ea27d4e0924b5613d4183`，原生脚本公共基线 `71d4e8f1b19f646fce15013d46059196fe623e4c`；不改镜像、版本号、封禁机制或自动增加例外。
+
 ### 2026-11-01 HTTP/3 authority 兼容修复
 
 配置包候选 `67f76ea02d2c88f6e9b6af17009ae4baaac49ee3` 仅在解析协议为 `HTTP/3.0` 且没有字面 `Host` 头时，运行期移除 CRS `920280` 缺 Host 检查。Nginx 在进入模块前已校验 authority；HTTP/1.x、HTTP/2、空 Host、其他协议检查及攻击检测不扩大豁免。依据：[HTTP/3 请求伪头](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.3.1)、[Nginx 1.31.8 校验实现](https://raw.githubusercontent.com/nginx/nginx/release-1.31.8/src/http/v3/ngx_http_v3_request.c)、[连接器 1.0.4 头列表传递](https://raw.githubusercontent.com/owasp-modsecurity/ModSecurity-nginx/v1.0.4/src/ngx_http_modsecurity_rewrite.c)。保留 HTTP/3，无须更换镜像或修改 KPanel。
