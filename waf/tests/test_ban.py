@@ -629,6 +629,53 @@ action = waf-unified-api[site=one.example.com]
         ban.save(self.root,'ban-cf.json',{'mode':'local'})
         self.assertEqual(ban.remove(self.root),{'updated':False})
 
+    def test_cleanup_accepts_only_explicit_missing_jail_reply(self):
+        reply=subprocess.CompletedProcess([],255,"Sorry but the jail 'waf-attack' does not exist\n",'NOK')
+        with patch.object(subprocess,'run',return_value=reply):
+            self.assertEqual(ban.query_tickets('attack',allow_missing=True),set())
+            with self.assertRaisesRegex(ValueError,'Cannot read complete'):
+                ban.query_tickets('attack')
+            with self.assertRaisesRegex(ValueError,'Cannot read complete'):
+                ban.query_tickets('rate',allow_missing=True)
+
+    def test_cleanup_does_not_hide_socket_or_partial_read_failures(self):
+        for reply in [subprocess.CompletedProcess([],255,'','Failed to access socket'),
+                      subprocess.CompletedProcess([],255,'one.example.com|8.8.8.8','NOK')]:
+            with patch.object(subprocess,'run',return_value=reply):
+                with self.assertRaisesRegex(ValueError,'Cannot read complete'):
+                    ban.query_tickets('attack',allow_missing=True)
+
+    def test_clear_with_missing_jails_clears_projection(self):
+        ban.save(self.root,'bans.json',self.value)
+        def reply(command,**kwargs):
+            return subprocess.CompletedProcess(command,255,
+                f"Sorry but the jail '{command[2]}' does not exist\n",'NOK')
+        with patch.object(subprocess,'run',side_effect=reply):
+            ban.clear(self.root)
+        self.assertEqual(ban.state(self.root)['records'],{})
+        self.assertFalse(any(call.args[0:2]==('fail2ban-client','set') for call in self.execute.call_args_list))
+
+    def test_remove_with_missing_jails_disables_owned_integration(self):
+        jail=self.f2b/'jail.d/zz-waf-managed.local'
+        jail.parent.mkdir(parents=True)
+        jail.write_text(ban.MARKER)
+        ban.save(self.root,'bans.json',self.value)
+        def reply(command,**kwargs):
+            if command[0]=='fail2ban-client':
+                return subprocess.CompletedProcess(command,255,
+                    f"Sorry but the jail '{command[2]}' does not exist\n",'NOK')
+            return subprocess.CompletedProcess(command,0,'','')
+        def update(root,files,label,apply):
+            self.assertEqual(files,{jail:ban.DISABLED.encode()})
+            apply()
+            return {'updated':True}
+        with patch.object(subprocess,'run',side_effect=reply), \
+             patch.object(manage,'_external_update',side_effect=update), \
+             patch.object(manage,'apply') as apply:
+            self.assertEqual(ban.remove(self.root),{'updated':True})
+        self.assertEqual(ban.state(self.root)['records'],{})
+        self.assertEqual(apply.call_args.args[1]['banBackend'],'none')
+
     def test_full_cf_switch_preserves_origin_bans_and_modes(self):
         jail=self.f2b/'jail.d/zz-waf-managed.local';jail.parent.mkdir(parents=True)
         jail.write_text(ban.MARKER)
