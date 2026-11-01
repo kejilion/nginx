@@ -172,6 +172,21 @@ def cases():
         ('generic.example','/.env','GET',{}),
         ('generic.example','/.git/config','GET',{})]:
         add('dotfile-guard-'+host+path+method,method,path,expected=403,headers=headers,host=host)
+    for scheme in ['http','https']:
+        url_file='/'+scheme+'://raw.example/acme/.repo/main/file'
+        for method in ['GET','HEAD']:
+            add('exact-url-dotfile-'+scheme+method,method,url_file,host='generic.example')
+        for path,method,headers,host in [
+            (url_file,'GET',{},'other.example'),
+            (url_file,'POST',{},'generic.example'),
+            (url_file,'GET',{'X-HTTP-Method-Override':'DELETE'},'generic.example'),
+            (url_file+'?q=%3Cscript%3Ealert(1)%3C/script%3E','GET',{},'generic.example'),
+            (url_file.replace('/.repo','/%2erepo'),'GET',{},'generic.example'),
+            (url_file.replace('/.repo','/%252erepo'),'GET',{},'generic.example'),
+            (url_file.replace('/.repo','//.repo'),'GET',{},'generic.example'),
+            (url_file.replace('/.repo','/../.repo'),'GET',{},'generic.example'),
+            (url_file+'-other','GET',{},'generic.example')]:
+            add('url-dotfile-boundary-'+scheme+path+method+host,method,path,expected=403,headers=headers,host=host)
     return result
 
 
@@ -183,6 +198,7 @@ def main():
     config=json.loads((bundle/'example-policy.json').read_text());config.update(mode='on',cdn='direct',sites={name:{'profile':profile}for name,profile in profiles.items()})
     config['sites']['generic.example']['sourceText']=[{'method':'POST','path':'/api/source-note','fields':['content']}]
     config['sites']['generic.example']['exclusions']=[{'ruleId':rule,'path':'/raw.example/acme/project/main/compose/.env','target':'REQUEST_FILENAME'}for rule in [1110,930130]]
+    config['sites']['generic.example']['exclusions'] += [{'ruleId':1110,'path':'/'+scheme+'://raw.example/acme/.repo/main/file','target':'REQUEST_FILENAME'}for scheme in ['http','https']]
     # A fresh static site has no explicit policy/profile entry.
     assets=work/'desktop-icons/xp';assets.mkdir(parents=True);(assets/'docker-v1.svg').write_text('<svg/>')
     cf=policy.networks(json.loads((bundle/'cloudflare-ips.json').read_text()))

@@ -85,13 +85,18 @@ def validate(config: dict) -> dict:
         for rule in site.get("exclusions", []):
             if not isinstance(rule.get("ruleId"), int) or not (900000 <= rule["ruleId"] <= 999999 or rule["ruleId"] == 1110):
                 raise ValueError("Exclusions must identify a CRS rule or the exact dot-path guard")
-            if not re.fullmatch(r"/[\w./-]{0,250}", rule.get("path", "")):
+            exact_path=rule.get('path','')
+            # Public download gateways may keep a literal URL in their path.
+            # This only validates an administrator's exact declaration; the
+            # request must still match the original, unnormalized path below.
+            checked_path=re.sub(r'^/https?://[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+/', '/', exact_path) if rule['ruleId']==1110 else exact_path
+            if len(exact_path)>251 or not re.fullmatch(r"/[\w./-]{0,250}", checked_path):
                 raise ValueError("Exclusion requires an exact path")
             if rule.get('target')!='REQUEST_FILENAME' and not re.fullmatch(r"ARGS:[A-Za-z0-9_.\[\]-]{1,100}", rule.get("target", "")):
                 raise ValueError("Exclusion requires one named argument or exact filename")
             if rule['ruleId']==1110 and (rule['target']!='REQUEST_FILENAME' or
-                    not re.fullmatch(r'/[A-Za-z0-9_./-]{1,250}',rule['path']) or
-                    '//' in rule['path'] or any(part in {'.','..'} for part in rule['path'].split('/'))):
+                    not re.fullmatch(r'/[A-Za-z0-9_./-]{1,250}',checked_path) or
+                    '//' in checked_path or any(part in {'.','..'} for part in checked_path.split('/'))):
                 raise ValueError('Dot-path guard exclusion requires a canonical ASCII filename path')
         if len(site.get("exclusions", [])) > 32:
             raise ValueError("Too many exclusions")

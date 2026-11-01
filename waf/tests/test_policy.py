@@ -138,6 +138,21 @@ class PolicyTests(unittest.TestCase):
             self.config['sites']['one.example']['exclusions']=[bad]
             with self.subTest(field=field,value=value),self.assertRaises(ValueError):policy.validate(self.config)
 
+    def test_dot_guard_accepts_only_literal_canonical_url_prefix(self):
+        entry={'ruleId':1110,'path':'/https://raw.example/owner/.repo/main/file','target':'REQUEST_FILENAME'}
+        self.config['sites']={'one.example':{'exclusions':[entry]}}
+        for prefix in ['/http://','/https://']:
+            entry['path']=prefix+'raw.example/owner/.repo/main/file'
+            policy.validate(self.config)
+            rendered=policy.render_profile_rules(self.config)
+            self.assertIn('@streq '+entry['path'],rendered)
+            self.assertIn('REQUEST_URI_RAW "@rx ^'+prefix+'raw\\.example/owner/\\.repo/main/file',rendered)
+        for path in ['/https:///raw.example/.env','/https://raw.example//.env','/https://raw.example/../.env','/https://user@raw.example/.env','/https://raw.example:443/.env','/https://raw.example/%2eenv','/https://raw.example/dir:part/.env','/https://raw.example/'+'x'*240]:
+            entry['path']=path
+            with self.subTest(path=path),self.assertRaises(ValueError):policy.validate(self.config)
+        entry['path']='/https://raw.example/owner/.repo/file';entry['ruleId']=930130
+        with self.assertRaises(ValueError):policy.validate(self.config)
+
     def test_no_global_business_path_blacklist_or_acme_bypass(self):
         rendered = policy.render_guard()
         for path in ['/feed', '/readme.html', '/xmlrpc.php', 'allow,', 'ruleEngine=Off']:
