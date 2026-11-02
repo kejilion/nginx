@@ -362,3 +362,5 @@ EU 试点只更新受管 `modsecurity.conf` 与 `policy.py`，保留模式 On、
 KPanel 配置档对 GET `/api/v1/apps/<受限应用ID>/install-port` 精确排除 CRS 932260 的 REQUEST_FILENAME 目标，修复 builtin 前缀被当作 Unix 命令的误报。保留方法覆盖头拒绝、查询/正文和其他规则检查，不关闭 WAF，不改镜像或版本号。依据为 CRS 官方运行期目标排除机制。
 
 固定生产 amd64 镜像的无网络隔离应用回归 207/207、策略单测 28/28 通过；独立静态复核无阻断。第一轮夹具因 umask 077 导致后端 socket 目录不可访问而失败，以 022 重建测试目录后通过，未改产品权限检查。108 受管 apply、Nginx 语法与 doctor 通过，WAF 保持 On；无登录请求不再被 932260 拦截，返回应用入口的 404，尚未验证用户登录后的完整安装。生产配置备份 `/home/web/backups/waf-managed/20261102T021425945247Z-policy`，原脚本在 `/home/web/backups/waf-app-install-20261102`。代码回退点 `98acdd8`；共享包发布与原生脚本固定引用以对应公开提交为准。长期观察、其他架构和实际安装完成未验证。
+
+同一固定包 `d5f237df04a3b4384a0aceb5ee1e716e4ca074d1` 七文件公开摘要与脚本 `00709e171ea3eda3846ba2875cd0f50feaa5c01e` 根/CN 各自公开字节回读一致，12 项引导检查及根/CN Shell 语法通过。108 两处实际脚本只更新包 revision/manifest；旧缓存达到16份上限，已将历史 `3e705b8` 缓存移至上述备份目录而未删除，再由真实 `k web waf apply` 下载并校验新包，重复应用无差异，doctor通过。KPanel 1.28.0 镜像未更换；既有用户需更新脚本并通过原受管应用/刷新入口取得新包。
