@@ -319,6 +319,23 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         for header in ['Content-Encoding', 'content-encoding', 'CONTENT-ENCODING']:
             check('artifact-git-compressed-'+header,host='artifact.example',path=git_path,method='POST',body=compressed_git_packet,headers={'Content-Type':'application/x-git-upload-pack-request',header:'gzip'})
         check('artifact-git-gzip-query-sqli',host='artifact.example',path=git_path+'?q=1%27%20UNION%20SELECT%20password%20FROM%20users--',method='POST',body=compressed_git_packet,headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip'},expected=403)
+        for prefix in ['/https://','/http://','/']:
+            unsuffixed=prefix+'github.com/acme/project/git-upload-pack'
+            check('git-unsuffixed-plain-'+prefix,host='artifact.example',path=unsuffixed,method='POST',body=b'0000',headers={'Content-Type':'application/x-git-upload-pack-request'})
+            check('git-unsuffixed-gzip-'+prefix,host='artifact.example',path=unsuffixed,method='POST',body=compressed_git_packet,headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip'})
+        unsuffixed='/https://github.com/acme/project/git-upload-pack'
+        for label,path,method,headers,host in [
+            ('query-xss',unsuffixed+'?q=%3Cscript%3Ealert(1)%3C/script%3E','POST',{'Content-Type':'application/x-git-upload-pack-request'},'artifact.example'),
+            ('wrong-site',unsuffixed,'POST',{'Content-Type':'application/x-git-upload-pack-request'},'api.example'),
+            ('wrong-method',unsuffixed,'PUT',{'Content-Type':'application/x-git-upload-pack-request'},'artifact.example'),
+            ('wrong-service',unsuffixed.replace('git-upload-pack','git-receive-pack'),'POST',{'Content-Type':'application/x-git-upload-pack-request'},'artifact.example'),
+            ('encoded-repo',unsuffixed.replace('/project/','/%70roject/'),'POST',{'Content-Type':'application/x-git-upload-pack-request'},'artifact.example'),
+            ('extra-depth',unsuffixed.replace('/project/','/group/project/'),'POST',{'Content-Type':'application/x-git-upload-pack-request'},'artifact.example'),
+            ('wrong-type',unsuffixed,'POST',{'Content-Type':'application/x-custom'},'artifact.example'),
+            ('duplicate-type',unsuffixed,'POST',{'Content-Type':'application/x-git-upload-pack-request','content-type':'application/json'},'artifact.example'),
+            ('override',unsuffixed,'POST',{'Content-Type':'application/x-git-upload-pack-request','X-HTTP-Method-Override':'PATCH'},'artifact.example'),
+            ('restricted-header',unsuffixed,'POST',{'Content-Type':'application/x-git-upload-pack-request','Proxy':'test'},'artifact.example')]:
+            check('git-unsuffixed-boundary-'+label,host=host,path=path,method=method,body=b'0000',headers=headers,expected=(400,403))
         check('artifact-git-gzip-query-xss',host='artifact.example',path=git_path+'?q=%3Cscript%3Ealert(1)%3C/script%3E',method='POST',body=compressed_git_packet,headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip'},expected=403)
         check('artifact-git-gzip-wrong-type',host='artifact.example',path=git_path,method='POST',body=compressed_git_packet,headers={'Content-Type':'application/json','Content-Encoding':'gzip'},expected=403)
         check('artifact-git-duplicate-encoding',host='artifact.example',path=git_path,method='POST',body=compressed_git_packet,headers={'Content-Type':'application/x-git-upload-pack-request','Content-Encoding':'gzip','content-encoding':'gzip'},expected=403)
