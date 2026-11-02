@@ -389,3 +389,11 @@ python3 waf/sign-channel.py --revision <已验证且公开的40位提交> --sequ
 用户命令：`k web waf package-check` / `package-update` / `package-status` / `package-rollback` / `package-recover`。首次新安装读取最新签名稳定包；现有安装与普通状态/配置操作不自动升级。更早的旧安装须先更新引导脚本并执行一次受管 `apply` 对齐迁移基线，未对齐时更新拒绝且保留原防护。旧固定脚本仍可能重新部署旧版本；新版 `package-update` 即使版本相同也检查并重应用全部受管文件，不覆盖前一版本身份。旧 KPanel 内嵌脚本须另按其发行流程接入，不将原生发布称作全部 KPanel 已迁移。
 
 包状态保存在 `config/waf/package-state.json`，位于严格七文件缓存外。更新先持有 package 锁，再持有既有 install 锁，记录确切配置快照与 pending 后热应用、检查并切换 active；失败恢复快照，中断后显式 recover。发现第三方配置冲突或恢复失败时保留 pending。回退不降低已接受版本的序号水位。缓存仍限制16份/总字节预算，满时要求管理员归档明确不在用版本，不自动删除未知内容。签名与兼容失败不静默退回旧下载；不会创建后台更新任务。进程终止恢复和持久化顺序通过专项验证，不声称物理断电或所有文件系统已实测。
+
+### 独立通道首发验证与试点
+
+2026-11-02 已公开通道提交 `f7e5475` 和原生脚本 4.5.17 `c2993d5`。首个签名 sequence 为1，仍指向已公开并验证的七文件包 `041d91ac33e8c74d8fcf97d30a73cef5910e6528`，没有借此更换规则或镜像。通道字节、七文件摘要、根/CN脚本各自公开字节均回读一致。
+
+最终候选通过26项真实RSA/缓存/状态/恢复单测、既有原生smoke、根/CN同步与内嵌一致性；真实生产镜像的无网络隔离Nginx通过19项检查，覆盖热更新不重启容器、旧脚本源码漂移修复、回滚/再升级、应用后验证失败的精确恢复、真实SIGKILL后恢复、离线active及实际shell的凭据stdin传递。下载中途SIGKILL另在单测中验证。独立静态复核发现并修正了暂存残留、持久化顺序、同版本漂移及旧安装身份/锁边界后无试点阻断；Windows编辑工具首次默认编码读取失败，改为显式UTF-8，未发布失败产物。
+
+108 两处实际入口仅替换WAF引导函数与版本号，保留其他业务脚本；备份 `/home/web/backups/waf-independent-20261102`。真实 `package-check`、`package-update`、重复更新、`package-status` 和doctor通过，active为041d91a、sequence1、pending为空、WAF On，公开业务首页200。配置快照位于 `/home/web/backups/waf-managed/*-package-update`；试点未实际改变包代码，版本切换与故障注入只在隔离环境完成。证据在试点机 `/root/waf-independent-tests-20261102`，私钥只留发布者本机受限目录。物理断电、长期负载和所有发行版未实测；旧KPanel内嵌固定脚本未重发。回退引导器可恢复上述两份脚本；回退包使用显式package-rollback，恢复未完成先package-recover，不删除签名状态或降低防重放水位。
