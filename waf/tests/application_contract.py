@@ -40,6 +40,23 @@ def cases():
     def add(label,method,path,body=None,expected=200,headers=None,host='panel.example',expected_body=None,expected_cache=None):
         result.append(dict(label=label,method=method,path=path,body=body,expected=expected,headers=headers or {},host=host,expected_body=expected_body,expected_cache=expected_cache))
     port_path='/api/v1/apps/builtin-84/install-port'
+    for app in ['builtin-84','thirdparty-demo','local-demo']:
+        for action in ['install','manage','start','stop','restart','update','uninstall','direct_access','check_update']:
+            path='/api/v1/apps/'+app+'/'+action
+            body={'hostPort':8084} if action=='install' else {'resourceVersion':'sha256:'+'a'*64}
+            if action=='direct_access':body['accessMode']='direct'
+            add('app-action-'+app+'-'+action,'POST',path,body)
+    install='/api/v1/apps/builtin-84/install'
+    add('install-entry-prefix','POST','/entry_123'+install,{'hostPort':8084})
+    add('install-wrong-method','GET',install,expected=403)
+    add('install-unknown-action','POST','/api/v1/apps/builtin-84/execute',{},403)
+    add('install-extra-suffix','POST',install+'/extra',{},403)
+    add('install-cross-site','POST',install,{},403,host='other.example')
+    add('install-method-override','POST',install,{},403,headers={'X-HTTP-Method-Override':'GET'})
+    add('install-query-rce','POST',install+'?q=cat%20/etc/passwd',{},403)
+    add('install-body-rce','POST',install,{'q':'cat /etc/passwd'},403)
+    add('install-body-sqli','POST',install,{'q':"1' UNION SELECT password FROM users--"},403)
+    add('install-body-xss','POST',install,{'q':'<script>alert(1)</script>'},403)
     for prefix in ['', '/entry_123']:
         add('install-port-preflight'+prefix,'GET',prefix+port_path+'?port=8084')
     add('install-port-other-site','GET',port_path+'?port=8084',expected=403,host='other.example')

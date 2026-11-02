@@ -152,6 +152,14 @@ server {
         assert isinstance(denied,dict) and denied.get('code')
         validation=request('real-script-manage-reaches-application-validation','POST','/api/v1/apps/builtin-120/manage',{},422,authenticated=True)
         assert isinstance(validation,dict) and validation.get('code')
+        install_path='/api/v1/apps/builtin-84/install'
+        request('install-still-requires-session','POST',install_path,{'hostPort':8084},401)
+        denied=request('install-still-requires-CSRF','POST',install_path,{'hostPort':8084},403,authenticated=True,csrf=False)
+        assert isinstance(denied,dict) and denied.get('code')
+        validation=request('install-reaches-application-validation','POST',install_path,{'hostPort':0},422,authenticated=True)
+        assert isinstance(validation,dict) and validation.get('code')
+        boundary=request('valid-install-reaches-agent-boundary','POST',install_path,{'hostPort':8084},503,authenticated=True)
+        assert isinstance(boundary,dict) and boundary.get('code')=='agent_unavailable'
         snapshot=request('real-saved-commands-read','GET','/api/v1/terminal-commands',authenticated=True)
         request('real-saved-command-code-content','PUT','/api/v1/terminal-commands',
                 {'expectedResourceVersion':snapshot['resourceVersion'],'items':[{'id':'a'*32,'name':'fixture',
