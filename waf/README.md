@@ -370,3 +370,5 @@ KPanel 配置档对 GET `/api/v1/apps/<受限应用ID>/install-port` 精确排�
 前次修复只覆盖 GET 端口检查；用户复测显示 POST install 仍因 builtin 前缀命中 932260。本次将既有 POST manage 精确路径排除扩展到 KPanel 明确支持的 install/start/stop/restart/update/uninstall/direct_access/check_update，保持受限 App ID、站点配置档、方法覆盖限制，以及查询/正文和其他规则检测。未使用任意动作通配符。
 
 相同生产镜像的隔离请求回归244/244、策略单测28/28、真实KPanel1.28.0无Agent隔离检查26/26通过。真实检查确认未登录401、缺CSRF403、非法端口422、合法安装503且code=agent_unavailable；这证明通过WAF到达Agent边界，不代表应用已安装。独立静态复核无阻断，两项测试改进（合法动作输入、精确错误码）均已采纳并复跑。108受管apply/doctor通过，WAF保持On；备份 `/home/web/backups/waf-managed/20261102T022419795573Z-policy`，脚本备份 `/home/web/backups/waf-app-actions-20261102`。回退基线 `b830c04`；完整生产登录安装及长期观察仍待验证。无需重发KPanel或Nginx镜像。
+
+共享包 `041d91a` 的七文件公开摘要、脚本 `9951a8d` 根/CN公开字节均已回读一致，12项引导检查和Shell语法通过。108实际脚本固定引用已更新，真实入口下载新包并重复apply无差异、doctor通过，运行中policy与缓存逐字一致。上轮 `d5f237d` 缓存移入上述备份目录保留回退，未删除；原版本仍可公开下载。
