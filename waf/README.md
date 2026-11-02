@@ -372,3 +372,20 @@ KPanel 配置档对 GET `/api/v1/apps/<受限应用ID>/install-port` 精确排�
 相同生产镜像的隔离请求回归244/244、策略单测28/28、真实KPanel1.28.0无Agent隔离检查26/26通过。真实检查确认未登录401、缺CSRF403、非法端口422、合法安装503且code=agent_unavailable；这证明通过WAF到达Agent边界，不代表应用已安装。独立静态复核无阻断，两项测试改进（合法动作输入、精确错误码）均已采纳并复跑。108受管apply/doctor通过，WAF保持On；备份 `/home/web/backups/waf-managed/20261102T022419795573Z-policy`，脚本备份 `/home/web/backups/waf-app-actions-20261102`。回退基线 `b830c04`；完整生产登录安装及长期观察仍待验证。无需重发KPanel或Nginx镜像。
 
 共享包 `041d91a` 的七文件公开摘要、脚本 `9951a8d` 根/CN公开字节均已回读一致，12项引导检查和Shell语法通过。108实际脚本固定引用已更新，真实入口下载新包并重复apply无差异、doctor通过，运行中policy与缓存逐字一致。上轮 `d5f237d` 缓存移入上述备份目录保留回退，未删除；原版本仍可公开下载。
+# 独立稳定通道（2026-11-02）
+
+原生脚本 4.5.17 起不再为每次共享包更新改 pin。`channels/stable-v1.json` 是 API 1 稳定通道的签名信封，包含不可变 Git revision、七文件 SHA-256、递增 sequence、签发/过期时间。引导器先用内置 RSA-3072 公钥验证原始清单字节，再检查兼容性、时效和摘要。依据：[OpenSSL SHA-256 签名与验签](https://docs.openssl.org/3.0/man1/openssl-dgst/)。本机制不是完整 TUF 实现，也不代表签名代码没有缺陷。
+
+API 1 固定 `configure.py`、`policy.py`、`nginx_edit.py`、`ban.py`、`example-policy.json`、`cloudflare-ips.json`、`legacy-jails.local` 七文件及现有命令/策略 schema。更新器还依赖 configure 的 `locked`、`make_plan`、`snapshot`、`apply(lock_held=True)`、`restore`、`configured_status` 和 nginx 检查/重载函数；这些接口和备份格式必须向后兼容。破坏性接口/数据迁移需新通道与新版引导器，不能冒充 API 1 热更新。
+
+发布者先完成包的隔离验证、独立复核和已授权试点，将确切源码合入并发布 main；再在本地签名新清单，以新的 main 提交发布清单。不可修改已签发 sequence 的身份。签名工具不会自动推送：
+
+```bash
+python3 waf/sign-channel.py --revision <已验证且公开的40位提交> --sequence <递增整数> --private-key <库外私钥> --output waf/channels/stable-v1.json
+```
+
+工具签发有效期90天的清单。即使源码未变化，过期前也需用更高 sequence 重新签发；过期不影响已有离线 active，但会拒绝新安装/更新。发布后回读签名清单和七文件字节，再测试实际脚本消费。私钥只由发布者保管，不入 Git、镜像、共享包或生产主机；公钥为 `release-public.pem`，脚本中固定相同公钥。丢失/泄露时必须更换签名密钥并发布新引导器；旧脚本无法自动撤销其信任根。
+
+用户命令：`k web waf package-check` / `package-update` / `package-status` / `package-rollback` / `package-recover`。首次新安装读取最新签名稳定包；现有安装与普通状态/配置操作不自动升级。更早的旧安装须先更新引导脚本并执行一次受管 `apply` 对齐迁移基线，未对齐时更新拒绝且保留原防护。旧固定脚本仍可能重新部署旧版本；新版 `package-update` 即使版本相同也检查并重应用全部受管文件，不覆盖前一版本身份。旧 KPanel 内嵌脚本须另按其发行流程接入，不将原生发布称作全部 KPanel 已迁移。
+
+包状态保存在 `config/waf/package-state.json`，位于严格七文件缓存外。更新先持有 package 锁，再持有既有 install 锁，记录确切配置快照与 pending 后热应用、检查并切换 active；失败恢复快照，中断后显式 recover。发现第三方配置冲突或恢复失败时保留 pending。回退不降低已接受版本的序号水位。缓存仍限制16份/总字节预算，满时要求管理员归档明确不在用版本，不自动删除未知内容。签名与兼容失败不静默退回旧下载；不会创建后台更新任务。进程终止恢复和持久化顺序通过专项验证，不声称物理断电或所有文件系统已实测。
