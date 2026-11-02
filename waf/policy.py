@@ -321,6 +321,10 @@ def _kpanel_rules(sites, first_id):
     route(['PUT'], '/api/v1/files/transfer/sessions', binary_controls, media='application/octet-stream')
     route(['PUT'], r'/api/v1/desktop/shortcuts/[a-f0-9]{32}/icon', binary_controls, media='image/(?:png|jpeg|webp)')
 
+    # The builtin app prefix also matches the Unix command dictionary during
+    # the read-only install-port preflight. Keep every query/body target active.
+    route(['GET'], r'/api/v1/apps/(?:builtin|thirdparty|local)-[A-Za-z0-9][A-Za-z0-9_-]{0,63}/install-port',
+          ['ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME'])
     # The fixed manage action is a word in the Unix command dictionary. Do not
     # exempt arbitrary app suffixes or any query/body target from this rule.
     route(['POST'], r'/api/v1/apps/(?:builtin|thirdparty|local)-[A-Za-z0-9][A-Za-z0-9_-]{0,63}/manage',

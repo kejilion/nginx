@@ -39,6 +39,16 @@ def cases():
     result=[]
     def add(label,method,path,body=None,expected=200,headers=None,host='panel.example',expected_body=None,expected_cache=None):
         result.append(dict(label=label,method=method,path=path,body=body,expected=expected,headers=headers or {},host=host,expected_body=expected_body,expected_cache=expected_cache))
+    port_path='/api/v1/apps/builtin-84/install-port'
+    for prefix in ['', '/entry_123']:
+        add('install-port-preflight'+prefix,'GET',prefix+port_path+'?port=8084')
+    add('install-port-other-site','GET',port_path+'?port=8084',expected=403,host='other.example')
+    add('install-port-wrong-method','POST',port_path,{},403)
+    add('install-port-extra-suffix','GET',port_path+'/extra',expected=403)
+    add('install-port-method-override','GET',port_path,expected=403,headers={'X-HTTP-Method-Override':'POST'})
+    add('install-port-query-rce','GET',port_path+'?port=8084&q=cat%20/etc/passwd',expected=403)
+    add('install-port-query-sqli','GET',port_path+'?port=8084&q=1%27%20UNION%20SELECT%20password%20FROM%20users--',expected=403)
+    add('install-port-body-xss','GET',port_path,{'q':'<script>alert(1)</script>'},403)
     for label,headers,status,body,cache in [
         ('anonymous-miss',{},404,b'anonymous','MISS'),('anonymous-hit',{},404,b'anonymous','HIT'),
         ('cookie-a',{'Cookie':'session=a'},200,b'session=a','BYPASS'),
