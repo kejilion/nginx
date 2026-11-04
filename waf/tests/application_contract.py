@@ -135,7 +135,7 @@ def cases():
     add('federation-summary-other-route','POST',summary_path+'-other',envelope,403)
     add('federation-summary-other-method','PUT',summary_path,envelope,403)
     add('federation-summary-metadata','POST',summary_path,{**envelope,'requestId':"1' UNION SELECT password FROM users--"},403)
-    add('federation-summary-plaintext','POST',summary_path,{'message':"1' UNION SELECT password FROM users--"},403)
+    add('federation-summary-plaintext','POST',summary_path+'?fixture=plaintext-summary',{'message':"1' UNION SELECT password FROM users--"},403)
     add('federation-summary-query-alias','POST',summary_path+'?json.message='+ciphertext,envelope,403)
     add('federation-summary-duplicate-field','POST',summary_path,('{"message":"'+ciphertext+'","message":"safe"}').encode(),403)
     add('federation-summary-method-override','POST',summary_path,envelope,403,headers={'X-HTTP-Method-Override':'PATCH'})
@@ -278,6 +278,13 @@ def main():
             c.request(item['method'],item['path'],body,headers);r=c.getresponse();payload=r.read();status=r.status;cache=r.getheader('X-Fixture-Cache');c.close()
             passed=status==item['expected'] and (item['expected_body'] is None or payload==item['expected_body']) and (item['expected_cache'] is None or cache==item['expected_cache'])
             results.append({'test':item['label'],'status':status,'expected':item['expected'],'passed':passed,'cache':cache,'elapsed_ms':round((time.monotonic()-started)*1000,2)})
+        with (logs/'waf-audit.json').open() as audit:
+            plaintext = [transaction for line in audit
+                         if (transaction := json.loads(line)['transaction'])['request']['uri']
+                         == '/api/v2/federation/summary?fixture=plaintext-summary']
+        assert any(message['details']['ruleId'] == '942100' and
+                   'ARGS:json.message:' in message['details'].get('data', '')
+                   for transaction in plaintext for message in transaction['messages'])
         failures=[r for r in results if not r['passed']]
         print(json.dumps({'cases':len(results),'passed':len(results)-len(failures),'failures':failures,'workspace':str(work)}),flush=True)
         if failures and not args.observe:raise AssertionError('KPanel contract regression failed')

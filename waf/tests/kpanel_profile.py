@@ -129,7 +129,7 @@ server {
         deadline=time.monotonic()+10
         while not (sockets/'front.sock').exists() and time.monotonic()<deadline:time.sleep(0.1)
         request('real-panel-health','GET','/api/v1/health')
-        denied = request('federation-summary-still-requires-noise-authentication', 'POST',
+        denied = request('federation-summary-reaches-application-authentication-boundary', 'POST',
                          '/api/v2/federation/summary',
                          {'protocol':'v2', 'controllerId':'a'*32, 'targetId':'b'*32,
                           'requestId':'c'*32, 'timestamp':int(time.time()), 'message':'1--'+'AaBbCcDd'*16}, 401)
