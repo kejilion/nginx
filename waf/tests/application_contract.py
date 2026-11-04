@@ -127,6 +127,18 @@ def cases():
     add('override-keeps-strict-targets','POST','/api/v1/terminal-batches',{'command':'cat /etc/passwd'},403,{'X-HTTP-Method-Override':'DELETE'})
     for path in ['/api/v1/desktop/workspace','/api/v1/docker/tasks']:
         add('metadata-still-inspected-'+path,'PUT'if path.endswith('workspace')else'POST',path,{'name':'<script>alert(1)</script>'},403)
+    summary_path = '/api/v2/federation/summary'
+    ciphertext = '1--' + 'AaBbCcDd' * 16
+    envelope = {'protocol':'noise-fixture','message':ciphertext}
+    add('federation-summary-ciphertext','POST',summary_path,envelope)
+    add('federation-summary-other-site','POST',summary_path,envelope,403,host='other.example')
+    add('federation-summary-other-route','POST',summary_path+'-other',envelope,403)
+    add('federation-summary-other-method','PUT',summary_path,envelope,403)
+    add('federation-summary-metadata','POST',summary_path,{**envelope,'requestId':"1' UNION SELECT password FROM users--"},403)
+    add('federation-summary-plaintext','POST',summary_path,{'message':"1' UNION SELECT password FROM users--"},403)
+    add('federation-summary-query-alias','POST',summary_path+'?json.message='+ciphertext,envelope,403)
+    add('federation-summary-duplicate-field','POST',summary_path,('{"message":"'+ciphertext+'","message":"safe"}').encode(),403)
+    add('federation-summary-method-override','POST',summary_path,envelope,403,headers={'X-HTTP-Method-Override':'PATCH'})
     for path,field in [('/api/v1/terminal-batches','command'),('/api/v2/federation/terminal/relay','message')]:
         add('query-cannot-borrow-json-selector-'+field,'POST',path+'?json.'+field+'=1%27%20UNION%20SELECT%20password%20FROM%20users--',{'command':'echo hello','message':'fixture'},403)
     keys=[f'nav:/app-script/builtin-{i}'for i in range(512)]

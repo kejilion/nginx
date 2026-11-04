@@ -313,6 +313,17 @@ def _kpanel_rules(sites, first_id):
     federation = r'/api/v2/federation/(?:pair|commit|revoke|terminal/(?:open|close|capabilities|output|input|resize|relay)|files/(?:open|open-linked|link|relay))'
     fields(['POST'], federation, ['message'], ('attack-sqli',))
 
+    # Summary uses the same authenticated Noise envelope. Libinjection can
+    # interpret base64url ciphertext as SQL tokens. Keep every other target.
+    summary_flag = 'waf_kpanel_summary'
+    route(['POST'], '/api/v2/federation/summary', ['setvar:tx.' + summary_flag + '=1'], json_body=True)
+    lines.extend([
+        f'SecRule TX:{summary_flag} "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,chain"',
+        '    SecRule &ARGS:json.message "@eq 1" "t:none,chain"',
+        '    SecRule ARGS:json.message "@rx \\A[A-Za-z0-9_-]+\\z" "t:none,ctl:ruleRemoveTargetById=942100;ARGS:json.message"',
+    ])
+    rid += 1
+
     # Authenticated upload handlers consume opaque bytes, not source for an
     # interpreter. Exclude only raw-byte injection targets; phase-2 protocol,
     # headers, cookies and URL parameters still run (body access stays On).

@@ -129,6 +129,11 @@ server {
         deadline=time.monotonic()+10
         while not (sockets/'front.sock').exists() and time.monotonic()<deadline:time.sleep(0.1)
         request('real-panel-health','GET','/api/v1/health')
+        denied = request('federation-summary-still-requires-noise-authentication', 'POST',
+                         '/api/v2/federation/summary',
+                         {'protocol':'v2', 'controllerId':'a'*32, 'targetId':'b'*32,
+                          'requestId':'c'*32, 'timestamp':int(time.time()), 'message':'1--'+'AaBbCcDd'*16}, 401)
+        assert isinstance(denied, dict) and denied.get('code') == 'federation_authentication_failed'
         icon=request('real-bundled-Docker-icon','GET','/desktop-icons/docker-kpanel-flat-v1.webp')
         assert isinstance(icon,bytes) and icon[:4]==b'RIFF' and icon[8:12]==b'WEBP'
         password='Fixture9! '+"1' UNION SELECT password FROM users--"+' <script>alert(1)</script>'
