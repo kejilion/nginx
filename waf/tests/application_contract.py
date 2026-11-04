@@ -278,10 +278,18 @@ def main():
             c.request(item['method'],item['path'],body,headers);r=c.getresponse();payload=r.read();status=r.status;cache=r.getheader('X-Fixture-Cache');c.close()
             passed=status==item['expected'] and (item['expected_body'] is None or payload==item['expected_body']) and (item['expected_cache'] is None or cache==item['expected_cache'])
             results.append({'test':item['label'],'status':status,'expected':item['expected'],'passed':passed,'cache':cache,'elapsed_ms':round((time.monotonic()-started)*1000,2)})
-        with (logs/'waf-audit.json').open() as audit:
-            plaintext = [transaction for line in audit
-                         if (transaction := json.loads(line)['transaction'])['request']['uri']
-                         == '/api/v2/federation/summary?fixture=plaintext-summary']
+        # The HTTP response can finish before the phase-5 audit record.
+        deadline = time.monotonic() + 2
+        while True:
+            with (logs/'waf-audit.json').open() as audit:
+                plaintext = [transaction for line in audit if line.endswith('\n')
+                             and (transaction := json.loads(line)['transaction'])['request']['uri']
+                             == '/api/v2/federation/summary?fixture=plaintext-summary']
+            if plaintext:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError('Summary plaintext audit transaction did not finish')
+            time.sleep(.025)
         assert any(message['details']['ruleId'] == '942100' and
                    'ARGS:json.message:' in message['details'].get('data', '')
                    for transaction in plaintext for message in transaction['messages'])
