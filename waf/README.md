@@ -386,6 +386,14 @@ KPanel 配置档对 GET `/api/v1/apps/<受限应用ID>/install-port` 精确排�
 
 # 独立稳定通道（2026-11-02）
 
+### 2026-11-04 联邦摘要密文误报
+
+正式服审计记录中，已配对节点的 `POST /api/v2/federation/summary` 因 `942100` 命中 Base64URL `json.message` 返回 403。同来源两份访问日志中另有 2508 条摘要请求返回 200。修复复用 KPanel 路由守卫，仅从该规则的检查目标中移除符合 Base64URL 字符集且只出现一次的 `ARGS:json.message`。查询参数、明文消息、其他字段及其他规则继续检查。
+
+固定 Nginx 镜像的隔离检查通过 253 项，旧包仅在新增密文用例失败并命中同一规则。最终检查核对明文消息的 `942100` 审计事件，使用有界等待读取完整记录。固定 KPanel 镜像的 27 项检查通过，伪造密文到达应用并返回 `federation_authentication_failed`。该隔离用例的证据范围为应用认证拒绝边界。独立复核补齐了审计断言、落盘等待和测试范围说明。
+
+经授权试点中，真实已配对节点摘要、管理入口和业务探针均返回 200。试点验证后先恢复旧包运行配置，让原生签名更新事务取得正确前像。稳定通道 sequence 2 指向 `f39353e251be41dc3c291435e8fc327ebe123845`，公开七文件与验证字节一致，`package-check`、`package-update`、`package-status` 和 `doctor` 通过。更新后真实摘要返回 200，WAF 为 On，重复计划为空。回滚使用 `k web waf package-rollback`，上一包为 `041d91a`。更新快照 `/home/web/backups/waf-managed/20261104T020930865828Z-package-update`。缓存旧包完整归档至 `/home/web/backups/waf-fed-20261104/`，逐文件摘要一致。
+
 原生脚本 4.5.17 起不再为每次共享包更新改 pin。`channels/stable-v1.json` 是 API 1 稳定通道的签名信封，包含不可变 Git revision、七文件 SHA-256、递增 sequence、签发/过期时间。引导器先用内置 RSA-3072 公钥验证原始清单字节，再检查兼容性、时效和摘要。依据：[OpenSSL SHA-256 签名与验签](https://docs.openssl.org/3.0/man1/openssl-dgst/)。本机制不是完整 TUF 实现，也不代表签名代码没有缺陷。
 
 API 1 固定 `configure.py`、`policy.py`、`nginx_edit.py`、`ban.py`、`example-policy.json`、`cloudflare-ips.json`、`legacy-jails.local` 七文件及现有命令/策略 schema。更新器还依赖 configure 的 `locked`、`make_plan`、`snapshot`、`apply(lock_held=True)`、`restore`、`configured_status` 和 nginx 检查/重载函数；这些接口和备份格式必须向后兼容。破坏性接口/数据迁移需新通道与新版引导器，不能冒充 API 1 热更新。
