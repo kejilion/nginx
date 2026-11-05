@@ -37,8 +37,8 @@ class ApplicationBackend(Backend):
 
 def cases():
     result=[]
-    def add(label,method,path,body=None,expected=200,headers=None,host='panel.example',expected_body=None,expected_cache=None):
-        result.append(dict(label=label,method=method,path=path,body=body,expected=expected,headers=headers or {},host=host,expected_body=expected_body,expected_cache=expected_cache))
+    def add(label,method,path,body=None,expected=200,headers=None,host='panel.example',expected_body=None,expected_cache=None,expected_headers=None):
+        result.append(dict(label=label,method=method,path=path,body=body,expected=expected,headers=headers or {},host=host,expected_body=expected_body,expected_cache=expected_cache,expected_headers=expected_headers or {}))
     port_path='/api/v1/apps/builtin-84/install-port'
     for app in ['builtin-84','thirdparty-demo','local-demo']:
         for action in ['install','manage','start','stop','restart','update','uninstall','direct_access','check_update']:
@@ -226,6 +226,40 @@ def cases():
             (url_file.replace('/.repo','/../.repo'),'GET',{},'generic.example'),
             (url_file+'-other','GET',{},'generic.example')]:
             add('url-dotfile-boundary-'+scheme+path+method+host,method,path,expected=403,headers=headers,host=host)
+    download = '/downloads/setup.sh'
+    for host in ['generic.example', 'cms.example']:
+        for method in ['GET', 'HEAD']:
+            add('public-download-'+host+method, method, download, host=host)
+    add('public-download-safe-query', 'GET', download+'?version=1', host='generic.example')
+    download_body = b'#!/bin/sh\n# inert public download fixture\n'
+    add('public-download-static-bytes', 'GET', download, host='static.example', expected_body=download_body)
+    add('public-download-static-head', 'HEAD', download, host='static.example', expected_body=b'',
+        expected_headers={'Content-Length': str(len(download_body)), 'Accept-Ranges': 'bytes'})
+    add('public-download-static-range', 'GET', download, expected=206,
+        headers={'Range': 'bytes=0-3'}, host='static.example', expected_body=download_body[:4],
+        expected_headers={'Content-Range': 'bytes 0-3/'+str(len(download_body))})
+    add('public-download-static-query-method', 'GET', download+'?_method=DELETE',
+        host='static.example', expected_body=download_body)
+    for path, method, headers, host in [
+        (download, 'GET', {}, 'other.example'),
+        (download, 'POST', {}, 'generic.example'),
+        (download, 'PUT', {}, 'generic.example'),
+        (download+'?fixture=download-method-override-a', 'GET', {'X-HTTP-Method-Override': 'DELETE'}, 'generic.example'),
+        (download+'?fixture=download-method-override-b', 'GET', {'X-Method-Override': 'DELETE'}, 'generic.example'),
+        (download.replace('setup', '%73etup'), 'GET', {}, 'generic.example'),
+        (download.replace('setup', '%2573etup'), 'GET', {}, 'generic.example'),
+        (download.replace('/setup', '//setup'), 'GET', {}, 'generic.example'),
+        (download.replace('/setup', '/./setup'), 'GET', {}, 'generic.example'),
+        (download.replace('/setup', '/x/../setup'), 'GET', {}, 'generic.example'),
+        (download+'.bak', 'GET', {}, 'generic.example'),
+        ('/downloads/other.sh', 'GET', {}, 'generic.example'),
+        ('/private/setup.sh', 'GET', {}, 'generic.example'),
+        ('/.env', 'GET', {}, 'generic.example'),
+        (download+'?q=1%27%20UNION%20SELECT%20password%20FROM%20users--', 'GET', {}, 'generic.example'),
+        (download+'?q=%3Cscript%3Ealert(1)%3C/script%3E', 'GET', {}, 'generic.example'),
+        (download+'?q=cat%20/etc/passwd', 'GET', {}, 'generic.example')]:
+        add('public-download-boundary-'+host+path+method+str(headers), method, path,
+            expected=403, headers=headers, host=host)
     return result
 
 
@@ -238,6 +272,13 @@ def main():
     config['sites']['generic.example']['sourceText']=[{'method':'POST','path':'/api/source-note','fields':['content']}]
     config['sites']['generic.example']['exclusions']=[{'ruleId':rule,'path':'/raw.example/acme/project/main/compose/.env','target':'REQUEST_FILENAME'}for rule in [1110,930130]]
     config['sites']['generic.example']['exclusions'] += [{'ruleId':1110,'path':'/'+scheme+'://raw.example/acme/.repo/main/file','target':'REQUEST_FILENAME'}for scheme in ['http','https']]
+    for host in ['generic.example', 'cms.example']:
+        config['sites'][host].setdefault('exclusions', []).append(
+            {'ruleId': 920440, 'path': '/downloads/setup.sh', 'target': 'REQUEST_BASENAME'})
+    config['sites']['static.example'] = {'exclusions': [
+        {'ruleId': 920440, 'path': '/downloads/setup.sh', 'target': 'REQUEST_BASENAME'}]}
+    downloads = work/'downloads'; downloads.mkdir()
+    (downloads/'setup.sh').write_bytes(b'#!/bin/sh\n# inert public download fixture\n')
     # A fresh static site has no explicit policy/profile entry.
     assets=work/'desktop-icons/xp';assets.mkdir(parents=True);(assets/'docker-v1.svg').write_text('<svg/>')
     cf=policy.networks(json.loads((bundle/'cloudflare-ips.json').read_text()))
@@ -277,6 +318,7 @@ def main():
             started=time.monotonic()
             c.request(item['method'],item['path'],body,headers);r=c.getresponse();payload=r.read();status=r.status;cache=r.getheader('X-Fixture-Cache');c.close()
             passed=status==item['expected'] and (item['expected_body'] is None or payload==item['expected_body']) and (item['expected_cache'] is None or cache==item['expected_cache'])
+            passed = passed and all(r.getheader(key) == value for key, value in item['expected_headers'].items())
             results.append({'test':item['label'],'status':status,'expected':item['expected'],'passed':passed,'cache':cache,'elapsed_ms':round((time.monotonic()-started)*1000,2)})
         # The HTTP response can finish before the phase-5 audit record.
         deadline = time.monotonic() + 2
@@ -293,6 +335,21 @@ def main():
         assert any(message['details']['ruleId'] == '942100' and
                    'ARGS:json.message:' in message['details'].get('data', '')
                    for transaction in plaintext for message in transaction['messages'])
+        deadline = time.monotonic() + 2
+        expected_override_paths = {'/downloads/setup.sh?fixture=download-method-override-'+suffix for suffix in ['a', 'b']}
+        while True:
+            with (logs/'waf-audit.json').open() as audit:
+                override_rows = [transaction for line in audit if line.endswith('\n')
+                                 and (transaction := json.loads(line)['transaction'])['request']['uri']
+                                 in expected_override_paths]
+            protected_paths = {transaction['request']['uri'] for transaction in override_rows
+                               if any(message['details']['ruleId'] == '920440'
+                                      for message in transaction['messages'])}
+            if protected_paths == expected_override_paths:
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError('Method override requests did not retain extension rule 920440')
+            time.sleep(.025)
         failures=[r for r in results if not r['passed']]
         print(json.dumps({'cases':len(results),'passed':len(results)-len(failures),'failures':failures,'workspace':str(work)}),flush=True)
         if failures and not args.observe:raise AssertionError('KPanel contract regression failed')

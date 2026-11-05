@@ -92,7 +92,13 @@ def validate(config: dict) -> dict:
             checked_path=re.sub(r'^/https?://[A-Za-z0-9-]+(?:[.][A-Za-z0-9-]+)+/', '/', exact_path) if rule['ruleId']==1110 else exact_path
             if len(exact_path)>251 or not re.fullmatch(r"/[\w./-]{0,250}", checked_path):
                 raise ValueError("Exclusion requires an exact path")
-            if rule.get('target')!='REQUEST_FILENAME' and not re.fullmatch(r"ARGS:[A-Za-z0-9_.\[\]-]{1,100}", rule.get("target", "")):
+            basename = rule.get('target') == 'REQUEST_BASENAME'
+            if basename and (rule['ruleId'] != 920440 or
+                    not re.fullmatch(r'/[A-Za-z0-9_./-]{1,250}', exact_path) or
+                    exact_path.endswith('/') or '//' in exact_path or
+                    any(part in {'.', '..'} for part in exact_path.split('/'))):
+                raise ValueError('Extension exclusion requires rule 920440 and a canonical ASCII filename path')
+            if not basename and rule.get('target')!='REQUEST_FILENAME' and not re.fullmatch(r"ARGS:[A-Za-z0-9_.\[\]-]{1,100}", rule.get("target", "")):
                 raise ValueError("Exclusion requires one named argument or exact filename")
             if rule['ruleId']==1110 and (rule['target']!='REQUEST_FILENAME' or
                     not re.fullmatch(r'/[A-Za-z0-9_./-]{1,250}',checked_path) or
@@ -438,9 +444,9 @@ def render_profile_rules(config: dict, method_controls=None, resource_controls=N
                 f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                 '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
             ]
-            if item['target']=='REQUEST_FILENAME':
+            if item['target'] in {'REQUEST_FILENAME', 'REQUEST_BASENAME'}:
                 exceptions.append('    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"')
-            if item['ruleId']==1110:
+            if item['ruleId']==1110 or item['target']=='REQUEST_BASENAME':
                 # Administrator-attested public files never cover encoded aliases.
                 exceptions.append('    SecRule REQUEST_URI_RAW "@rx ^'+re.escape(item['path'])+'(?:[?].*)?$" "t:none,chain"')
             exceptions.append(f'    SecRule REQUEST_FILENAME "@streq {item["path"]}" "t:none,ctl:ruleRemoveTargetById={item["ruleId"]};{item["target"]}"')

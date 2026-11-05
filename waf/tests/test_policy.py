@@ -125,6 +125,23 @@ class PolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.validate(self.config)
 
+    def test_extension_exclusion_requires_exact_basename_contract(self):
+        entry = {'ruleId': 920440, 'path': '/downloads/setup.sh', 'target': 'REQUEST_BASENAME'}
+        self.config['sites'] = {'one.example': {'exclusions': [entry]}}
+        policy.validate(self.config)
+        rendered = policy.render_profile_rules(self.config)
+        self.assertIn('ruleRemoveTargetById=920440;REQUEST_BASENAME', rendered)
+        self.assertIn('REQUEST_URI_RAW "@rx ^/downloads/setup\\.sh(?:[?].*)?$', rendered)
+        self.assertIn('REQUEST_METHOD "@rx ^(?:GET|HEAD)$"', rendered)
+        self.assertNotIn('ruleRemoveById=920440', rendered)
+        for field, value in [('ruleId', 942100), ('ruleId', 1110), ('path', '/x/../setup.sh'),
+                             ('path', '/x/./setup.sh'), ('path', '//setup.sh'), ('path', '/x/'),
+                             ('path', '/%73etup.sh'), ('path', '/中文.sh')]:
+            bad = dict(entry); bad[field] = value
+            self.config['sites']['one.example']['exclusions'] = [bad]
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                policy.validate(self.config)
+
     def test_dot_guard_exclusion_is_exact_filename_only(self):
         entry={'ruleId':1110,'path':'/raw.example/repo/main/.env','target':'REQUEST_FILENAME'}
         self.config['sites']={'one.example':{'exclusions':[entry]}}
