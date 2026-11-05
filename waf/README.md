@@ -394,7 +394,11 @@ KPanel 配置档对 GET `/api/v1/apps/<受限应用ID>/install-port` 精确排�
 
 固定生产 amd64 Nginx 镜像 `sha256:5cdeeb593a6a1f517acb733e5f92cb33695e2d84847e3955d763008ca12993c1` 的无网络隔离验证最终通过 279/279 请求及 92 项相关单元检查。旧包在无新增声明的相同请求矩阵中通过 270/279，九项新增下载正例全部被 920440 拦截。新矩阵覆盖不同配置档、真实静态正文、HEAD 长度、Range 正文与响应头、方法覆盖头、编码/路径别名、跨站、写请求及查询 SQLi/XSS/RCE。独立复核提出真实文件响应和方法覆盖审计断言两项改进，补齐后重跑通过；复核者独立运行 29 项策略单测和差异检查，未独立运行镜像集成。两条覆盖头反例均显式核对仍命中 920440，并有界等待完整审计记录。
 
-108 候选试点恢复 GET/HEAD 200、Range 206，完整 642760 字节下载与原文件逐字一致；首页、镜像站、论坛、健康及私有管理入口均为 200。WAF 保持 On，重复计划无差异。试点恢复点 `/home/web/backups/waf-managed/20261105T020817508272Z-policy`，私有证据 `/root/waf-download-20261105`；未执行下载脚本，也不将短窗口成功称作所有用户场景已验证。发布与原生入口消费结果另行回读；回退不支持新目标的旧包之前，须先恢复本次站点声明及其配置事务，不重置签名水位。
+108 候选试点恢复 GET/HEAD 200、Range 206，完整 642760 字节下载与原文件逐字一致；首页、镜像站、论坛、健康及私有管理入口均为 200。WAF 保持 On，重复计划无差异。试点恢复点 `/home/web/backups/waf-managed/20261105T020817508272Z-policy`，私有证据 `/root/waf-download-20261105`；未执行下载脚本，也不将短窗口成功称作所有用户场景已验证。
+
+公共源码 [`412d0a5`](https://github.com/kejilion/nginx/commit/412d0a5a02cc7b487109a78571cde2a01cffa73b) 的七文件已回读，与验证产物逐字/摘要一致；签名通道提交 [`3400797`](https://github.com/kejilion/nginx/commit/34007971ca5fd93ac06dce1267f3605f2d91d08f) 发布 sequence 3。先恢复试点前像，再经真实 `k web waf package-update` 安装该包，随后 `k web waf apply --policy` 应用唯一新增的站点声明。实际 active 与公开 available 均为 `412d0a5`，previous 为 `f39353e`，无待恢复事务；doctor、七文件缓存摘要、运行中策略字节及重复计划通过。下载与管理入口复验通过，原联邦摘要自然请求仍返回 200。原生脚本沿用已发布签名消费入口，不改脚本 pin，不宣称其他已有用户或旧 KPanel 内嵌脚本已自动升级。
+
+回退顺序：先用 `k web waf rollback --backup /home/web/backups/waf-managed/20261105T021138156471Z-policy` 撤销新站点声明，再执行 `k web waf package-rollback`；旧包不支持新目标，不跳过第一步。包事务恢复点 `/home/web/backups/waf-managed/20261105T021128486799Z-package-update`，不重置签名水位。缓存达到 16 份上限，已核实无活动状态、实际脚本或进程引用的旧六文件包 `0a37a7d`，与其源码摘要一致后完整归档到 `/home/web/backups/waf-download-20261105/`；未删除旧包或扩大缓存上限。
 
 ### 2026-11-04 联邦摘要密文误报
 
