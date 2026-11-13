@@ -72,7 +72,7 @@ def validate(config: dict) -> dict:
         raise ValueError("Invalid or excessive sites")
     contract_count=field_count=0
     for name, site in sites.items():
-        if set(site) - {"profile", "mode", "exclusions", "cdn", "trustedProxies", "proxyHeader", "methodOverride", "sourceText"}:
+        if set(site) - {"profile", "mode", "exclusions", "cdn", "trustedProxies", "proxyHeader", "methodOverride", "sourceText", "fileMetadata"}:
             raise ValueError("Unknown site policy fields")
         if scope(name) != name:
             raise ValueError("Site scopes must be normalized")
@@ -106,20 +106,21 @@ def validate(config: dict) -> dict:
                 raise ValueError('Dot-path guard exclusion requires a canonical ASCII filename path')
         if len(site.get("exclusions", [])) > 32:
             raise ValueError("Too many exclusions")
-        contracts=site.get('sourceText',[])
-        if not isinstance(contracts,list) or len(contracts)>16:raise ValueError('Too many source text contracts')
-        contract_count+=len(contracts)
-        if contract_count>256:raise ValueError('Global source text contract budget exceeded')
-        for contract in contracts:
-            if not isinstance(contract,dict) or set(contract)!={'method','path','fields'}:raise ValueError('Invalid source text contract')
-            if contract['method'] not in {'POST','PUT','PATCH'}:raise ValueError('Invalid source text method')
-            if not isinstance(contract['path'],str) or not re.fullmatch(r'/[A-Za-z0-9_/-]{1,200}',contract['path']) or '//' in contract['path']:raise ValueError('Source text requires a literal path')
-            fields=contract['fields']
-            if not isinstance(fields,list) or not 1<=len(fields)<=8 or any(not isinstance(f,str) for f in fields):raise ValueError('Invalid source text fields')
-            if len(set(fields))!=len(fields):raise ValueError('Duplicate source text fields')
-            field_count+=len(fields)
-            if field_count>1024:raise ValueError('Global source text field budget exceeded')
-            if any(not isinstance(field,str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:[.][A-Za-z_][A-Za-z0-9_]*){0,7}',field) for field in fields):raise ValueError('Invalid JSON field name')
+        for kind in ('sourceText','fileMetadata'):
+            contracts=site.get(kind,[])
+            if not isinstance(contracts,list) or len(contracts)>16:raise ValueError('Too many '+kind+' contracts')
+            contract_count+=len(contracts)
+            if contract_count>256:raise ValueError('Global semantic contract budget exceeded')
+            for contract in contracts:
+                if not isinstance(contract,dict) or set(contract)!={'method','path','fields'}:raise ValueError('Invalid '+kind+' contract')
+                if contract['method'] not in {'POST','PUT','PATCH'}:raise ValueError('Invalid '+kind+' method')
+                if not isinstance(contract['path'],str) or not re.fullmatch(r'/[A-Za-z0-9_/-]{1,200}',contract['path']) or '//' in contract['path']:raise ValueError(kind+' requires a literal path')
+                fields=contract['fields']
+                if not isinstance(fields,list) or not 1<=len(fields)<=8 or any(not isinstance(f,str) for f in fields):raise ValueError('Invalid '+kind+' fields')
+                if len(set(fields))!=len(fields):raise ValueError('Duplicate '+kind+' fields')
+                field_count+=len(fields)
+                if field_count>1024:raise ValueError('Global semantic field budget exceeded')
+                if any(not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(?:[.][A-Za-z_][A-Za-z0-9_]*){0,7}',field) for field in fields):raise ValueError('Invalid JSON field name')
         if "cdn" in site:
             validate({"schemaVersion": 1, "mode": config["mode"], "cdn": site["cdn"],
                       "container": config["container"], "sites": {},
@@ -356,6 +357,54 @@ def _kpanel_rules(sites, first_id):
     return lines, rid
 
 
+def _file_metadata_rules(sites, first_id):
+    """Literal basename contracts; never infer trust from a client field name."""
+    lines = []
+    rid = first_id
+    contracts = []
+    if any(site.get('profile') == 'kpanel' for site in sites.values()):
+        for path, field in [('/api/v1/files/transfer/sessions', 'input.name'),
+                            ('/api/v1/files/actions', 'name'),
+                            ('/api/v1/files/archive-jobs', 'input.name')]:
+            contracts.append(('TX:waf_kpanel_profile', '@eq 1', 'POST',
+                              r'^(?:/[A-Za-z0-9_-]+)?' + path + '$', [field]))
+    for name, site in sorted(sites.items()):
+        for contract in site.get('fileMetadata', []):
+            contracts.append(('UNIQUE_ID', '@beginsWith ' + name + '|',
+                              contract['method'], '^' + re.escape(contract['path']) + '$',
+                              contract['fields']))
+    for selector, operator, method, path, fields in contracts:
+        flag = 'waf_filename_' + str(rid)
+        lines += [
+            f'SecRule {selector} "{operator}" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+            '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+            '    SecRule &REQUEST_HEADERS:Content-Encoding "@eq 0" "t:none,chain"',
+            '    SecRule &REQUEST_HEADERS:Content-Type "@eq 1" "t:none,chain"',
+            '    SecRule &ARGS_GET:/^json[.]/ "@eq 0" "t:none,chain"',
+            '    SecRule REQUEST_METHOD "@streq ' + method + '" "t:none,chain"',
+            '    SecRule REQUEST_URI_RAW "@rx ^/[^%?]*(?:[?].*)?$" "t:none,chain"',
+            '    SecRule REQUEST_HEADERS:Content-Type "@rx ^application/(?:[a-z0-9.+-]+\\+)?json(?:;|$)" "t:none,t:lowercase,chain"',
+            '    SecRule REQUEST_FILENAME "@rx ' + path + '" "t:none,setvar:tx.' + flag + '=1"',
+        ]
+        rid += 1
+        for field in fields:
+            # A single filesystem component, bounded in bytes. Backend name,
+            # directory, authorization and platform checks remain authoritative.
+            # Remove only the confirmed libinjection false-positive target;
+            # other SQL rules and all raw-body/header/query targets remain on.
+            basename = r'\A(?![.]{1,2}\z)[^/\\\x00-\x1f\x7f]{1,255}\z'
+            lines += [
+                f'SecRule TX:{flag} "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,chain"',
+                '    SecRule REQBODY_PROCESSOR "@streq JSON" "t:none,chain"',
+                '    SecRule REQBODY_ERROR "@eq 0" "t:none,chain"',
+                '    SecRule &ARGS:/(?i:_method)$/ "@eq 0" "t:none,chain"',
+                '    SecRule &ARGS:json.' + field + ' "@eq 1" "t:none,chain"',
+                '    SecRule ARGS:json.' + field + ' "@rx ' + basename + '" "t:none,ctl:ruleRemoveTargetById=942100;ARGS:json.' + field + '"',
+            ]
+            rid += 1
+    return lines, rid
+
+
 def _content_application_rules(sites, first_id):
     """Known CMS URL grammar and forum source text, not arbitrary API bypasses."""
     lines=[]
@@ -455,6 +504,8 @@ def render_profile_rules(config: dict, method_controls=None, resource_controls=N
         lines.append('SecRule &TX:waf_mode_override "@eq 0" "id:1190,phase:1,pass,nolog,ctl:ruleEngine=' + {"off":"Off", "detect":"DetectionOnly"}[global_mode] + '"')
     kpanel_lines,rid=_kpanel_rules(config['sites'],rid)
     lines+=kpanel_lines
+    filename_lines,rid=_file_metadata_rules(config['sites'],rid)
+    lines+=filename_lines
     content_lines,rid=_content_application_rules(config['sites'],rid)
     lines+=content_lines
     for name,site in sorted(config['sites'].items()):

@@ -653,7 +653,9 @@ def configured_status(root,config):
     synchronized=profile.exists() and read_config(profile)==policy.render_profile_rules(config,(strict_all,strict_sites),resources)
     mode='off' if not engine else ('on' if not policy.engine_enabled(config) else (next(iter(modes)) if len(modes)==1 else 'mixed'))
     return {'mode':mode,'engineEnabled':engine,'sites':config['sites'],'siteCount':len(names),
-            'requestSemantics':{'staticResources':resources,'sourceTextContracts':{name:len(site.get('sourceText',[])) for name,site in config['sites'].items() if site.get('sourceText')},'synchronized':synchronized},
+            'requestSemantics':{'staticResources':resources,'sourceTextContracts':{name:len(site.get('sourceText',[])) for name,site in config['sites'].items() if site.get('sourceText')},
+                                'fileMetadataContracts':{name:len(site.get('fileMetadata',[]))+(3 if site.get('profile')=='kpanel' else 0) for name,site in config['sites'].items() if site.get('fileMetadata') or site.get('profile')=='kpanel'},
+                                'synchronized':synchronized},
             'banBackend':config.get('banBackend','existing'),'source':'configuration',
             'methodOverride':{'configured':config.get('methodOverride','guarded'),
                               'gatewayStrictAll':strict_all,'gatewayStrictSites':sorted(strict_sites),
