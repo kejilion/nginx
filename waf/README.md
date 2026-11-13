@@ -434,6 +434,18 @@ python3 waf/sign-channel.py --revision <已验证且公开的40位提交> --sequ
 
 包状态保存在 `config/waf/package-state.json`，位于严格七文件缓存外。更新先持有 package 锁，再持有既有 install 锁，记录确切配置快照与 pending 后热应用、检查并切换 active；失败恢复快照，中断后显式 recover。发现第三方配置冲突或恢复失败时保留 pending。回退不降低已接受版本的序号水位。缓存仍限制16份/总字节预算，满时要求管理员归档明确不在用版本，不自动删除未知内容。签名与兼容失败不静默退回旧下载；不会创建后台更新任务。进程终止恢复和持久化顺序通过专项验证，不声称物理断电或所有文件系统已实测。
 
+### 2026-11-14：通用单文件名元数据与 EU 试点发布
+
+共享包 [`d8cb4f7`](https://github.com/kejilion/nginx/commit/d8cb4f7f22e16418f723e9d834df088ed528be65) 提供不依赖应用类型的 `fileMetadata` 声明，KPanel 的接收会话、目录/归档动作和归档任务复用同一守卫。公共默认不包含试点域名、音乐目录或文件名。配置包版本仍为 1.1.0；稳定 API 1 通道 sequence 4 由 [`bebbe46`](https://github.com/kejilion/nginx/commit/bebbe46) 发布，七文件公开字节与冻结候选、签名摘要一致。此次无需重建 Nginx 或 KPanel 镜像。
+
+相对公共基线 `5b30ea4`，未声明能力的 generic 站点生成内容不变；1 个和 200 个 KPanel 均只增加共享的 6 条根规则、3546 字节。移除新增块并规范化生成编号后，其余规则语义一致。文件名仍受单值、解析、来源与方法边界保护，其他字段、其他 SQL 规则和应用权限继续检查；完整路径及旧 query 上传不属于此次能力。
+
+固定 Nginx/ModSecurity 镜像的隔离应用矩阵 306 项、引擎集成 197 项、实际 Panel/Agent 的完整上传/读回/目录/ZIP 内容检查 30 项、受管应用/幂等/精确回滚/重载故障恢复 11 项通过。独立复核对最终候选执行 12 项真实引擎边界探针通过，包含 UTF-8 255/258 字节、字段大小写、同名前缀字段、编码 query 碰撞及任意应用声明。Linux 单测 203 项中 201 通过；`test_busy_install_still_persists_ticket_for_cron`、`test_full_cf_switch_preserves_origin_bans_and_modes` 在原基线同环境仍失败，未计为通过，本轮未改封禁后端。首轮夹具的目录权限、无效样本期望和重载接管等待经修正后复验，失败轮次不计入上述通过结果。原始隔离证据保留于验证机 `/root/waf-file-metadata-20261113/`；不作长期或跨平台性能收益承诺。
+
+EU ARM64 试点保持 WAF On，原误报上传的创建、分块和提交自然请求返回 200，原目标目录的文件实际落盘约 1.13 MiB。试点验证后先精确恢复原像，再经真实 `k web waf package-update` 安装同一签名包，active 为 `d8cb4f7`、previous 为 `041d91a`、maximumSequence 为 4，无待恢复事务；doctor、重复 plan 和本地封禁健康检查通过。正式安装后继续观察到上传 200、文件读取 200/206 和管理 API 正常响应。未在生产执行攻击、压力或故障注入。
+
+恢复点为 `/home/web/backups/waf-managed/20261113T162537892685Z-package-update`，另保留试点前配置归档。回退使用 `k web waf package-rollback`，不降低签名水位；自定义新声明按上文先撤销再回退。具备签名入口的已有用户需主动执行 `k web waf package-update`，旧入口先更新原生脚本；没有引入自动升级，也未重发旧面板内嵌脚本。公开七文件和实际缓存逐字相同；六个运行代码/模板文件与缓存一致，运行中的 Cloudflare 地址 JSON 仅规范化排版，值一致。
+
 ### 独立通道首发验证与试点
 
 2026-11-02 已公开通道提交 `f7e5475` 和原生脚本 4.5.17 `c2993d5`。首个签名 sequence 为1，仍指向已公开并验证的七文件包 `041d91ac33e8c74d8fcf97d30a73cef5910e6528`，没有借此更换规则或镜像。通道字节、七文件摘要、根/CN脚本各自公开字节均回读一致。
