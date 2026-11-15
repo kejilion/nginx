@@ -434,6 +434,18 @@ python3 waf/sign-channel.py --revision <已验证且公开的40位提交> --sequ
 
 包状态保存在 `config/waf/package-state.json`，位于严格七文件缓存外。更新先持有 package 锁，再持有既有 install 锁，记录确切配置快照与 pending 后热应用、检查并切换 active；失败恢复快照，中断后显式 recover。发现第三方配置冲突或恢复失败时保留 pending。回退不降低已接受版本的序号水位。缓存仍限制16份/总字节预算，满时要求管理员归档明确不在用版本，不自动删除未知内容。签名与兼容失败不静默退回旧下载；不会创建后台更新任务。进程终止恢复和持久化顺序通过专项验证，不声称物理断电或所有文件系统已实测。
 
+### 2026-11-15：复用密文守卫处理监控交换误报
+
+EU 近期日志确认 4 次 `POST /api/v2/federation/monitoring/relay` 被 942100 对 `ARGS:json.message` 的 SQL 检测误拦。核对实际部署的 Panel `f656291688401a7e5232f97659810d98ff0c95c8` 后，确认该字段为 Noise 加密消息，应用仍执行配对身份、解密、作用域、时间窗及重放检查。共享包 [`b4dd5a0`](https://github.com/kejilion/nginx/commit/b4dd5a0f644a456da57819033486d4a3f3bbfe9f) 将已有 summary 密文守卫复用到精确的 monitoring/history、monitoring/relay 端点：仅 POST、JSON 成功解析、单个规范 base64url 消息字段排除 942100；路径编码别名不进入守卫，其他参数、其他 SQL 检测及应用权限检查保留。未增加域名或用户凭据例外，也未将整个联邦命名空间免检。
+
+相对上一签名包 `d8cb4f7`，代表性双站点配置的根规则数保持 824，完整规则 ID 序列一致，生成内容增加 222 字节；仅两个既有守卫入口改变。隔离矩阵 342 项、使用同一已部署 Panel 镜像清单的真实应用验证 29 项、受管更新/幂等/精确回滚/重载故障恢复 11 项通过，独立复核另行重复 342 项与 29 项验证通过。基线运行相同矩阵有 5 个预期差异：两个监控端点各两种密文请求由 WAF 403 变为通过，summary 编码别名由通过变为拒绝。真实 history 未认证请求由应用返回 403 `monitoring_access_denied`，relay 返回 401 `federation_authentication_failed`；首轮测试误将 history 期望设为 401，已按应用源码及响应修正测试，失败轮次未计为通过。Linux 单测 203 项中 201 通过，另两项为上节列明且在原基线复现的封禁测试失败，本轮未修改封禁代码。
+
+原始隔离证据位于验证机 `/root/waf-monitoring-noise-20261115/`，独立证据在 `/root/waf-monitoring-independent-review-20261115/` 与 `/root/waf-monitoring-independent-real-panel-20261115/`。未在隔离环境构造完整的真实配对节点成功监控交换；因此在已授权 EU 试点观察已有配对节点通信。试点约 105 秒内中继 28 次返回 200，健康接口 200，未见新的监控 WAF 拦截；正式更新后约 84 秒内另有 22 次中继 200。独立复核确认真实隐藏管理入口、带入口 Cookie 的登录页及健康接口均 200；根路径 404 是现存入口隐藏机制的预期行为。短窗口不代表长期无误报或性能收益，未在生产执行攻击、压力或故障注入。
+
+稳定 API 1 通道 sequence 5 由 [`29d023d`](https://github.com/kejilion/nginx/commit/29d023de1a7e7ecf46d6f9edc875de9c55c237ac) 发布，RSA 签名、公开七文件与冻结 Git 字节一致，配置包版本仍为 1.1.0，不重建或升级镜像。试点后先恢复 `d8cb4f7` 前像，再经真实 `k web waf package-update` 安装；EU active 为 `b4dd5a0`、previous 为 `d8cb4f7`、maximumSequence 为 5、无待恢复事务。doctor 显示 WAF On、语法与语义同步，重复 plan 为空，本地封禁健康；七文件缓存校验通过，六个运行代码/模板逐字一致，Cloudflare 地址 JSON 仅规范化排版且值相同。缓存 10 份，保留旧包和用户配置。
+
+全量恢复点 `/home/web/backups/waf-monitoring-noise-20261115T031550Z`；原生更新前像 `/home/web/backups/waf-managed/20261115T032211745102Z-package-update` 已核验其 policy 为上一签名包字节。回退使用 `k web waf package-rollback`，不降低签名水位。具备签名消费入口的其他用户需主动执行 `k web waf package-update`，旧入口先更新原生脚本；108 本轮未确认新增误报，保持原有安装，不引入自动升级或修改无关架构。
+
 ### 2026-11-14：通用单文件名元数据与 EU 试点发布
 
 共享包 [`d8cb4f7`](https://github.com/kejilion/nginx/commit/d8cb4f7f22e16418f723e9d834df088ed528be65) 提供不依赖应用类型的 `fileMetadata` 声明，KPanel 的接收会话、目录/归档动作和归档任务复用同一守卫。公共默认不包含试点域名、音乐目录或文件名。配置包版本仍为 1.1.0；稳定 API 1 通道 sequence 4 由 [`bebbe46`](https://github.com/kejilion/nginx/commit/bebbe46) 发布，七文件公开字节与冻结候选、签名摘要一致。此次无需重建 Nginx 或 KPanel 镜像。
