@@ -248,7 +248,7 @@ def _kpanel_rules(sites, first_id):
         lines.append(f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,setvar:tx.waf_kpanel_profile=1"')
         rid += 1
 
-    def route(methods, path, controls, json_body=False, media=None):
+    def route(methods, path, controls, json_body=False, media=None, canonical=False):
         nonlocal rid
         lines.extend([
             f'SecRule TX:waf_kpanel_profile "@eq 1" "id:{rid},phase:1,pass,nolog,t:none,chain"',
@@ -262,6 +262,8 @@ def _kpanel_rules(sites, first_id):
             lines.append('    SecRule REQUEST_HEADERS:Content-Type "@rx ^application/(?:[a-z0-9.+-]+\\+)?json(?:;|$)" "t:none,t:lowercase,chain"')
         if media:
             lines.append('    SecRule REQUEST_HEADERS:Content-Type "@rx ^(?:'+media+')(?:;|$)" "t:none,t:lowercase,chain"')
+        if canonical:
+            lines.append('    SecRule REQUEST_URI_RAW "@rx ^/[^%?]*(?:[?].*)?$" "t:none,chain"')
         lines.append('    SecRule REQUEST_FILENAME "@rx ^(?:/[A-Za-z0-9_-]+)?' + path + '$" "t:none,' + ','.join(controls) + '"')
         rid += 1
 
@@ -320,12 +322,16 @@ def _kpanel_rules(sites, first_id):
     federation = r'/api/v2/federation/(?:pair|commit|revoke|terminal/(?:open|close|capabilities|output|input|resize|relay)|files/(?:open|open-linked|link|relay))'
     fields(['POST'], federation, ['message'], ('attack-sqli',))
 
-    # Summary uses the same authenticated Noise envelope. Libinjection can
-    # interpret base64url ciphertext as SQL tokens. Keep every other target.
-    summary_flag = 'waf_kpanel_summary'
-    route(['POST'], '/api/v2/federation/summary', ['setvar:tx.' + summary_flag + '=1'], json_body=True)
+    # Summary and the complete read-only monitoring exchange use the same
+    # authenticated Noise envelope. Share one bounded ciphertext guard rather
+    # than adding a rule per endpoint; unknown federation routes stay inspected.
+    noise_flag = 'waf_kpanel_noise_message'
+    noise_reads = r'/api/v2/federation/(?:summary|monitoring/(?:history|relay))'
+    route(['POST'], noise_reads, ['setvar:tx.' + noise_flag + '=1'], json_body=True, canonical=True)
     lines.extend([
-        f'SecRule TX:{summary_flag} "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,chain"',
+        f'SecRule TX:{noise_flag} "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,chain"',
+        '    SecRule REQBODY_PROCESSOR "@streq JSON" "t:none,chain"',
+        '    SecRule REQBODY_ERROR "@eq 0" "t:none,chain"',
         '    SecRule &ARGS:json.message "@eq 1" "t:none,chain"',
         '    SecRule ARGS:json.message "@rx \\A[A-Za-z0-9_-]+\\z" "t:none,ctl:ruleRemoveTargetById=942100;ARGS:json.message"',
     ])

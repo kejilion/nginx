@@ -167,6 +167,26 @@ def cases():
     add('federation-summary-query-alias','POST',summary_path+'?json.message='+ciphertext,envelope,403)
     add('federation-summary-duplicate-field','POST',summary_path,('{"message":"'+ciphertext+'","message":"safe"}').encode(),403)
     add('federation-summary-method-override','POST',summary_path,envelope,403,headers={'X-HTTP-Method-Override':'PATCH'})
+    for suffix in ['monitoring/history','monitoring/relay']:
+        path='/api/v2/federation/'+suffix
+        add('noise-read-ciphertext-'+suffix,'POST',path,envelope)
+        add('noise-read-private-prefix-'+suffix,'POST','/entry_123'+path,envelope)
+        add('noise-read-cross-site-'+suffix,'POST',path,envelope,403,host='other.example')
+        add('noise-read-cross-profile-'+suffix,'POST',path,envelope,403,host='generic.example')
+        for method in ['GET','PUT','PATCH']:
+            add('noise-read-wrong-method-'+suffix+method,method,path,envelope,403)
+        add('noise-read-metadata-'+suffix,'POST',path,{**envelope,'requestId':"1' UNION SELECT password FROM users--"},403)
+        add('noise-read-query-'+suffix,'POST',path+'?q=1%27%20UNION%20SELECT%20password%20FROM%20users--',envelope,403)
+        add('noise-read-query-alias-'+suffix,'POST',path+'?json%2emessage='+ciphertext,envelope,403)
+        add('noise-read-plaintext-'+suffix,'POST',path,{'message':"1' UNION SELECT password FROM users--"},403)
+        add('noise-read-duplicate-field-'+suffix,'POST',path,('{"message":"'+ciphertext+'","message":"safe"}').encode(),403)
+        add('noise-read-invalid-json-'+suffix,'POST',path,b'{broken',400)
+        add('noise-read-wrong-media-'+suffix,'POST',path,envelope,403,{'Content-Type':'text/plain'})
+        add('noise-read-method-override-'+suffix,'POST',path,envelope,403,{'X-HTTP-Method-Override':'DELETE'})
+        add('noise-read-encoded-route-'+suffix,'POST',path.replace('/api/','/%61pi/'),envelope,403)
+        add('noise-read-extra-path-'+suffix,'POST',path+'/extra',envelope,403)
+    add('noise-unknown-monitoring-action','POST','/api/v2/federation/monitoring/delete',envelope,403)
+    add('noise-summary-encoded-route','POST',summary_path.replace('/api/','/%61pi/'),envelope,403)
     for path,field in [('/api/v1/terminal-batches','command'),('/api/v2/federation/terminal/relay','message')]:
         add('query-cannot-borrow-json-selector-'+field,'POST',path+'?json.'+field+'=1%27%20UNION%20SELECT%20password%20FROM%20users--',{'command':'echo hello','message':'fixture'},403)
     keys=[f'nav:/app-script/builtin-{i}'for i in range(512)]
