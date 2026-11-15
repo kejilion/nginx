@@ -135,10 +135,11 @@ server {
                           'requestId':'c'*32, 'timestamp':int(time.time()), 'message':'1--'+'AaBbCcDd'*16}, 401)
         assert isinstance(denied, dict) and denied.get('code') == 'federation_authentication_failed'
         for suffix in ['monitoring/history','monitoring/relay']:
+            expected_status,expected_code=(403,'monitoring_access_denied') if suffix.endswith('/history') else (401,'federation_authentication_failed')
             denied=request('noise-'+suffix+'-keeps-real-authentication','POST','/api/v2/federation/'+suffix,
                            {'protocol':'v2','controllerId':'a'*32,'targetId':'b'*32,
-                            'requestId':'c'*32,'timestamp':int(time.time()),'message':'1--'+'AaBbCcDd'*16},401)
-            assert isinstance(denied,dict) and denied.get('code')=='federation_authentication_failed'
+                            'requestId':'c'*32,'timestamp':int(time.time()),'message':'1--'+'AaBbCcDd'*16},expected_status)
+            assert isinstance(denied,dict) and denied.get('code')==expected_code
         icon=request('real-bundled-Docker-icon','GET','/desktop-icons/docker-kpanel-flat-v1.webp')
         assert isinstance(icon,bytes) and icon[:4]==b'RIFF' and icon[8:12]==b'WEBP'
         password='Fixture9! '+"1' UNION SELECT password FROM users--"+' <script>alert(1)</script>'
