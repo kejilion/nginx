@@ -437,16 +437,18 @@ def _content_application_rules(sites, first_id):
             ])
             rid+=1
             continue
-        # Flarum's username and optional profile tab are route data. Keep the
-        # core username grammar and a single bounded literal tab; API queries,
-        # permissions and all other CRS targets remain independently checked.
+        # Profile SSR and client navigation both resolve a username as data;
+        # the latter reads the user resource API. Keep the core username
+        # grammar and one bounded tab, preserving queries and API permissions.
+        username=r'[A-Za-z0-9_-]{1,30}'
+        profile_reads=r'^(?:/u/'+username+r'(?:/[A-Za-z0-9_-]{0,64})?|/api/users/'+username+r')$'
         lines.extend([
             f'SecRule TX:waf_flarum_profile "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,chain"',
             '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
             '    SecRule &ARGS:/^(?i:(?:json[.])?_method(?:[.\\[].*)?)$/ "@eq 0" "t:none,chain"',
             '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
             '    SecRule REQUEST_URI_RAW "@rx ^/[^%?]*(?:[?].*)?$" "t:none,chain"',
-            '    SecRule REQUEST_FILENAME "@rx ^/u/[A-Za-z0-9_-]{1,30}(?:/[A-Za-z0-9_-]{0,64})?$" "t:none,ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME"',
+            '    SecRule REQUEST_FILENAME "@rx '+profile_reads+'" "t:none,ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME"',
         ])
         rid+=1
         for methods,path,target in [
