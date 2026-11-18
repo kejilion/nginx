@@ -201,6 +201,28 @@ def cases():
         add('wordpress-noncanonical-path-not-exempt-'+path,'GET',path,expected=403,host='cms.example')
     add('forum-title-still-inspected','POST','/api/discussions',{'data':{'attributes':{'content':'cat /etc/passwd','title':'<script>alert(1)</script>'}}},403,host='forum.example')
     add('forum-json-query-not-exempt','POST','/api/posts?json.data.attributes.content=%3Cscript%3Ealert(1)%3C/script%3E',{'data':{'attributes':{'content':'safe'}}},403,host='forum.example')
+    for method in ['GET','HEAD']:
+        for suffix in ['', '/', '/posts', '/discussions', '/security', '/extension-tab']:
+            add('forum-profile-'+method+suffix,method,'/u/docker-reader'+suffix,host='forum.example')
+    add('forum-profile-longest-username','GET','/u/docker-'+'a'*23,host='forum.example')
+    add('forum-profile-longest-tab','GET','/u/docker-reader/'+'a'*64,host='forum.example')
+    add('forum-profile-safe-query','GET','/u/docker-reader?filter=posts',host='forum.example')
+    for host in ['other.example','generic.example','cms.example','panel.example']:
+        add('forum-profile-cross-site-'+host,'GET','/u/docker-reader',expected=403,host=host)
+    for method in ['POST','PUT','PATCH','DELETE']:
+        add('forum-profile-write-method-'+method,method,'/u/docker-reader',{},403,host='forum.example')
+    for path in ['/u/docker-reader/extra/path','/prefix/u/docker-reader','/u/docker-reader/security/',
+                 '/u/docker-'+'a'*24,'/u/docker-reader/'+'a'*65,
+                 '/u/docker-reader;id','/u/docker-reader$(id)','/u/docker-reader/..',
+                 '/u/%64ocker-reader','/%75/docker-reader','/u/docker%2dreader','/u//docker-reader']:
+        add('forum-profile-route-boundary-'+path,'GET',path,expected=403,host='forum.example')
+    for header in ['X-HTTP-Method-Override','X-Method-Override','X-HTTP-Method']:
+        add('forum-profile-override-'+header,'GET','/u/docker-reader',expected=403,headers={header:'POST'},host='forum.example')
+    for query in ['q=cat%20/etc/passwd','q=1%27%20UNION%20SELECT%20password%20FROM%20users--',
+                  'q=%3Cscript%3Ealert(1)%3C/script%3E','_method=POST']:
+        add('forum-profile-query-inspected-'+query,'GET','/u/docker-reader?'+query,expected=403,host='forum.example')
+    add('forum-profile-body-inspected','GET','/u/docker-reader',{'q':'cat /etc/passwd'},403,host='forum.example')
+    add('forum-profile-other-path-inspected','GET','/api/users/docker-reader',expected=403,host='forum.example')
     for method,path,content_type in [('POST','/api/v1/files/upload?path=/tmp&name=fixture.bin','application/octet-stream'),('PUT','/api/v1/files/transfer/sessions?id=fixture','application/octet-stream'),('PUT','/api/v1/desktop/shortcuts/'+'a'*32+'/icon','image/png')]:
         add('opaque-upload-'+path,method,path,b'\x89PNG\r\n\x1a\nfixture <script>alert(1)</script> java.lang.Runtime.getRuntime().exec("id")',headers={'Content-Type':content_type})
         add('upload-query-still-inspected-'+path,method,path+'&q=%3Cscript%3Ealert(1)%3C/script%3E'if'?'in path else path+'?q=%3Cscript%3Ealert(1)%3C/script%3E',b'fixture',403,headers={'Content-Type':content_type})
