@@ -461,7 +461,7 @@ def _content_application_rules(sites, first_id):
             '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
             '    SecRule REQUEST_URI_RAW "@rx ^/[^%?]*(?:[?].*)?$" "t:none,chain"',
             '    SecRule REQUEST_FILENAME "@rx ^/api/(?:posts|discussions)$" "t:none,chain"',
-            '    SecRule &ARGS_GET:/^filter[[]author[]](?:[[]|$)/ "@eq 1" "t:none,chain"',
+            '    SecRule &ARGS_GET:/^filter[[]author[]]/ "@eq 1" "t:none,chain"',
             '    SecRule &ARGS_GET:'+author+' "@eq 1" "t:none,chain"',
             '    SecRule &ARGS:'+author+' "@eq 1" "t:none,chain"',
             '    SecRule ARGS_GET:'+author+' "@rx \\A'+username+r'\z" "t:none,ctl:ruleRemoveTargetById=932260;ARGS:'+author+'"',
