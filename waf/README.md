@@ -49,7 +49,9 @@ python3 -B configure.py status
 
 兼容镜像只提供容器内部的规则基线与请求解析余量，不改宿主挂载、CF 模式或封禁动作。完整站点策略、受信代理、日志轮转与可回滚升级由同源固定版本配置包接入；不应把单独更新镜像解释为已完成所有宿主配置迁移。旧规则的评分阈值与审计开关由镜像兼容层保留，启用完整配置包后才使用本方案的阈值和审计策略。用户日常仍通过原生 WAF 开关操作。
 
-`--profile` 必须同时指定 `--site`。`wordpress` 使用已有官方排除插件及受限文章路径兼容；`flarum` 仅对 JSON:API 发帖正文和登录密码作精确例外；`artifact-proxy` 限定下载路径与 Git 协议；`kpanel` 限定方法、API 路径和已知业务参数，其他查询及用户名仍接受检查。WebSocket/SSE、上传等配置档不替代应用鉴权、代理超时或上传容量配置。
+`--profile` 必须同时指定 `--site`。`wordpress` 使用已有官方排除插件及受限文章路径兼容，`flarum` 对 JSON:API 发帖正文、登录密码及规范资料读取链作精确例外。`artifact-proxy` 限定下载路径与 Git 协议，`kpanel` 限定方法、API 路径和已知业务参数。WebSocket/SSE、上传等配置档不替代应用鉴权、代理超时或上传容量配置。
+
+Flarum 资料读取守卫只适用于 GET/HEAD、无方法覆盖且原始路径没有百分号的规范请求。资料页、一个字面标签段和用户详情 API 仅排除 932260 的路径目标。帖子与讨论列表仅排除该规则对单值 `filter[author]` 的检测，重复键、嵌套键和正文参数碰撞仍接受原检查。用户名限定 ASCII 字母、数字、`_`、`-`，长度 1–30 字符。其他查询、正文、规则及应用权限继续检查。每个安装共用两条守卫。
 
 `artifact-proxy` 对 GitHub 原始文件及 OCI manifest 的规范只读路径兼容 CRS 932260：仅 GET/HEAD、无方法覆盖头、路径为有界的字面安全字符且没有百分号或双点时，排除该规则的 `REQUEST_FILENAME` 目标；查询参数及其他规则仍检查。支持常规 tag 和 `sha256:<64位小写十六进制>` manifest 引用。这个配置档要求代理后端将路径作为数据处理而非交给 shell；其他源、编码路径和不符合格式的请求仍按原规则检查。仅有某条记录被拦截并不代表该请求一定正常，需结合后端行为判断。
 
@@ -433,6 +435,20 @@ python3 waf/sign-channel.py --revision <已验证且公开的40位提交> --sequ
 用户命令：`k web waf package-check` / `package-update` / `package-status` / `package-rollback` / `package-recover`。首次新安装读取最新签名稳定包；现有安装与普通状态/配置操作不自动升级。更早的旧安装须先更新引导脚本并执行一次受管 `apply` 对齐迁移基线，未对齐时更新拒绝且保留原防护。旧固定脚本仍可能重新部署旧版本；新版 `package-update` 即使版本相同也检查并重应用全部受管文件，不覆盖前一版本身份。旧 KPanel 内嵌脚本须另按其发行流程接入，不将原生发布称作全部 KPanel 已迁移。
 
 包状态保存在 `config/waf/package-state.json`，位于严格七文件缓存外。更新先持有 package 锁，再持有既有 install 锁，记录确切配置快照与 pending 后热应用、检查并切换 active；失败恢复快照，中断后显式 recover。发现第三方配置冲突或恢复失败时保留 pending。回退不降低已接受版本的序号水位。缓存仍限制16份/总字节预算，满时要求管理员归档明确不在用版本，不自动删除未知内容。签名与兼容失败不静默退回旧下载；不会创建后台更新任务。进程终止恢复和持久化顺序通过专项验证，不声称物理断电或所有文件系统已实测。
+
+### 2026-11-18 Flarum 资料读取与 108 发布
+
+108 日志确认同一公开资料页 24 小时内被规则 932260 拦截 4 次。核对 Flarum 2.0.2 后，确认资料页、客户端用户详情和按作者加载活动都将用户名作为数据，应用继续执行参数化查询和访客可见性控制。两条守卫覆盖完整读取流程，公共配置不含试点用户名或域名。依据：[Flarum 页面路由](https://github.com/flarum/framework/blob/v2.0.2/framework/core/src/Forum/routes.php)、[客户端资料页](https://github.com/flarum/framework/blob/v2.0.2/framework/core/js/src/forum/components/UserPage.tsx)、[CRS 误报调优](https://coreruleset.org/docs/2-how-crs-works/2-3-false-positives-and-tuning/)。
+
+相对上一共享包 `b4dd5a0`，代表性配置增加 2 条根规则和 1365 字节。无 Flarum 配置档时生成字节一致。108 从实际旧包 `412d0a5` 更新时也取得此前发布的上传元数据和监控密文修复，实际生成配置从 848 条根规则、477040 字节变为 856 条、482173 字节。部分生成编号顺延，既有规则语义保留。
+
+最终候选的隔离矩阵 462 项、真实 Panel 检查 29 项、从旧包更新及故障恢复 28 项通过。独立复核另跑 462 项矩阵和 31 项边界检查。对照上一共享包，25 个规范资料读取用例从 403 恢复，其余结果一致。Linux 单测 203 项中 201 通过，另有两项既有封禁测试失败。初轮方法覆盖、客户端读取覆盖及规则解析问题均在最终配置发布前修正，失败轮次未计入通过。原始隔离记录保留在 `/root/waf-flarum-profile-20261118/` 和 `/root/waf-flarum-independent-20261118/`。
+
+初轮使用了验证机既有镜像，正式安装后发现其摘要与 108 不同。随后用 108 实际运行的 `kjlion/nginx@sha256:7827d4c2e19bfce579f6fb4ce94884a126b5ab8ea74943e5448fa4c2b3d7f894` 补跑上述隔离矩阵、Panel、更新恢复及独立边界检查，全部通过。清单指向 AMD64 配置 `5cdeeb593a6a1f517acb733e5f92cb33695e2d84847e3955d763008ca12993c1`，14 层 RootFS 与 108 一致。
+
+108 正常请求验证资料页及标签页、用户详情、按作者读取帖子和讨论均为 200。访客响应验证未包含邮箱、密码、token 或邮箱确认字段。主站、博客及面板健康接口均为 200，WAF 开启，配置同步，封禁健康。独立复核通过源站 TLS 验证管理入口和登录页均为 200，未登录会话接口返回 401。公网脚本探测收到 Cloudflare 403，公网浏览器访问未验证。
+
+稳定 API 1 通道序号 6 指向 `18da4ad`，签名和七文件公开字节、缓存及运行文件已校验。Cloudflare 地址运行文件仅格式规范化，值一致。108 先恢复试点前像，再以 `k web waf package-update` 安装同一包。旧包 `412d0a5` 保留，更新前像 `/home/web/backups/waf-managed/20261118T023036606320Z-package-update` 已核验，回退入口为 `k web waf package-rollback`，签名水位保持。另将一份已核验且无引用的旧缓存完整移入全量备份目录，腾出安装所需缓存位置。158 保持 `b4dd5a0`。其他已有用户需主动执行 `k web waf package-update`，旧入口先升级原生脚本。[共享配置提交](https://github.com/kejilion/nginx/commit/18da4adec5988f6b6c776126ef9a9eac750b3a65)、[签名通道提交](https://github.com/kejilion/nginx/commit/5fd88e9360e6d502dc002a706919eb9eac4f2fce)。
 
 ### 2026-11-15：复用密文守卫处理监控交换误报
 
