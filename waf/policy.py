@@ -441,8 +441,9 @@ def _content_application_rules(sites, first_id):
         # core username grammar and a single bounded literal tab; API queries,
         # permissions and all other CRS targets remain independently checked.
         lines.extend([
-            f'SecRule TX:waf_flarum_profile "@eq 1" "id:{rid},phase:1,pass,nolog,t:none,chain"',
+            f'SecRule TX:waf_flarum_profile "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,chain"',
             '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+            '    SecRule &ARGS:/^(?i:(?:json[.])?_method(?:[.\\[].*)?)$/ "@eq 0" "t:none,chain"',
             '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
             '    SecRule REQUEST_URI_RAW "@rx ^/[^%?]*(?:[?].*)?$" "t:none,chain"',
             '    SecRule REQUEST_FILENAME "@rx ^/u/[A-Za-z0-9_-]{1,30}(?:/[A-Za-z0-9_-]{0,64})?$" "t:none,ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME"',

@@ -219,9 +219,11 @@ def cases():
     for header in ['X-HTTP-Method-Override','X-Method-Override','X-HTTP-Method']:
         add('forum-profile-override-'+header,'GET','/u/docker-reader',expected=403,headers={header:'POST'},host='forum.example')
     for query in ['q=cat%20/etc/passwd','q=1%27%20UNION%20SELECT%20password%20FROM%20users--',
-                  'q=%3Cscript%3Ealert(1)%3C/script%3E','_method=POST']:
+                  'q=%3Cscript%3Ealert(1)%3C/script%3E','_method=POST','_METHOD=POST',
+                  '%5fmethod=POST','_method%5B0%5D=POST','json._method=POST']:
         add('forum-profile-query-inspected-'+query,'GET','/u/docker-reader?'+query,expected=403,host='forum.example')
     add('forum-profile-body-inspected','GET','/u/docker-reader',{'q':'cat /etc/passwd'},403,host='forum.example')
+    add('forum-profile-body-method-alias','GET','/u/docker-reader',{'_method':'POST'},403,host='forum.example')
     add('forum-profile-other-path-inspected','GET','/api/users/docker-reader',expected=403,host='forum.example')
     for method,path,content_type in [('POST','/api/v1/files/upload?path=/tmp&name=fixture.bin','application/octet-stream'),('PUT','/api/v1/files/transfer/sessions?id=fixture','application/octet-stream'),('PUT','/api/v1/desktop/shortcuts/'+'a'*32+'/icon','image/png')]:
         add('opaque-upload-'+path,method,path,b'\x89PNG\r\n\x1a\nfixture <script>alert(1)</script> java.lang.Runtime.getRuntime().exec("id")',headers={'Content-Type':content_type})
