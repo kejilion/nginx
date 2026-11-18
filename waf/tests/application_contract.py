@@ -239,6 +239,28 @@ def cases():
         add('forum-profile-user-api-query-'+query,'GET','/api/users/docker-reader?bySlug=true&'+query,expected=403,host='forum.example')
     add('forum-profile-user-api-body-inspected','GET','/api/users/docker-reader',{'q':'cat /etc/passwd'},403,host='forum.example')
     add('forum-profile-user-api-header-override','GET','/api/users/docker-reader',expected=403,headers={'X-HTTP-Method-Override':'POST'},host='forum.example')
+    author='filter%5Bauthor%5D=docker-reader'
+    for path in ['/api/posts','/api/discussions']:
+        for method in ['GET','HEAD']:
+            add('forum-profile-activity-'+path+method,method,path+'?'+author,host='forum.example')
+        add('forum-profile-activity-pagination-'+path,'GET',path+'?'+author+'&page%5Blimit%5D=20&sort=-createdAt',host='forum.example')
+        for method in ['POST','PUT','PATCH','DELETE']:
+            add('forum-profile-activity-write-'+path+method,method,path+'?'+author,{},403,host='forum.example')
+        for query in [author+'&'+author,author+'&filter%5Bauthor%5D%5B0%5D=docker-reader',
+                      'filter%5Bauthor%5D%5B0%5D=docker-reader','filter%5BAuthor%5D=docker-reader',
+                      'filter%5Bauthor%5D=docker-reader%3Bid','filter%5Bauthor%5D=docker-'+'a'*24,
+                      author+'&_method=POST',author+'&q=cat%20/etc/passwd',
+                      author+'&q=1%27%20UNION%20SELECT%20password%20FROM%20users--',
+                      author+'&q=%3Cscript%3Ealert(1)%3C/script%3E',
+                      author+'&filter%5Bq%5D=cat%20/etc/passwd']:
+            add('forum-profile-activity-query-boundary-'+path+query,'GET',path+'?'+query,expected=403,host='forum.example')
+        for host in ['other.example','generic.example']:
+            add('forum-profile-activity-cross-site-'+path+host,'GET',path+'?'+author,expected=403,host=host)
+        add('forum-profile-activity-body-inspected-'+path,'GET',path+'?'+author,{'q':'cat /etc/passwd'},403,host='forum.example')
+        add('forum-profile-activity-body-collision-'+path,'GET',path+'?'+author,b'filter%5Bauthor%5D=docker-reader',403,headers={'Content-Type':'application/x-www-form-urlencoded'},host='forum.example')
+        add('forum-profile-activity-header-override-'+path,'GET',path+'?'+author,expected=403,headers={'X-HTTP-Method-Override':'POST'},host='forum.example')
+    for path in ['/api/users/docker-reader','/u/docker-reader','/api/posts/1','/api/discussions/', '/%61pi/posts']:
+        add('forum-profile-activity-path-boundary-'+path,'GET',path+'?'+author,expected=403,host='forum.example')
     for method,path,content_type in [('POST','/api/v1/files/upload?path=/tmp&name=fixture.bin','application/octet-stream'),('PUT','/api/v1/files/transfer/sessions?id=fixture','application/octet-stream'),('PUT','/api/v1/desktop/shortcuts/'+'a'*32+'/icon','image/png')]:
         add('opaque-upload-'+path,method,path,b'\x89PNG\r\n\x1a\nfixture <script>alert(1)</script> java.lang.Runtime.getRuntime().exec("id")',headers={'Content-Type':content_type})
         add('upload-query-still-inspected-'+path,method,path+'&q=%3Cscript%3Ealert(1)%3C/script%3E'if'?'in path else path+'?q=%3Cscript%3Ealert(1)%3C/script%3E',b'fixture',403,headers={'Content-Type':content_type})

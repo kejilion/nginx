@@ -451,6 +451,22 @@ def _content_application_rules(sites, first_id):
             '    SecRule REQUEST_FILENAME "@rx '+profile_reads+'" "t:none,ctl:ruleRemoveTargetById=932260;REQUEST_FILENAME"',
         ])
         rid+=1
+        # Profile activity lists filter by the same username slug. Trust only
+        # one scalar query field, never a body/query collision or nested alias.
+        author=r'filter[author]'
+        lines.extend([
+            f'SecRule TX:waf_flarum_profile "@eq 1" "id:{rid},phase:2,pass,nolog,t:none,chain"',
+            '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
+            '    SecRule &ARGS:/^(?i:(?:json[.])?_method(?:[.\\[].*)?)$/ "@eq 0" "t:none,chain"',
+            '    SecRule REQUEST_METHOD "@rx ^(?:GET|HEAD)$" "t:none,chain"',
+            '    SecRule REQUEST_URI_RAW "@rx ^/[^%?]*(?:[?].*)?$" "t:none,chain"',
+            '    SecRule REQUEST_FILENAME "@rx ^/api/(?:posts|discussions)$" "t:none,chain"',
+            '    SecRule &ARGS_GET:/^filter[[]author[]](?:[[]|$)/ "@eq 1" "t:none,chain"',
+            '    SecRule &ARGS_GET:'+author+' "@eq 1" "t:none,chain"',
+            '    SecRule &ARGS:'+author+' "@eq 1" "t:none,chain"',
+            '    SecRule ARGS_GET:'+author+' "@rx \\A'+username+r'\z" "t:none,ctl:ruleRemoveTargetById=932260;ARGS:'+author+'"',
+        ])
+        rid+=1
         for methods,path,target in [
             ('POST',r'/api/(?:posts|discussions)','data.attributes.content'),
             ('PATCH',r'/api/posts/[0-9]{1,20}','data.attributes.content'),
