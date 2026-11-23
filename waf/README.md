@@ -53,7 +53,7 @@ python3 -B configure.py status
 
 Flarum 资料读取守卫只适用于 GET/HEAD、无方法覆盖且原始路径没有百分号的规范请求。资料页、一个字面标签段和用户详情 API 仅排除 932260 的路径目标。帖子与讨论列表仅排除该规则对单值 `filter[author]` 的检测，重复键、嵌套键和正文参数碰撞仍接受原检查。用户名限定 ASCII 字母、数字、`_`、`-`，长度 1–30 字符。其他查询、正文、规则及应用权限继续检查。每个安装共用两条守卫。
 
-`artifact-proxy` 对 GitHub 原始文件及 OCI manifest 的规范只读路径兼容 CRS 932260：仅 GET/HEAD、无方法覆盖头、路径为有界的字面安全字符且没有百分号或双点时，排除该规则的 `REQUEST_FILENAME` 目标；查询参数及其他规则仍检查。支持常规 tag 和 `sha256:<64位小写十六进制>` manifest 引用。这个配置档要求代理后端将路径作为数据处理而非交给 shell；其他源、编码路径和不符合格式的请求仍按原规则检查。仅有某条记录被拦截并不代表该请求一定正常，需结合后端行为判断。
+`artifact-proxy` 对 GitHub 原始文件、GitHub Release 附件及 OCI manifest 的规范只读路径兼容 CRS 932260。仅 GET/HEAD、无方法覆盖头、路径使用有界的字面安全字符且没有百分号或双点时，排除该规则的 `REQUEST_FILENAME` 目标。查询参数及其他规则仍检查。GitHub Release 支持 `/releases/latest/download/<附件名>` 和 `/releases/download/<单段标签>/<附件名>`。OCI 支持常规 tag 和 `sha256:<64位小写十六进制>` manifest 引用。此配置档要求代理后端将路径当作数据处理。其他源、编码路径和不符合格式的请求继续接受原规则检查。[GitHub 最新版附件链接](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases) · [指定标签附件链接](https://docs.github.com/en/rest/releases/assets)
 
 站点 `exclusions` 支持 Unicode 字面路径，例如 `{"ruleId":932260,"path":"/category/docker-项目/","target":"REQUEST_FILENAME"}`。路径填写解码后的文字，不接受百分号编码、通配符或正则表达式。`REQUEST_FILENAME` 例外只适用于 GET/HEAD 且无方法覆盖头的精确路径；仅移除指定规则的路径目标，查询、正文和其他规则保持检查。既有 `ARGS:参数名` 例外行为不变。部署域名及具体业务路径留在用户策略内，不进入公共默认值。这遵循 [CRS 精确排除建议](https://coreruleset.org/docs/2-how-crs-works/2-3-false-positives-and-tuning/)；CRS 4.30 加入路径命令注入检查后，[官方要求关注路径误报](https://coreruleset.org/20261002/crs-versions-4.30.0-and-4.25.2-lts-released/)，不能为兼容而整体关闭 RCE 路径检测。
 
@@ -435,6 +435,16 @@ python3 waf/sign-channel.py --revision <已验证且公开的40位提交> --sequ
 用户命令：`k web waf package-check` / `package-update` / `package-status` / `package-rollback` / `package-recover`。首次新安装读取最新签名稳定包；现有安装与普通状态/配置操作不自动升级。更早的旧安装须先更新引导脚本并执行一次受管 `apply` 对齐迁移基线，未对齐时更新拒绝且保留原防护。旧固定脚本仍可能重新部署旧版本；新版 `package-update` 即使版本相同也检查并重应用全部受管文件，不覆盖前一版本身份。旧 KPanel 内嵌脚本须另按其发行流程接入，不将原生发布称作全部 KPanel 已迁移。
 
 包状态保存在 `config/waf/package-state.json`，位于严格七文件缓存外。更新先持有 package 锁，再持有既有 install 锁，记录确切配置快照与 pending 后热应用、检查并切换 active；失败恢复快照，中断后显式 recover。发现第三方配置冲突或恢复失败时保留 pending。回退不降低已接受版本的序号水位。缓存仍限制16份/总字节预算，满时要求管理员归档明确不在用版本，不自动删除未知内容。签名与兼容失败不静默退回旧下载；不会创建后台更新任务。进程终止恢复和持久化顺序通过专项验证，不声称物理断电或所有文件系统已实测。
+
+### 2026-11-23 GitHub Release 下载兼容
+
+108 镜像站审计确认规则 932260 在 `REQUEST_FILENAME` 上拦截了一次规范 GitHub Release 附件 GET。GitHub 原始下载链和镜像后端均返回 200，244948 字节内容一致。沿用 `artifact-proxy` 现有路径守卫，只增加最新版本和指定单段标签的 GitHub 附件格式。实际生成配置增加 233 字节，根规则保持 856 条，ID 序列一致。公共包不包含该请求的用户名、仓库或文件名。
+
+隔离验证使用 108 的 AMD64 镜像 `kjlion/nginx@sha256:7827d4c2e19bfce579f6fb4ce94884a126b5ab8ea74943e5448fa4c2b3d7f894`。基线同镜像复现无协议前缀的最新版链接返回 403，带协议的指定标签样本在基线已返回 200，初轮对后一用例的错误期望已纠正。候选通过 209 项引擎集成、462 项应用矩阵和 29 项策略单测，额外边界运行共 213 项通过，覆盖跨站、其他域名、写方法、覆盖头、编码和查询检查。独立静态复核未发现阻断项。验证证据保留于 `/root/waf-release-download-20261123/`。具有编码字符或多段标签的下载路径不在这次兼容范围内。
+
+108 试点及正式安装后，原附件 GET、HEAD 均返回 200，源站下载内容校验一致，公网 HEAD 为 200。主站、论坛、面板健康接口、管理入口和登录页返回 200，匿名会话返回 401。WAF 开启、配置同步、封禁健康，重复计划为空。试点后恢复原包前像，再通过 `k web waf package-update` 安装稳定签名序号 7。公开签名和七文件字节、108 缓存与运行文件均已核验。158 可见序号 7，实际仍运行序号 6。[共享包](https://github.com/kejilion/nginx/commit/b08e1cb224628e21aba79313911985f2f1244218) · [稳定签名](https://github.com/kejilion/nginx/commit/d9d3c22bfa0a8e5adf053b53c1a2d2a1fb70d0b8)
+
+108 上一签名包为 `18da4ad`，原生更新前像为 `/home/web/backups/waf-managed/20261123T021451800985Z-package-update`，试点备份为 `/home/web/backups/waf-managed/20261123T021327424142Z-policy`。缓存达到 16 份时，将核对过源码摘要且无活动引用的旧六文件包 `1662016` 完整移至 `/home/web/backups/waf-github-release-20261123/`，保留当前包、回滚包和用户策略。回滚用 `k web waf package-rollback`。已安装用户通过 `k web waf package-update` 主动更新。
 
 ### 2026-11-18 Flarum 资料读取与 108 发布
 
