@@ -314,6 +314,23 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         check('artifact-literal-override-denied',host='artifact.example',path=artifact_download,headers={'X-HTTP-Method-Override':'PATCH'},expected=403)
         check('artifact-literal-other-profile-denied',host='api.example',path=artifact_download,expected=403)
         check('artifact-literal-other-origin-denied',host='artifact.example',path='/other.example/example/docker-app/main/config.yml',expected=403)
+        release='/github.com/example/docker-app/releases/latest/download/fixture.bin'
+        tagged='/https://github.com/example/docker-app/releases/download/v1.2.3/fixture.bin'
+        for path in (release,tagged):
+            for method in ('GET','HEAD'):
+                _,data=check('artifact-release-'+method+'-'+path,host='artifact.example',path=path,method=method)
+                if method=='GET':assert json.loads(data)['path']==path
+        for label,path,host,method,headers in [
+            ('cross-site',release,'api.example','GET',{}),
+            ('write-method',release,'artifact.example','POST',{}),
+            ('override',release,'artifact.example','GET',{'X-HTTP-Method-Override':'PATCH'}),
+            ('encoded',release.replace('docker-app','%64ocker-app'),'artifact.example','GET',{}),
+            ('wrong-host',release.replace('github.com','other.example'),'artifact.example','GET',{}),
+            ('extra-segment',release+'/extra','artifact.example','GET',{}),
+            ('repository-page',release.replace('/latest/download/','/tag/'),'artifact.example','GET',{}),
+        ]:
+            check('artifact-release-'+label,host=host,path=path,method=method,headers=headers,expected=403)
+        check('artifact-release-query-inspection',host='artifact.example',path=release+'?q=%3Cscript%3Ealert(1)%3C/script%3E',expected=403)
         git_path='/github.com/kejilion/apps.git/git-upload-pack'
         compressed_git_packet=gzip.compress(b'0032want 0123456789012345678901234567890123456789\n0000')
         for header in ['Content-Encoding', 'content-encoding', 'CONTENT-ENCODING']:

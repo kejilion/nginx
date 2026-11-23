@@ -553,6 +553,8 @@ def render_profile_rules(config: dict, method_controls=None, resource_controls=N
             artifact_path = (r'^/(?:' +
                 r'(?:https?://)?raw[.]githubusercontent[.]com/' +
                 artifact_segment + r'(?:/' + artifact_segment + r'){1,15}' +
+                r'|(?:https?://)?github[.]com/' + artifact_segment + '/' + artifact_segment +
+                r'/releases/(?:latest/download|download/' + artifact_segment + ')/' + artifact_segment +
                 r'|v2/' + artifact_segment + r'(?:/' + artifact_segment + r'){0,5}/manifests/(?:' + artifact_segment + r'|sha256:[a-f0-9]{64}))$')
             lines += [f'SecRule UNIQUE_ID "@beginsWith {name}|" "id:{rid},phase:1,pass,nolog,t:none,chain"',
                       '    SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@eq 0" "t:none,chain"',
