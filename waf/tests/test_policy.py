@@ -222,8 +222,9 @@ class PolicyTests(unittest.TestCase):
         self.assertNotIn('ruleEngine=Off',guard)
         self.assertIn('requires a compatible gateway policy',guard)
         self.assertNotIn('@within',guard)
-        self.assertIn(r'(?:PATCH|\|PATCH\|)',guard)
+        self.assertIn(r'(?:^|[ \t])\|PATCH\|(?:[ \t]|$)',guard)
         self.assertIn('tx.allowed_methods=|GET| |HEAD| |POST| |OPTIONS| |PUT| |PATCH| |DELETE|',rules)
+        self.assertNotIn('tx.allowed_http_versions=',rules)
         self.assertIn('phase:2',guard)
         self.config['methodOverride']='off'
         with self.assertRaisesRegex(ValueError,'method override'):policy.validate(self.config)
