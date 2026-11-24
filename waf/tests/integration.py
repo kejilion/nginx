@@ -240,7 +240,7 @@ upstream fixture_backend { server unix:/test/backend.sock; }
         assert controls==(False,{'acl.example','realm.example','underscore.example'}),controls
         (generated/'profile-rules.conf').write_text(policy.render_profile_rules(config,controls))
         guard=(generated/'method-override.conf').read_text()
-        (generated/'method-override.conf').write_text('SecRule UNIQUE_ID "@beginsWith narrow.example|" "id:1160,phase:1,pass,nolog,t:none,setvar:\'tx.allowed_methods=GET HEAD POST PATCHING UNDELETE OUTPUT\'"\n'+guard)
+        (generated/'method-override.conf').write_text('SecRule UNIQUE_ID "@beginsWith narrow.example|" "id:1160,phase:1,pass,nolog,t:none,setvar:\'tx.allowed_methods=|GET| |HEAD| |POST| |PATCHING| |UNDELETE| |OUTPUT|\'"\n'+guard)
         old_workers={line.split()[0] for line in run('docker','top',name,'-eo','pid,args').stdout.decode().splitlines() if 'nginx: worker process' in line}
         run('docker','exec',name,'nginx','-s','reload')
         for attempt in range(100):
@@ -262,6 +262,7 @@ upstream fixture_backend { server unix:/test/backend.sock; }
                     _,data=check('actual-framework-'+header+'-'+method,host='api.example',path='/framework/'+header,
                                  method='POST',body=b'{"title":"normal"}',headers={header:method,'Content-Type':'application/json'})
                     assert json.loads(data)['frameworkMethod']==dict(original='POST',effective=method)
+        check('narrow-policy-allows-original-post',host='narrow.example',method='POST')
         for method in ['PUT','PATCH','DELETE']:
             check('allowed-method-requires-complete-token-'+method,host='narrow.example',method='POST',headers={'X-HTTP-Method-Override':method},expected=403)
         check('method-acl-original-post',host='acl.example',method='POST')

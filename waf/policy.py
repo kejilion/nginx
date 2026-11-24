@@ -494,7 +494,7 @@ def render_profile_rules(config: dict, method_controls=None, resource_controls=N
     lines = [
         '# Settings run after vendor setup, before CRS and application exclusions.',
         'SecAction "id:1100,phase:1,pass,nolog,t:none,setvar:tx.inbound_anomaly_score_threshold=5,setvar:tx.outbound_anomaly_score_threshold=4,setvar:tx.blocking_paranoia_level=1,setvar:tx.detection_paranoia_level=1,setvar:tx.wordpress-rule-exclusions-plugin_enabled=0"',
-        'SecAction "id:1101,phase:1,pass,nolog,t:none,setvar:\'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE\'"',
+        'SecAction "id:1101,phase:1,pass,nolog,t:none,setvar:\'tx.allowed_methods=|GET| |HEAD| |POST| |OPTIONS| |PUT| |PATCH| |DELETE|\'"',
         # CRS may reject a phase-1 score before buffering/inspecting the body.
         # DetectionOnly still runs every phase, preserving false-positive tuning.
         'SecAction "id:1102,phase:1,pass,nolog,t:none,setvar:tx.early_blocking=1"',
@@ -703,7 +703,7 @@ SecRule &REQUEST_HEADERS:/^(?i:x-(?!method$)(?:http-)?method(?:-override)?)$/ "@
     for header in ['x-http-method-override','x-http-method','x-method-override']:
       for method in ['PUT','PATCH','DELETE']:
         lines.append(f'''SecRule REQUEST_HEADERS:{header} "@streq {method}" "id:{number},phase:2,pass,log,t:none,msg:'WAF method override is not allowed by policy',chain"
-    SecRule TX:allowed_methods "!@rx (?:^|[ \\t]){method}(?:[ \\t]|$)" "t:none,setvar:tx.inbound_anomaly_score_pl1=+%{{tx.critical_anomaly_score}}"
+    SecRule TX:allowed_methods "!@rx (?:^|[ \\t])(?:{method}|\\|{method}\\|)(?:[ \\t]|$)" "t:none,setvar:tx.inbound_anomaly_score_pl1=+%{{tx.critical_anomaly_score}}"
 ''')
         number+=1
     return ''.join(lines)
