@@ -434,6 +434,10 @@ python3 waf/sign-channel.py --revision <已验证且公开的40位提交> --sequ
 
 用户命令：`k web waf package-check` / `package-update` / `package-status` / `package-rollback` / `package-recover`。首次新安装读取最新签名稳定包；现有安装与普通状态/配置操作不自动升级。更早的旧安装须先更新引导脚本并执行一次受管 `apply` 对齐迁移基线，未对齐时更新拒绝且保留原防护。旧固定脚本仍可能重新部署旧版本；新版 `package-update` 即使版本相同也检查并重应用全部受管文件，不覆盖前一版本身份。旧 KPanel 内嵌脚本须另按其发行流程接入，不将原生发布称作全部 KPanel 已迁移。
 
+2026-11-24，稳定通道 sequence 9 使用 `c874e54f4730c73916adc93af07a3a513f11165d`。受管配置写入 `|GET|` 形式的方法条目，方法覆盖检查也按这个格式完整匹配。HTTP 协议版本沿用镜像中的 CRS 策略，因此可随 CRS 迭代。自维护的 CRS 方法列表同样采用 `|方法|` 条目。 [CRS 4.31.0 迁移说明](https://github.com/coreruleset/coreruleset/releases/tag/v4.31.0)
+
+独立配置对照确认只有九处方法条目匹配发生变化，规则编号一致。CRS 4.30.0 和 4.31.0 各通过 210 项隔离集成检查，后者另通过 462 项应用检查和 19 项签名包更新与恢复检查。158 经授权热重载后，WAF 为 On，面板健康接口返回 200，受保护站点返回预期的 401。上一签名源码为 `946b61f400ed8148ddeda346a721a0efbdefadbb`，可以通过 `k web waf package-rollback` 恢复。
+
 包状态保存在 `config/waf/package-state.json`，位于严格七文件缓存外。更新先持有 package 锁，再持有既有 install 锁，记录确切配置快照与 pending 后热应用、检查并切换 active；失败恢复快照，中断后显式 recover。发现第三方配置冲突或恢复失败时保留 pending。回退不降低已接受版本的序号水位。缓存仍限制16份/总字节预算，满时要求管理员归档明确不在用版本，不自动删除未知内容。签名与兼容失败不静默退回旧下载；不会创建后台更新任务。进程终止恢复和持久化顺序通过专项验证，不声称物理断电或所有文件系统已实测。
 
 ### 2026-11-23 GitHub Release 下载兼容
